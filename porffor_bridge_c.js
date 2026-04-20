@@ -1,0 +1,1 @@
+import compile from 'porffor/compiler/index.js'; export const porffor_compile = (code, args) => { globalThis.Prefs = { target: 'c' }; globalThis.defaultPrefs = { target: 'c' }; return compile(code, args); };

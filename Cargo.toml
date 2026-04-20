@@ -1,0 +1,41 @@
+[package]
+name = "nexus-io"
+version = "0.1.0"
+edition = "2021"
+authors = ["Aerea Development Team"]
+description = "Nexus-IO Platform Shell - Nushell distribution with QuickJS-NG and SurrealDB"
+license = "MIT"
+repository = "https://github.com/aerea/nexus-io"
+
+[dependencies]
+nu-protocol = "0.110.0"
+nu-engine = "0.110.0"
+nu-parser = "0.110.0"
+nu-command = { version = "0.110.0", features = ["os", "network", "rand", "sqlite"] }
+nu-cmd-extra = "0.110.0"
+nu-cli = "0.110.0"
+nu-cmd-lang = "0.110.0"
+surrealdb = { version = "3.0.0-beta.2", default-features = false, features = ["kv-mem", "kv-surrealkv"] }
+quickjs-rusty = { version = "0.11", features = ["serde"] }
+libquickjs-ng-sys = "0.10.0"
+oxc_allocator = { version = "0.13", features = ["serialize"] }
+oxc_parser = "0.13"
+oxc_transformer = "0.13"
+oxc_codegen = "0.13"
+oxc_span = { version = "0.13", features = ["serialize"] }
+oxc_ast = { version = "0.13", features = ["serialize"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+miette = { version = "7", features = ["fancy"] }
+anyhow = "1.0"
+reedline = "0.38.0"
+lazy_static = "1.4"
+chrono = { version = "0.4", features = ["serde"] }
+interprocess = "=2.2.1"
+pollster = "0.4.0"
+rustyline = "17.0.2"
+clap = { version = "=4.5.55", features = ["derive"] }
+nu-table = "0.110.0"
+nu-ansi-term = "0.50.0"
