@@ -1,0 +1,194 @@
+use anyhow::Result;
+use std::sync::Arc;
+use std::collections::HashMap;
+use tokio::sync::RwLock;
+use crate::db::Database;
+
+/// GarageBridge provides the interface to storage
+/// Phase 14A: Simplified in-memory implementation
+/// Phase 14B: Full Garage DHT integration
+pub struct GarageBridge {
+    db: Arc<Database>,
+    // In-memory object store: bucket -> key -> value
+    objects: Arc<RwLock<HashMap<String, HashMap<String, Vec<u8>>>>>,
+}
+
+impl GarageBridge {
+    pub async fn new(db: Arc<Database>) -> Result<Self> {
+        Ok(Self {
+            db,
+            objects: Arc::new(RwLock::new(HashMap::new())),
+        })
+    }
+    
+    /// Create a new bucket
+    pub async fn create_bucket(&self, name: &str) -> Result<()> {
+        let name = name.to_string(); // Convert to owned
+        
+        // Check if bucket already exists
+        let buckets = self.list_buckets().await?;
+        if buckets.contains(&name) {
+            return Err(anyhow::anyhow!("Bucket '{}' already exists", name));
+        }
+        
+        // Create bucket in memory
+        let mut objects = self.objects.write().await;
+        objects.insert(name.clone(), HashMap::new());
+        drop(objects);
+        
+        // Persist to SurrealDB
+        let now = chrono::Utc::now();
+        self.db.client.query(
+            "CREATE bucket CONTENT {
+                name: $name,
+                created_at: $now,
+                object_count: 0
+            }"
+        )
+            .bind(("name", name))
+            .bind(("now", now))
+            .await?
+            .check()?;
+        
+        Ok(())
+    }
+    
+    /// List all buckets
+    pub async fn list_buckets(&self) -> Result<Vec<String>> {
+        let mut response = self.db.client
+            .query("SELECT name FROM bucket")
+            .await?;
+        
+        let results: Vec<serde_json::Value> = response.take(0)?;
+        
+        let buckets = results.iter()
+            .filter_map(|b| b.get("name").and_then(|v| v.as_str()).map(|s| s.to_string()))
+            .collect();
+        
+        Ok(buckets)
+    }
+    
+    /// Put an object into a bucket (zero-copy write)
+    pub async fn put_object(&self, bucket: &str, key: &str, value: Vec<u8>) -> Result<()> {
+        let bucket = bucket.to_string(); // Convert to owned
+        let key_owned = key.to_string();
+        
+        // Ensure bucket exists
+        let buckets = self.list_buckets().await?;
+        if !buckets.contains(&bucket) {
+            return Err(anyhow::anyhow!("Bucket '{}' does not exist", bucket));
+        }
+        
+        let size = value.len() as i64;
+        let now = chrono::Utc::now();
+        
+        // Convert Vec<u8> to Vec<i64> for SurrealDB array
+        let value_array: Vec<i64> = value.iter().map(|&b| b as i64).collect();
+        
+        // Store in memory
+        let mut objects = self.objects.write().await;
+        let bucket_map = objects.entry(bucket.clone()).or_insert_with(HashMap::new);
+        bucket_map.insert(key_owned.clone(), value.clone());
+        drop(objects);
+        
+        // Persist to SurrealDB as array
+        self.db.client.query(
+            "CREATE objdata CONTENT {
+                bucket: $bucket,
+                key: $key,
+                value: $value,
+                created_at: $now,
+                size: $size
+            }"
+        )
+            .bind(("bucket", bucket.clone()))
+            .bind(("key", key_owned))
+            .bind(("value", value_array))
+            .bind(("now", now))
+            .bind(("size", size))
+            .await?
+            .check()?;
+        
+        // Update object count in bucket
+        self.db.client.query(
+            "UPDATE bucket SET object_count = object_count + 1 WHERE name = $name"
+        )
+            .bind(("name", bucket))
+            .await?
+            .check()?;
+        
+        Ok(())
+    }
+    
+    /// Get an object from a bucket (zero-copy read)
+    pub async fn get_object(&self, bucket: &str, key: &str) -> Result<Option<Vec<u8>>> {
+        let bucket = bucket.to_string();
+        let key_owned = key.to_string();
+        
+        // Try memory first
+        let objects = self.objects.read().await;
+        if let Some(bucket_map) = objects.get(&bucket) {
+            if let Some(value) = bucket_map.get(&key_owned) {
+                println!("DEBUG: Found object in memory cache");
+                return Ok(Some(value.clone()));
+            }
+        }
+        drop(objects);
+        
+        println!("DEBUG: Object not in memory, querying SurrealDB...");
+        println!("DEBUG: Query params - bucket: '{}', key: '{}'", bucket, key_owned);
+        
+        // Fall back to database
+        let query_str = format!(
+            "SELECT value FROM objdata WHERE bucket = '{}' AND key = '{}' LIMIT 1",
+            bucket, key_owned
+        );
+        println!("DEBUG: Executing query: {}", query_str);
+        
+        let mut response = self.db.client
+            .query(&query_str)
+            .await?;
+        
+        let results: Vec<serde_json::Value> = response.take(0)?;
+        println!("DEBUG: Query returned {} results", results.len());
+        
+        if let Some(obj) = results.first() {
+            println!("DEBUG: First result: {:?}", obj);
+            if let Some(value_array) = obj.get("value").and_then(|v| v.as_array()) {
+                let bytes: Vec<u8> = value_array.iter()
+                    .filter_map(|v| v.as_i64().map(|n| n as u8))
+                    .collect();
+                
+                println!("DEBUG: Successfully decoded {} bytes from database", bytes.len());
+                
+                // Cache in memory
+                let mut objects_write = self.objects.write().await;
+                let bucket_map = objects_write.entry(bucket).or_insert_with(HashMap::new);
+                bucket_map.insert(key_owned, bytes.clone());
+                
+                return Ok(Some(bytes));
+            }
+        }
+        
+        println!("DEBUG: Object not found in database");
+        Ok(None)
+    }
+    
+    /// Delete bucket
+    pub async fn delete_bucket(&self, name: &str) -> Result<()> {
+        let name = name.to_string(); // Convert to owned
+        
+        // Remove from memory
+        let mut objects = self.objects.write().await;
+        objects.remove(&name);
+        drop(objects);
+        
+        // Remove from SurrealDB
+        self.db.client.query("DELETE bucket WHERE name = $name")
+            .bind(("name", name))
+            .await?
+            .check()?;
+        
+        Ok(())
+    }
+}
