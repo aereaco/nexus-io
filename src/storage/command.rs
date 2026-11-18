@@ -4,7 +4,7 @@ use nu_protocol::{Category, PipelineData, ShellError, Signature, Value};
 use nu_engine::CallExt;
 use std::sync::Arc;
 use crate::db::Database;
-use crate::storage::{GarageBridge, WireGuardManager};
+use crate::storage::{BlobBridge, WireGuardManager};
 
 // ===== INITIALIZATION COMMANDS =====
 
@@ -39,23 +39,21 @@ impl Command for StorageInitCommand {
         let result = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async move {
                 let wg = WireGuardManager::new(db).await
-                    .map_err(|e| ShellError::GenericError {
-                        error: "Failed to initialize WireGuardManager".into(),
-                        msg: e.to_string(),
-                        span: Some(span),
-                        help: None,
-                        inner: vec![],
-                    })?;
+                    .map_err(|e| crate::shell_err(
+                        "Failed to initialize WireGuardManager",
+                        e.to_string(),
+                        Some(span),
+                        None,
+                    ))?;
                 
                 // Check if keypair already exists
                 let existing = wg.get_local_keypair().await
-                    .map_err(|e| ShellError::GenericError {
-                        error: "Failed to check existing keypair".into(),
-                        msg: e.to_string(),
-                        span: Some(span),
-                        help: None,
-                        inner: vec![],
-                    })?;
+                    .map_err(|e| crate::shell_err(
+                        "Failed to check existing keypair",
+                        e.to_string(),
+                        Some(span),
+                        None,
+                    ))?;
                 
                 if let Some((_, pubkey)) = existing {
                     return Ok(format!("✅ Storage already initialized\nPublic Key: {}", pubkey));
@@ -63,13 +61,12 @@ impl Command for StorageInitCommand {
                 
                 // Generate new keypair
                 let (_privkey, pubkey) = wg.generate_keypair().await
-                    .map_err(|e| ShellError::GenericError {
-                        error: "Failed to generate WireGuard keypair".into(),
-                        msg: e.to_string(),
-                        span: Some(span),
-                        help: None,
-                        inner: vec![],
-                    })?;
+                    .map_err(|e| crate::shell_err(
+                        "Failed to generate WireGuard keypair",
+                        e.to_string(),
+                        Some(span),
+                        None,
+                    ))?;
                 
                 Ok(format!("✅ Storage initialized successfully\nPublic Key: {}\n\nShare this public key with peers to join the mesh.", pubkey))
             })
@@ -119,7 +116,7 @@ impl Command for StorageStatusCommand {
 /// storage bucket create - Create a Garage bucket
 #[derive(Clone)]
 pub struct StorageBucketCreateCommand {
-    pub bridge: Arc<GarageBridge>,
+    pub bridge: Arc<BlobBridge>,
 }
 
 impl Command for StorageBucketCreateCommand {
@@ -145,13 +142,12 @@ impl Command for StorageBucketCreateCommand {
         let result = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async move {
                 bridge.create_bucket(&name).await
-                    .map_err(|e| ShellError::GenericError {
-                        error: "Failed to create bucket".into(),
-                        msg: e.to_string(),
-                        span: Some(span),
-                        help: None,
-                        inner: vec![],
-                    })?;
+                    .map_err(|e| crate::shell_err(
+                        "Failed to create bucket",
+                        e.to_string(),
+                        Some(span),
+                        None,
+                    ))?;
                 
                 Ok(format!("✅ Bucket '{}' created successfully", name))
             })
@@ -167,7 +163,7 @@ impl Command for StorageBucketCreateCommand {
 /// storage bucket list - List all buckets
 #[derive(Clone)]
 pub struct StorageBucketListCommand {
-    pub bridge: Arc<GarageBridge>,
+    pub bridge: Arc<BlobBridge>,
 }
 
 impl Command for StorageBucketListCommand {
@@ -191,13 +187,12 @@ impl Command for StorageBucketListCommand {
         let result = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async move {
                 let buckets = bridge.list_buckets().await
-                    .map_err(|e| ShellError::GenericError {
-                        error: "Failed to list buckets".into(),
-                        msg: e.to_string(),
-                        span: Some(span),
-                        help: None,
-                        inner: vec![],
-                    })?;
+                    .map_err(|e| crate::shell_err(
+                        "Failed to list buckets",
+                        e.to_string(),
+                        Some(span),
+                        None,
+                    ))?;
                 
                 // Convert to Nushell table
                 let records: Vec<Value> = buckets.into_iter().map(|name| {
@@ -225,7 +220,7 @@ impl Command for StorageBucketListCommand {
 /// storage put - Store an object in a bucket
 #[derive(Clone)]
 pub struct StoragePutCommand {
-    pub bridge: Arc<GarageBridge>,
+    pub bridge: Arc<BlobBridge>,
 }
 
 impl Command for StoragePutCommand {
@@ -255,13 +250,12 @@ impl Command for StoragePutCommand {
         let result = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async move {
                 bridge.put_object(&bucket, &key, bytes::Bytes::from(value.into_bytes())).await
-                    .map_err(|e| ShellError::GenericError {
-                        error: "Failed to store object".into(),
-                        msg: e.to_string(),
-                        span: Some(span),
-                        help: None,
-                        inner: vec![],
-                    })?;
+                    .map_err(|e| crate::shell_err(
+                        "Failed to store object",
+                        e.to_string(),
+                        Some(span),
+                        None,
+                    ))?;
                 
                 Ok(format!("✅ Object stored: {}/{}", bucket, key))
             })
@@ -277,7 +271,7 @@ impl Command for StoragePutCommand {
 /// storage get - Retrieve an object from a bucket
 #[derive(Clone)]
 pub struct StorageGetCommand {
-    pub bridge: Arc<GarageBridge>,
+    pub bridge: Arc<BlobBridge>,
 }
 
 impl Command for StorageGetCommand {
@@ -305,26 +299,24 @@ impl Command for StorageGetCommand {
         let result = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async move {
                 let value = bridge.get_object(&bucket, &key).await
-                    .map_err(|e| ShellError::GenericError {
-                        error: "Failed to retrieve object".into(),
-                        msg: e.to_string(),
-                        span: Some(span),
-                        help: None,
-                        inner: vec![],
-                    })?;
+                    .map_err(|e| crate::shell_err(
+                        "Failed to retrieve object",
+                        e.to_string(),
+                        Some(span),
+                        None,
+                    ))?;
                 
                 match value {
                     Some(bytes) => {
                         let content = String::from_utf8_lossy(&bytes).to_string();
                         Ok(content)
                     },
-                    None => Err(ShellError::GenericError {
-                        error: "Object not found".into(),
-                        msg: format!("No object found at {}/{}", bucket, key),
-                        span: Some(span),
-                        help: Some("Check that the bucket and key are correct".into()),
-                        inner: vec![],
-                    })
+                    None => Err(crate::shell_err(
+                        "Object not found",
+                        format!("No object found at {}/{}", bucket, key),
+                        Some(span),
+                        Some("Check that the bucket and key are correct".into()),
+                    ))
                 }
             })
         });
@@ -369,22 +361,20 @@ impl Command for StoragePeerAddCommand {
         let result = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async move {
                 let wg = WireGuardManager::new(db).await
-                    .map_err(|e| ShellError::GenericError {
-                        error: "Failed to initialize WireGuardManager".into(),
-                        msg: e.to_string(),
-                        span: Some(span),
-                        help: None,
-                        inner: vec![],
-                    })?;
+                    .map_err(|e| crate::shell_err(
+                        "Failed to initialize WireGuardManager",
+                        e.to_string(),
+                        Some(span),
+                        None,
+                    ))?;
                 
                 wg.add_peer(&pubkey, &endpoint).await
-                    .map_err(|e| ShellError::GenericError {
-                        error: "Failed to add peer".into(),
-                        msg: e.to_string(),
-                        span: Some(span),
-                        help: None,
-                        inner: vec![],
-                    })?;
+                    .map_err(|e| crate::shell_err(
+                        "Failed to add peer",
+                        e.to_string(),
+                        Some(span),
+                        None,
+                    ))?;
                 
                 Ok(format!("✅ Peer added successfully\nPublic Key: {}\nEndpoint: {}", pubkey, endpoint))
             })
@@ -424,22 +414,20 @@ impl Command for StoragePeerListCommand {
         let result = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async move {
                 let wg = WireGuardManager::new(db).await
-                    .map_err(|e| ShellError::GenericError {
-                        error: "Failed to initialize WireGuardManager".into(),
-                        msg: e.to_string(),
-                        span: Some(span),
-                        help: None,
-                        inner: vec![],
-                    })?;
+                    .map_err(|e| crate::shell_err(
+                        "Failed to initialize WireGuardManager",
+                        e.to_string(),
+                        Some(span),
+                        None,
+                    ))?;
                 
                 let peers = wg.list_peers().await
-                    .map_err(|e| ShellError::GenericError {
-                        error: "Failed to list peers".into(),
-                        msg: e.to_string(),
-                        span: Some(span),
-                        help: None,
-                        inner: vec![],
-                    })?;
+                    .map_err(|e| crate::shell_err(
+                        "Failed to list peers",
+                        e.to_string(),
+                        Some(span),
+                        None,
+                    ))?;
                 
                 // Convert to Nushell table
                 let records: Vec<Value> = peers.into_iter().map(|(pubkey, endpoint, status)| {

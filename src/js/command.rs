@@ -51,13 +51,12 @@ impl Command for JsCommand {
             println!("--- Nexus Sovereign Logic (JavaScript) ---");
             println!("Type 'exit' to return to nexus shell.");
             
-            let mut rl = DefaultEditor::new().map_err(|e| ShellError::GenericError {
-                error: "REPL Error".into(),
-                msg: e.to_string(),
-                span: Some(call.head),
-                help: None,
-                inner: vec![],
-            })?;
+            let mut rl = DefaultEditor::new().map_err(|e| crate::shell_err(
+                "REPL Error",
+                e.to_string(),
+                Some(call.head),
+                None,
+            ))?;
 
             loop {
                 let readline = rl.readline("nexus [js]> ");
@@ -84,6 +83,7 @@ impl Command for JsCommand {
                                     &mut engine_state.clone(),
                                     &mut _stack.clone(),
                                     val.into_pipeline_data(),
+                                    vec![],
                                     nu_cli::EvaluateCommandsOpts::default(),
                                 );
                                 if let Err(e) = result {
@@ -153,13 +153,12 @@ impl Command for JsCommand {
             };
 
             if c_code.starts_with("NO_") || c_code.starts_with("ERR:") || c_code.starts_with("COMPILER_ERROR") {
-                 return Err(ShellError::GenericError {
-                    error: "Compilation Failed".into(),
-                    msg: c_code,
-                    span: Some(call.head),
-                    help: None,
-                    inner: vec![],
-                });
+                 return Err(crate::shell_err(
+                    "Compilation Failed",
+                    c_code,
+                    Some(call.head),
+                    None,
+                ));
             }
 
             // 2. Crystalize: Compile C -> Binary
@@ -172,31 +171,28 @@ impl Command for JsCommand {
             let header_c = include_str!("../../src/c/NXs.h");
             let header_file = "NXs.h";
 
-            std::fs::write(c_file, &c_code).map_err(|e| ShellError::GenericError {
-                error: "IO Error".into(),
-                msg: e.to_string(),
-                span: Some(call.head),
-                help: None,
-                inner: vec![],
-            })?;
+            std::fs::write(c_file, &c_code).map_err(|e| crate::shell_err(
+                "IO Error",
+                e.to_string(),
+                Some(call.head),
+                None,
+            ))?;
 
             // Write the embedded kernel to disk
-            std::fs::write(kernel_file, kernel_c).map_err(|e| ShellError::GenericError {
-                error: "IO Error (Kernel)".into(),
-                msg: e.to_string(),
-                span: Some(call.head),
-                help: None,
-                inner: vec![],
-            })?;
+            std::fs::write(kernel_file, kernel_c).map_err(|e| crate::shell_err(
+                "IO Error (Kernel)",
+                e.to_string(),
+                Some(call.head),
+                None,
+            ))?;
 
             // Write the embedded header to disk
-            std::fs::write(header_file, header_c).map_err(|e| ShellError::GenericError {
-                error: "IO Error (Header)".into(),
-                msg: e.to_string(),
-                span: Some(call.head),
-                help: None,
-                inner: vec![],
-            })?;
+            std::fs::write(header_file, header_c).map_err(|e| crate::shell_err(
+                "IO Error (Header)",
+                e.to_string(),
+                Some(call.head),
+                None,
+            ))?;
 
             // Compile with clang/cc and link kernel.c
             let output = std::process::Command::new("cc")
@@ -207,23 +203,21 @@ impl Command for JsCommand {
                 .arg("-I.") // Include current dir for headers if needed
                 .arg("-lm")
                 .output()
-                .map_err(|e| ShellError::GenericError {
-                    error: "Compiler Launch Failed".into(),
-                    msg: e.to_string(),
-                    span: Some(call.head),
-                    help: None,
-                    inner: vec![],
-                })?;
+                .map_err(|e| crate::shell_err(
+                    "Compiler Launch Failed",
+                    e.to_string(),
+                    Some(call.head),
+                    None,
+                ))?;
 
             if !output.status.success() {
                  let stderr = String::from_utf8_lossy(&output.stderr);
-                 return Err(ShellError::GenericError {
-                    error: "Native Compilation Failed".into(),
-                    msg: stderr.to_string(),
-                    span: Some(call.head),
-                    help: None,
-                    inner: vec![],
-                });
+                 return Err(crate::shell_err(
+                    "Native Compilation Failed",
+                    stderr.to_string(),
+                    Some(call.head),
+                    None,
+                ));
             }
 
             return Ok(nu_protocol::Value::string(

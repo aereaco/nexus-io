@@ -3,7 +3,7 @@
 
 use nexus_io::ux::gateway::{UxGateway, GatewayConfig};
 use nexus_io::db::Database;
-use nexus_io::storage::GarageBridge;
+use nexus_io::storage::BlobBridge;
 use std::sync::Arc;
 
 #[tokio::main]
@@ -12,7 +12,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Initialize dependencies (minimal for testing)
     let db = Arc::new(Database::init().await);
-    let garage = Arc::new(GarageBridge::new());
+    let garage = Arc::new(BlobBridge::new());
 
     // Configure gateway (dev mode - using ports 8443 and 8080)
     let config = GatewayConfig {

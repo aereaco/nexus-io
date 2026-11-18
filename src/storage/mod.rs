@@ -1,11 +1,11 @@
-// Storage module for Garage DHT and WireGuard mesh integration
+// Storage module for iroh-blobs, s3s, and WireGuard mesh integration
 pub mod wireguard;
 pub mod mesh;
-pub mod garage_config;
-pub mod garage_bridge;
+pub mod storage_config;
+pub mod blob_bridge;
 pub mod command;
 
-pub use garage_bridge::GarageBridge;
+pub use blob_bridge::BlobBridge;
 pub use wireguard::WireGuardManager;
 pub use mesh::MeshReactor;
 

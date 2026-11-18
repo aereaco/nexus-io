@@ -5,7 +5,7 @@ use salvo::prelude::*;
 use std::sync::Arc;
 
 use crate::db::Database;
-use crate::storage::GarageBridge;
+use crate::storage::BlobBridge;
 use crate::ux::surreal_ws::WebSocketHandler;
 use crate::ux::s3_proxy::S3ProxyHandler;
 
@@ -39,12 +39,12 @@ impl Default for GatewayConfig {
 #[derive(Clone)]
 pub struct UxGateway {
     db: Arc<Database>,
-    garage: Arc<GarageBridge>,
+    garage: Arc<BlobBridge>,
     config: GatewayConfig,
 }
 
 impl UxGateway {
-    pub fn new(db: Arc<Database>, garage: Arc<GarageBridge>, config: GatewayConfig) -> Self {
+    pub fn new(db: Arc<Database>, garage: Arc<BlobBridge>, config: GatewayConfig) -> Self {
         Self { db, garage, config }
     }
 

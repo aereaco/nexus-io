@@ -3,7 +3,7 @@ use std::time::Duration;
 use anyhow::{Result, Context};
 use crate::db::Database;
 use crate::storage::wireguard::{WireGuardInterface, PeerConfig};
-use crate::storage::GarageBridge;
+use crate::storage::BlobBridge;
 use crate::compute::{NodeResources, InferenceRouter, PeerRecord};
 use std::collections::HashMap;
 
@@ -14,7 +14,7 @@ use std::collections::HashMap;
 pub struct MeshReactor {
     db: Arc<Database>,
     interface: Arc<WireGuardInterface>,
-    bridge: Arc<GarageBridge>,
+    bridge: Arc<BlobBridge>,
     pub router: Arc<std::sync::RwLock<InferenceRouter>>,
 }
 
@@ -22,7 +22,7 @@ impl MeshReactor {
     pub fn new(
         db: Arc<Database>, 
         interface: Arc<WireGuardInterface>,
-        bridge: Arc<GarageBridge>
+        bridge: Arc<BlobBridge>
     ) -> Self {
         Self { 
             db, 

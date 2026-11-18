@@ -2,13 +2,13 @@ use nu_protocol::engine::{Command, EngineState, Stack};
 use nu_protocol::{Category, PipelineData, ShellError, Signature, Value, IntoPipelineData};
 use std::sync::Arc;
 use crate::db::Database;
-use crate::storage::GarageBridge;
+use crate::storage::BlobBridge;
 use crate::economy::EconomicKernel;
 
 #[derive(Clone)]
 pub struct VerifyCommand {
     pub db: Arc<Database>,
-    pub bridge: Arc<GarageBridge>,
+    pub bridge: Arc<BlobBridge>,
     pub economy: Arc<EconomicKernel>,
 }
 

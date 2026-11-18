@@ -33,7 +33,7 @@ impl Command for HostScanCommand {
         _input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
         let path_arg: Option<String> = call.opt(engine_state, _stack, 0)?;
-        let path_str = path_arg.unwrap_or_else(|| "/tmp".to_string());
+        let path_str = path_arg.unwrap_or_else(|| std::env::temp_dir().to_string_lossy().to_string());
         
         let db = self.db.clone();
         tokio::task::block_in_place(|| {
@@ -42,13 +42,12 @@ impl Command for HostScanCommand {
                     .bind(("path", path_str))
                     .await
             })
-        }).map_err(|e| ShellError::GenericError {
-            error: "VFS Query Error".into(),
-            msg: e.to_string(),
-            span: Some(call.head),
-            help: None,
-            inner: vec![],
-        })?;
+        }).map_err(|e| crate::shell_err(
+            "VFS Query Error",
+            e.to_string(),
+            Some(call.head),
+            None,
+        ))?;
 
         // Simplified mapping for the prototype
         Ok(Value::list(vec![], call.head).into_pipeline_data())

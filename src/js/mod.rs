@@ -395,13 +395,12 @@ impl JsClient {
         let (resp_tx, resp_rx) = channel();
         let span_val = NuValue::nothing(span);
         self.tx.send(JsRequest::Execute(code, span_val, resp_tx)).expect("JS Actor Dead");
-        resp_rx.recv().unwrap_or_else(|_| Err(ShellError::GenericError {
-            error: "JS Engine Error".into(),
-            msg: "JS Actor Disconnected".into(),
-            span: Some(span),
-            help: None,
-            inner: vec![],
-        }))
+        resp_rx.recv().unwrap_or_else(|_| Err(crate::shell_err(
+            "JS Engine Error",
+            "JS Actor Disconnected",
+            Some(span),
+            None,
+        )))
     }
 
     pub fn oneshot_async_blocking(mut code: String, db: Option<Arc<Database>>, span: Span) -> Result<NuValue, ShellError> {
@@ -457,13 +456,12 @@ fn format_js_error(e: quickjs_rusty::ExecutionError, span: Span, is_module: bool
         other => format!("{:?}", other),
     };
     
-    ShellError::GenericError {
-        error: if is_module { "JS Module Error".into() } else { "JS Error".into() },
+    crate::shell_err(
+        if is_module { "JS Module Error" } else { "JS Error" },
         msg,
-        span: Some(span),
-        help: None,
-        inner: vec![],
-    }
+        Some(span),
+        None,
+    )
 }
 
 fn js_to_nu(val: &OwnedJsValue, span: Span) -> NuValue {

@@ -3,19 +3,19 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use anyhow::Result;
 use crate::db::Database;
-use super::GarageBridge;
+use super::BlobBridge;
 
-/// Global singleton GarageBridge instance
+/// Global singleton BlobBridge instance
 /// This ensures state persists across multiple Nushell command invocations
-static BRIDGE: Lazy<Arc<RwLock<Option<GarageBridge>>>> = 
+static BRIDGE: Lazy<Arc<RwLock<Option<BlobBridge>>>> = 
     Lazy::new(|| Arc::new(RwLock::new(None)));
 
-/// Get or initialize the global GarageBridge singleton
+/// Get or initialize the global BlobBridge singleton
 /// 
 /// This function returns a clone of the bridge, allowing multiple commands
-/// to share the same underlying storage HashMap. The first call initializes
+/// to share the same underlying storage store. The first call initializes
 /// the bridge, subsequent calls return the existing instance.
-pub async fn get_bridge(db: Arc<Database>) -> Result<GarageBridge> {
+pub async fn get_bridge(db: Arc<Database>) -> Result<BlobBridge> {
     // Fast path: check if already initialized (read lock)
     {
         let bridge_lock = BRIDGE.read().await;
@@ -29,8 +29,8 @@ pub async fn get_bridge(db: Arc<Database>) -> Result<GarageBridge> {
     
     // Double-check in case another task initialized while we waited
     if bridge_lock.is_none() {
-        println!("DEBUG: Initializing global GarageBridge singleton");
-        *bridge_lock = Some(GarageBridge::new(db).await?);
+        println!("DEBUG: Initializing global BlobBridge singleton");
+        *bridge_lock = Some(BlobBridge::new(db).await?);
     }
     
     Ok(bridge_lock.as_ref().unwrap().clone())
@@ -41,5 +41,5 @@ pub async fn get_bridge(db: Arc<Database>) -> Result<GarageBridge> {
 pub async fn reset_bridge() {
     let mut bridge_lock = BRIDGE.write().await;
     *bridge_lock = None;
-    println!("DEBUG: Global GarageBridge reset");
+    println!("DEBUG: Global BlobBridge reset");
 }

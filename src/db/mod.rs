@@ -89,9 +89,8 @@ impl Database {
                 .await;
         }
 
-        // 3. PROJECT INITIAL VFS (Subset for prototype)
-        // Projecting /tmp for demonstration
-        if let Ok(entries) = std::fs::read_dir("/tmp") {
+        // 3. PROJECT INITIAL VFS (Cross-platform temp dir)
+        if let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) {
             for entry in entries.flatten() {
                 if let Ok(meta) = entry.metadata() {
                     let path = entry.path().to_string_lossy().to_string();

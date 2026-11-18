@@ -13,13 +13,12 @@ pub fn transform_ts_to_js(source: &str, span: Span) -> Result<String, ShellError
     
     // We assume .ts for the purpose of the transformer
     let path = Path::new("input.ts");
-    let source_type = SourceType::from_path(path).map_err(|_| ShellError::GenericError {
-        error: "Transformer Error".into(),
-        msg: "Failed to determine source type".into(),
-        span: Some(span),
-        help: None,
-        inner: vec![],
-    })?;
+    let source_type = SourceType::from_path(path).map_err(|_| crate::shell_err(
+        "Transformer Error",
+        "Failed to determine source type",
+        Some(span),
+        None,
+    ))?;
 
     let parser_return = Parser::new(&allocator, source, source_type).parse();
 
@@ -30,13 +29,12 @@ pub fn transform_ts_to_js(source: &str, span: Span) -> Result<String, ShellError
             .collect::<Vec<_>>()
             .join("\n");
         
-        return Err(ShellError::GenericError {
-            error: "TypeScript Syntax Error".into(),
-            msg: err_msg,
-            span: Some(span),
-            help: Some("Ensure your TypeScript code is valid.".into()),
-            inner: vec![],
-        });
+        return Err(crate::shell_err(
+            "TypeScript Syntax Error",
+            err_msg,
+            Some(span),
+            Some("Ensure your TypeScript code is valid.".into()),
+        ));
     }
 
     let program = allocator.alloc(parser_return.program);

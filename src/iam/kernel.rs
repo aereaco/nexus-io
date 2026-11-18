@@ -25,21 +25,19 @@ impl SecurityKernel {
         let mut response = self.db.client.query("SELECT VALUE active_role FROM user WHERE username = $user")
             .bind(("user", username))
             .await
-            .map_err(|e| ShellError::GenericError {
-                error: "IAM Kernel Error".into(),
-                msg: format!("Failed to fetch user policy: {}", e),
-                span: Some(_span),
-                help: None,
-                inner: vec![],
-            })?;
+            .map_err(|e| crate::shell_err(
+                "IAM Kernel Error",
+                format!("Failed to fetch user policy: {}", e),
+                Some(_span),
+                None,
+            ))?;
 
-        let role_val: Option<SurValue> = response.take(0).map_err(|e| ShellError::GenericError {
-            error: "IAM Kernel Error".into(),
-            msg: format!("Data corruption in user table: {}", e),
-            span: Some(_span),
-            help: None,
-            inner: vec![],
-        })?;
+        let role_val: Option<SurValue> = response.take(0).map_err(|e| crate::shell_err(
+            "IAM Kernel Error",
+            format!("Data corruption in user table: {}", e),
+            Some(_span),
+            None,
+        ))?;
 
         // Convert role_val to string for comparison (e.g. "role:admin")
         let role_id = match role_val {
@@ -63,13 +61,12 @@ impl SecurityKernel {
                 let is_admin = role_id.contains("role:admin") || role_id.contains("admin");
 
                 if (upper.contains("DROP") || upper.contains("DELETE")) && !is_admin {
-                    return Err(ShellError::GenericError {
-                        error: "Security Violation".into(),
-                        msg: format!("Destructive SQL operations are restricted to Administrators. (Role Found: {})", role_id),
-                        span: Some(_span),
-                        help: Some("Contact your system administrator for elevation.".into()),
-                        inner: vec![],
-                    });
+                    return Err(crate::shell_err(
+                        "Security Violation",
+                        format!("Destructive SQL operations are restricted to Administrators. (Role Found: {})", role_id),
+                        Some(_span),
+                        Some("Contact your system administrator for elevation.".into()),
+                    ));
                 }
             }
         }
@@ -80,13 +77,12 @@ impl SecurityKernel {
                 let is_guest = role_id.contains("role:guest") || role_id.contains("guest");
                 let lower_arg = arg.to_lowercase();
                 if (lower_arg.contains("require") && lower_arg.contains("fs")) && is_guest {
-                    return Err(ShellError::GenericError {
-                        error: "Security Violation".into(),
-                        msg: format!("Filesystem access from JS is restricted for Guest users. (Detected in: {}, Role: {})", arg, role_id),
-                        span: Some(_span),
-                        help: Some("Use --harden to run in an isolated scratchpad.".into()),
-                        inner: vec![],
-                    });
+                    return Err(crate::shell_err(
+                        "Security Violation",
+                        format!("Filesystem access from JS is restricted for Guest users. (Detected in: {}, Role: {})", arg, role_id),
+                        Some(_span),
+                        Some("Use --harden to run in an isolated scratchpad.".into()),
+                    ));
                 }
             }
         }

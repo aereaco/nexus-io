@@ -8,11 +8,30 @@ mod ux;
 mod economy;
 
 use std::sync::Arc;
+use std::borrow::Cow;
+use std::time::Instant;
 use nu_protocol::engine::{StateWorkingSet, Stack};
 use nu_cmd_lang::create_default_context;
 use nu_command::add_shell_command_context;
-use nu_protocol::{Value, Span};
-use std::time::Instant;
+use nu_protocol::{Value, Span, ShellError};
+use nu_protocol::shell_error::generic::GenericError;
+
+/// Shared helper to construct a `ShellError::Generic` across Nexus-IO modules.
+pub fn shell_err(
+    title: impl Into<Cow<'static, str>>,
+    msg: impl Into<Cow<'static, str>>,
+    span: Option<Span>,
+    help: Option<Cow<'static, str>>,
+) -> ShellError {
+    let mut err = match span {
+        Some(s) => GenericError::new(title, msg, s),
+        None => GenericError::new_internal(title, msg),
+    };
+    if let Some(h) = help {
+        err = err.with_help(h);
+    }
+    ShellError::Generic(err)
+}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
@@ -70,6 +89,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &mut engine_state,
                 &mut stack,
                 nu_protocol::PipelineData::Value(result, None),
+                vec![],
                 nu_cli::EvaluateCommandsOpts::default(),
             ) {
                  nu_protocol::report_shell_error(None, &engine_state, &e);
@@ -97,10 +117,10 @@ async fn async_main(args: Vec<String>, is_test: bool) -> Result<(), Box<dyn std:
         async { 
             // We need a temporary DB handle for bridge init before the joint DB is ready, 
             // but Database::init() is async. 
-            // Actually, GarageBridge needs the DB. So we must sequence this or use the DB after init.
+            // Actually, BlobBridge needs the DB. So we must sequence this or use the DB after init.
             // Let's defer bridge init to after DB init.
             // Returning None for now in the join, will init after.
-            let res: Option<Arc<storage::GarageBridge>> = None;
+            let res: Option<Arc<storage::BlobBridge>> = None;
             res
         },
         async {
@@ -110,7 +130,7 @@ async fn async_main(args: Vec<String>, is_test: bool) -> Result<(), Box<dyn std:
     );
     
     // Now initialize the persistent bridge with the ready DB
-    let bridge = Arc::new(storage::GarageBridge::new(db.clone()).await.expect("Failed to init storage bridge"));
+    let bridge = Arc::new(storage::BlobBridge::new(db.clone()).await.expect("Failed to init storage bridge"));
 
     let kernel = Arc::new(iam::kernel::SecurityKernel::new(db.clone()));
     let economy = Arc::new(economy::EconomicKernel::new(db.clone()));
@@ -350,6 +370,7 @@ async fn async_main(args: Vec<String>, is_test: bool) -> Result<(), Box<dyn std:
             &mut engine_state,
             &mut stack,
             nu_protocol::PipelineData::empty(),
+            vec![],
             nu_cli::EvaluateCommandsOpts::default(),
         );
 
@@ -363,7 +384,6 @@ async fn async_main(args: Vec<String>, is_test: bool) -> Result<(), Box<dyn std:
             stack,
             None, 
             None, 
-            Instant::now(),
         );
 
         if let Err(e) = result {

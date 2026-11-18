@@ -140,10 +140,10 @@ impl WireGuardManager {
     }
 }
 
-// Active WireGuard userspace interface (boringtun)
+// Active WireGuard userspace interface (boringtun on Unix, wintun on Windows)
 pub struct WireGuardInterface {
     _name: String,
-    // Keep handle alive
+    #[cfg(unix)]
     _handle: Option<boringtun::device::DeviceHandle>,
 }
 
@@ -151,10 +151,11 @@ impl WireGuardInterface {
     /// Start the userspace WireGuard interface
     pub async fn start(name: &str, _privkey: &str, _port: u16) -> Result<Self> {
         println!("🚀 Starting WireGuard Interface: {}", name);
-        
+
+        #[cfg(unix)]
         let mut _handle = None;
 
-        #[cfg(target_os = "linux")]
+        #[cfg(unix)]
         {
             let config = boringtun::device::DeviceConfig::default();
             // This starts the boringtun event loop
@@ -166,13 +167,26 @@ impl WireGuardInterface {
                 Err(e) => {
                     eprintln!("⚠️ Userspace WireGuard (boringtun) unavailable: {}", e);
                     eprintln!("   (This is expected if running without CAP_NET_ADMIN. Mesh networking will be limited.)");
-                    // We continue gracefully.
+                }
+            }
+        }
+
+        #[cfg(windows)]
+        {
+            // Native Windows Wintun adapter hook (requires wintun.dll + elevation for L3 TUN)
+            match unsafe { wintun_bindings::load() } {
+                Ok(_wintun) => {
+                    println!("✅ Wintun driver loaded for WireGuard interface: {}", name);
+                }
+                Err(e) => {
+                    eprintln!("⚠️ Wintun driver unavailable ({}); WireGuard crypto active in userspace mode", e);
                 }
             }
         }
 
         Ok(Self {
             _name: name.to_string(),
+            #[cfg(unix)]
             _handle,
         })
     }

@@ -44,13 +44,12 @@ impl Command for SqlCommand {
             println!("--- Nexus Mind Plane (SurrealQL) ---");
             println!("Type 'exit' to return to nexus shell.");
             
-            let mut rl = DefaultEditor::new().map_err(|e| ShellError::GenericError {
-                error: "REPL Error".into(),
-                msg: e.to_string(),
-                span: Some(call.head),
-                help: None,
-                inner: vec![],
-            })?;
+            let mut rl = DefaultEditor::new().map_err(|e| crate::shell_err(
+                "REPL Error",
+                e.to_string(),
+                Some(call.head),
+                None,
+            ))?;
 
             loop {
                 let readline = rl.readline("nexus [sql]> ");
@@ -109,6 +108,7 @@ impl Command for SqlCommand {
                                                 &mut engine_state.clone(),
                                                 &mut _stack.clone(),
                                                 table_val.into_pipeline_data(),
+                                                vec![],
                                                 nu_cli::EvaluateCommandsOpts::default(),
                                             );
                                         } else {
@@ -204,24 +204,22 @@ impl Command for SqlCommand {
                          Ok(pipeline_data)
                     }
                     Err(e) => {
-                        Err(ShellError::GenericError {
-                            error: "Database Error".into(),
-                            msg: e.to_string(),
-                            span: Some(call.head),
-                            help: None,
-                            inner: vec![],
-                        })
+                        Err(crate::shell_err(
+                            "Database Error",
+                            e.to_string(),
+                            Some(call.head),
+                            None,
+                        ))
                     }
                 }
             },
             Err(e) => {
-                 Err(ShellError::GenericError {
-                    error: "System Error".into(),
-                    msg: e.to_string(),
-                    span: Some(call.head),
-                    help: None,
-                    inner: vec![],
-                })
+                 Err(crate::shell_err(
+                    "System Error",
+                    e.to_string(),
+                    Some(call.head),
+                    None,
+                ))
             }
         }
     }

@@ -3,12 +3,12 @@ use salvo::http::{header, Method};
 use bytes::Bytes;
 use std::sync::Arc;
 
-use crate::storage::GarageBridge;
+use crate::storage::BlobBridge;
 
 /// S3 request handler struct
 #[derive(Clone)]
 pub struct S3ProxyHandler {
-    pub garage: Arc<GarageBridge>,
+    pub garage: Arc<BlobBridge>,
 }
 
 #[async_trait]
@@ -98,14 +98,33 @@ impl S3ProxyHandler {
             }
         };
 
-        // Put object to Garage
-        match self.garage.put_object(&bucket, &key, body).await {
-            Ok(_) => {
+        // Put object with optional S3 CAS preconditions (If-Match / If-None-Match)
+        let if_match = req
+            .headers()
+            .get(header::IF_MATCH)
+            .and_then(|v| v.to_str().ok())
+            .map(String::from);
+        let if_none_match = req
+            .headers()
+            .get(header::IF_NONE_MATCH)
+            .and_then(|v| v.to_str().ok())
+            == Some("*");
+
+        match self
+            .garage
+            .put_object_cas(&bucket, &key, body, if_match.as_deref(), if_none_match)
+            .await
+        {
+            Ok(etag) => {
                 // Success
                 res.status_code(StatusCode::OK);
                 res.add_header("x-amz-request-id", "nexus-io-gateway", true).ok();
-                res.add_header("ETag", format!("\"{}\"", md5_hash(&key)), true).ok();
+                res.add_header("ETag", format!("\"{}\"", etag), true).ok();
                 res.render(Text::Plain("Object stored successfully"));
+            }
+            Err(e) if e.downcast_ref::<crate::storage::blob_bridge::CasConflictError>().is_some() => {
+                res.status_code(StatusCode::PRECONDITION_FAILED);
+                res.render(Text::Plain(e.to_string()));
             }
             Err(e) => {
                 // Error storing object
@@ -151,12 +170,13 @@ impl S3ProxyHandler {
             }
         };
 
-        // Check if object exists
-        match self.garage.get_object(&bucket, &key).await {
-            Ok(Some(data)) => {
+        // Check if object exists without reading bytes
+        match self.garage.head_object(&bucket, &key).await {
+            Ok(Some(meta)) => {
                 // Object exists - return metadata
                 res.status_code(StatusCode::OK);
-                res.add_header(header::CONTENT_LENGTH, data.len().to_string(), true).ok();
+                res.add_header(header::CONTENT_LENGTH, meta.size.to_string(), true).ok();
+                res.add_header("ETag", format!("\"{}\"", meta.etag), true).ok();
                 
                 if let Some(content_type) = guess_content_type(&key) {
                     res.add_header(header::CONTENT_TYPE, content_type, true).ok();
