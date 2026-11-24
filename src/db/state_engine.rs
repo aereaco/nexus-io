@@ -233,3 +233,158 @@ fn json_to_sur(val: &serde_json::Value) -> SurValue {
         }
     }
 }
+
+fn nexus_to_sur(val: &nexus_db::Value) -> SurValue {
+    json_to_sur(&val.to_json())
+}
+
+fn sur_to_nexus(val: &SurValue) -> nexus_db::Value {
+    nexus_db::Value::from_json(&sur_to_json(val))
+}
+
+#[salvo::prelude::async_trait]
+impl StateEngine for nexus_db::NexusDb {
+    async fn query_scoped(
+        &self,
+        ns: &str,
+        db: &str,
+        surql: &str,
+        bindings: Vec<(String, SurValue)>,
+    ) -> Result<Vec<SurValue>> {
+        let converted: Vec<(String, nexus_db::Value)> = bindings
+            .into_iter()
+            .map(|(k, v)| (k, sur_to_nexus(&v)))
+            .collect();
+        let rows = nexus_db::NexusDb::query_scoped(self, ns, db, surql, converted)?;
+        Ok(rows.iter().map(nexus_to_sur).collect())
+    }
+
+    async fn kv_get(&self, ns: &str, db: &str, key: &str) -> Result<Option<SurValue>> {
+        Ok(nexus_db::NexusDb::kv_get(self, ns, db, key)?
+            .as_ref()
+            .map(nexus_to_sur))
+    }
+
+    async fn kv_put(&self, ns: &str, db: &str, key: &str, value: SurValue) -> Result<()> {
+        nexus_db::NexusDb::kv_put(self, ns, db, key, sur_to_nexus(&value))
+    }
+
+    async fn kv_delete(&self, ns: &str, db: &str, key: &str) -> Result<()> {
+        nexus_db::NexusDb::kv_delete(self, ns, db, key)
+    }
+
+    async fn kv_list(&self, ns: &str, db: &str, prefix: Option<&str>) -> Result<Vec<(String, SurValue)>> {
+        let entries = nexus_db::NexusDb::kv_list(self, ns, db, prefix)?;
+        Ok(entries
+            .into_iter()
+            .map(|(k, v)| (k, nexus_to_sur(&v)))
+            .collect())
+    }
+
+    async fn export_snapshot(&self, ns: &str, db: &str) -> Result<Bytes> {
+        Ok(Bytes::from(nexus_db::NexusDb::export_snapshot(self, ns, db)?))
+    }
+
+    async fn import_snapshot(&self, ns: &str, db: &str, snapshot: Bytes) -> Result<()> {
+        nexus_db::NexusDb::import_snapshot(self, ns, db, &snapshot)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::sql_compiler::compile_sqlite_to_surql;
+    use surrealdb::engine::local::Mem;
+    use surrealdb::Surreal;
+
+    /// Differential test harness: runs identical SurrealQL, SQLite-compiled SQL, KV, and snapshot
+    /// operations against both SurrealDB 4.0 and `nexus-db` and asserts identical outputs.
+    #[test]
+    fn differential_nexus_db_matches_surrealdb_4() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let rt = tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .thread_stack_size(16 * 1024 * 1024)
+                    .build()
+                    .unwrap();
+                rt.block_on(Box::pin(async {
+                    let client = Surreal::new::<Mem>(()).await.unwrap();
+                    client.use_ns("nexus").use_db("system").await.unwrap();
+                    let surreal_engine = Database { client };
+                    let nexus_engine = nexus_db::NexusDb::open_mem();
+
+                    let engines: [&dyn StateEngine; 2] = [&surreal_engine, &nexus_engine];
+                    let mut results = Vec::new();
+
+                    for eng in engines {
+                        // 1. SQLite AST-compiled CREATE TABLE + INSERT + SELECT
+                        let ddl = compile_sqlite_to_surql(
+                            "CREATE TABLE IF NOT EXISTS tasks (title TEXT, score INT)",
+                            vec![],
+                        )
+                        .unwrap();
+                        eng.query_scoped("diff_app", "room_1", &ddl.surql, ddl.bindings)
+                            .await
+                            .unwrap();
+
+                        let ins1 = compile_sqlite_to_surql(
+                            "INSERT INTO tasks (title, score) VALUES (?, ?)",
+                            vec![
+                                SurValue::String("alpha".into()),
+                                SurValue::Number(surrealdb::types::Number::Int(10)),
+                            ],
+                        )
+                        .unwrap();
+                        eng.query_scoped("diff_app", "room_1", &ins1.surql, ins1.bindings)
+                            .await
+                            .unwrap();
+
+                        let ins2 = compile_sqlite_to_surql(
+                            "INSERT INTO tasks (title, score) VALUES (?, ?)",
+                            vec![
+                                SurValue::String("beta".into()),
+                                SurValue::Number(surrealdb::types::Number::Int(25)),
+                            ],
+                        )
+                        .unwrap();
+                        eng.query_scoped("diff_app", "room_1", &ins2.surql, ins2.bindings)
+                            .await
+                            .unwrap();
+
+                        let rows = eng
+                            .query_scoped(
+                                "diff_app",
+                                "room_1",
+                                "SELECT VALUE title FROM tasks WHERE score >= 10 ORDER BY score DESC;",
+                                vec![],
+                            )
+                            .await
+                            .unwrap();
+
+                        // 2. Cell KV + snapshot round-trip
+                        eng.kv_put("diff_app", "room_1", "k1", SurValue::String("v1".into()))
+                            .await
+                            .unwrap();
+                        let kv_val = eng.kv_get("diff_app", "room_1", "k1").await.unwrap();
+                        let snap = eng.export_snapshot("diff_app", "room_1").await.unwrap();
+                        eng.kv_delete("diff_app", "room_1", "k1").await.unwrap();
+                        eng.import_snapshot("diff_app", "room_1", snap).await.unwrap();
+                        let kv_after = eng.kv_get("diff_app", "room_1", "k1").await.unwrap();
+
+                        results.push((
+                            rows.iter().map(sur_to_json).collect::<Vec<_>>(),
+                            kv_val.as_ref().map(sur_to_json),
+                            kv_after.as_ref().map(sur_to_json),
+                        ));
+                    }
+
+                    assert_eq!(results[0], results[1], "nexus-db diverged from SurrealDB 4.0!");
+                }));
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+}

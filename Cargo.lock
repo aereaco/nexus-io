@@ -4505,7 +4505,7 @@ dependencies = [
  "postcard",
  "rand 0.10.4",
  "range-collections",
- "redb",
+ "redb 4.6.0",
  "ref-cast",
  "reflink-copy",
  "self_cell",
@@ -5960,6 +5960,7 @@ dependencies = [
  "hex",
  "iroh",
  "iroh-blobs",
+ "nexus-db",
  "nu-cli",
  "nu-cmd-lang",
  "nu-command",
@@ -5993,6 +5994,18 @@ dependencies = [
  "uuid",
  "wasmtime",
  "wintun-bindings",
+]
+
+[[package]]
+name = "nexus-db"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "redb 2.6.4",
+ "serde",
+ "serde_json",
+ "uuid",
 ]
 
 [[package]]
@@ -8837,6 +8850,15 @@ checksum = "76009fbe0614077fc1a2ce255e3a1881a2e3a3527097d5dc6d8212c585e7e38b"
 dependencies = [
  "quote",
  "syn 2.0.114",
+]
+
+[[package]]
+name = "redb"
+version = "2.6.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3d64e07496d293ad8ed401c4d193d5b9f0f97671fbd5bf21d691a0c7d2c53dc8"
+dependencies = [
+ "libc",
 ]
 
 [[package]]
