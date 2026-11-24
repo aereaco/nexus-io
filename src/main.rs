@@ -10,7 +10,37 @@ use nu_protocol::{Value, Span};
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
     let is_test = args.contains(&"--test".to_string());
+    let launch_gui = args.contains(&"--gui".to_string())
+        || std::env::var("NEXUS_GUI").as_deref() == Ok("1");
     let positional_args: Vec<String> = args.iter().skip(1).filter(|a| !a.starts_with("--")).cloned().collect();
+
+    // 0. Native Device GUI Mode (`--gui` or `NEXUS_GUI=1`):
+    // Spawns the embedded Nexus-IO gateway on a background thread and opens the OS-native WebView
+    // (`WebView2` / `WKWebView` / `WebKitGTK`) on the main OS thread.
+    if launch_gui {
+        let mut cfg = ux::native_gui::NativeWindowConfig::default();
+        if let Ok(url) = std::env::var("NEXUS_GUI_URL") {
+            cfg.url = url;
+        }
+        std::thread::spawn(|| {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("tokio runtime for GUI gateway");
+            rt.block_on(async {
+                let db = Arc::new(db::Database::init().await);
+                let bridge = Arc::new(
+                    storage::BlobBridge::new(db.clone())
+                        .await
+                        .expect("Failed to init storage bridge"),
+                );
+                let gw = ux::UxGateway::new(db, bridge, ux::GatewayConfig::default());
+                let _ = gw.start().await;
+            });
+        });
+        ux::native_gui::launch_native_window(cfg)?;
+        return Ok(());
+    }
 
     // 1. Hyper-Fast Fluid-First Short-Circuit (Sub-50ms Path)
     // If the task is JS and doesn't require the shared Data Plane, bypass Tokio/DB entirely

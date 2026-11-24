@@ -396,8 +396,96 @@ pub fn verify_jwt(token: &str, secret: &str) -> Result<JwtClaims> {
         return Err(anyhow!("Invalid JWT signature"));
     }
 
+    decode_and_validate_claims(parts[1])
+}
+
+/// Issue an asymmetric EdDSA (Ed25519) JWT (`header.payload.signature`).
+pub fn issue_eddsa_jwt(claims: &JwtClaims, signing_key_bytes: &[u8; 32]) -> Result<String> {
+    use ed25519_dalek::{Signer, SigningKey};
+    let signing_key = SigningKey::from_bytes(signing_key_bytes);
+    let header = serde_json::json!({ "alg": "EdDSA", "typ": "JWT" });
+    let h_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header)?);
+    let p_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(claims)?);
+    let signing_input = format!("{}.{}", h_b64, p_b64);
+    let sig = signing_key.sign(signing_input.as_bytes());
+    let s_b64 = URL_SAFE_NO_PAD.encode(sig.to_bytes());
+    Ok(format!("{}.{}", signing_input, s_b64))
+}
+
+/// Verify an asymmetric EdDSA (Ed25519) JWT against a 32-byte public key.
+pub fn verify_eddsa_jwt(token: &str, public_key_bytes: &[u8; 32]) -> Result<JwtClaims> {
+    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+    let parts: Vec<&str> = token.split('.').collect();
+    if parts.len() != 3 {
+        return Err(anyhow!("Invalid JWT format"));
+    }
+    let signing_input = format!("{}.{}", parts[0], parts[1]);
+    let sig_bytes = URL_SAFE_NO_PAD
+        .decode(parts[2])
+        .map_err(|_| anyhow!("Invalid EdDSA signature encoding"))?;
+    let sig = Signature::from_slice(&sig_bytes).map_err(|_| anyhow!("Invalid EdDSA signature length"))?;
+    let vk = VerifyingKey::from_bytes(public_key_bytes)
+        .map_err(|_| anyhow!("Invalid Ed25519 public key"))?;
+    vk.verify(signing_input.as_bytes(), &sig)
+        .map_err(|_| anyhow!("Invalid EdDSA JWT signature"))?;
+    decode_and_validate_claims(parts[1])
+}
+
+/// JSON Web Key (JWK) entry for OIDC / JWKS verification (`EdDSA` OKP + `HS256` oct).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Jwk {
+    pub kty: String,
+    #[serde(default)]
+    pub alg: Option<String>,
+    #[serde(default)]
+    pub kid: Option<String>,
+    /// Base64url-encoded Ed25519 public key (`kty = "OKP"`, `crv = "Ed25519"`)
+    #[serde(default)]
+    pub x: Option<String>,
+    /// Base64url-encoded symmetric key (`kty = "oct"`)
+    #[serde(default)]
+    pub k: Option<String>,
+}
+
+/// JSON Web Key Set (`{ "keys": [ ... ] }`) compatible with OIDC providers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Jwks {
+    pub keys: Vec<Jwk>,
+}
+
+/// Verify a JWT against any matching key in a `Jwks` keyset (`EdDSA` or `HS256`).
+pub fn verify_jwt_with_jwks(token: &str, jwks: &Jwks) -> Result<JwtClaims> {
+    for jwk in &jwks.keys {
+        if jwk.kty.eq_ignore_ascii_case("OKP") {
+            if let Some(ref x_b64) = jwk.x {
+                if let Ok(raw) = URL_SAFE_NO_PAD.decode(x_b64) {
+                    if raw.len() == 32 {
+                        let mut pk = [0u8; 32];
+                        pk.copy_from_slice(&raw);
+                        if let Ok(claims) = verify_eddsa_jwt(token, &pk) {
+                            return Ok(claims);
+                        }
+                    }
+                }
+            }
+        } else if jwk.kty.eq_ignore_ascii_case("oct") {
+            if let Some(ref k_b64) = jwk.k {
+                if let Ok(raw) = URL_SAFE_NO_PAD.decode(k_b64) {
+                    if let Ok(secret) = String::from_utf8(raw) {
+                        if let Ok(claims) = verify_jwt(token, &secret) {
+                            return Ok(claims);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Err(anyhow!("No key in JWKS verified the provided JWT"))
+}
+
+fn decode_and_validate_claims(payload_b64: &str) -> Result<JwtClaims> {
     let payload_bytes = URL_SAFE_NO_PAD
-        .decode(parts[1])
+        .decode(payload_b64)
         .map_err(|_| anyhow!("Invalid JWT payload encoding"))?;
     let claims: JwtClaims = serde_json::from_slice(&payload_bytes)?;
 

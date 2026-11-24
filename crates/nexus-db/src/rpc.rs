@@ -84,6 +84,25 @@ impl RpcSession {
         self.db.query_scoped(&self.ns, &self.database, sql, bindings)
     }
 
+    fn exec_query_multi(
+        &self,
+        sql: &str,
+        bindings: Vec<(String, Value)>,
+    ) -> anyhow::Result<Vec<crate::StatementOutcome>> {
+        #[cfg(feature = "auth")]
+        if let Some(ref auth) = self.auth {
+            return self.db.query_scoped_multi_with_auth(
+                &self.ns,
+                &self.database,
+                sql,
+                bindings,
+                auth.clone(),
+            );
+        }
+        self.db
+            .query_scoped_multi(&self.ns, &self.database, sql, bindings)
+    }
+
     pub fn handle_json(&mut self, raw: &str) -> String {
         let req: RpcRequest = match serde_json::from_str(raw) {
             Ok(r) => r,
@@ -375,9 +394,20 @@ impl RpcSession {
                         bindings.push((k.clone(), Value::from_json(v)));
                     }
                 }
-                let rows = self.exec_query(sql, bindings)?;
-                let json_rows: Vec<JsonValue> = rows.iter().map(Value::to_json).collect();
-                Ok(json!([{ "status": "OK", "result": json_rows }]))
+                let outcomes = self.exec_query_multi(sql, bindings)?;
+                let frames: Vec<JsonValue> = outcomes
+                    .into_iter()
+                    .map(|o| {
+                        let json_rows: Vec<JsonValue> =
+                            o.result.iter().map(Value::to_json).collect();
+                        json!({
+                            "time": format!("{}µs", o.time_us),
+                            "status": o.status,
+                            "result": json_rows
+                        })
+                    })
+                    .collect();
+                Ok(JsonValue::Array(frames))
             }
             "select" => {
                 let thing = params

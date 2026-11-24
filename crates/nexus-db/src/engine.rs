@@ -52,6 +52,18 @@ struct FieldMeta {
     readonly: bool,
     #[serde(default = "default_on_delete")]
     on_delete: OnDeleteAction,
+    #[serde(default)]
+    permissions_select: Option<Expr>,
+    #[serde(default)]
+    permissions_write: Option<Expr>,
+}
+
+/// Per-statement execution outcome for SurrealDB multi-statement `POST /sql` and RPC `query` parity.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StatementOutcome {
+    pub status: String,
+    pub time_us: u64,
+    pub result: Vec<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -306,7 +318,11 @@ impl<'a> ExecContext<'a> {
                 }
             }
             // IAM Admin DDL (OWNER only)
-            Statement::DefineUser { .. } | Statement::DefineAccess { .. } => {
+            Statement::DefineUser { .. }
+            | Statement::DefineAccess { .. }
+            | Statement::AccessGrant { .. }
+            | Statement::AccessRevoke { .. }
+            | Statement::AccessPurge { .. } => {
                 if !auth.can_admin_iam(&self.ns, &self.db) {
                     return Err(anyhow!(
                         "IAM Violation: OWNER role required for user/access administration"
@@ -338,6 +354,12 @@ impl<'a> ExecContext<'a> {
     }
 
     pub fn execute_all(&mut self, stmts: &[Statement]) -> Result<Vec<Value>> {
+        let outcomes = self.execute_all_detailed(stmts)?;
+        Ok(outcomes.into_iter().last().map(|o| o.result).unwrap_or_default())
+    }
+
+    /// Execute all statements and return one `StatementOutcome` per statement (SurrealDB HTTP/RPC batch parity).
+    pub fn execute_all_detailed(&mut self, stmts: &[Statement]) -> Result<Vec<StatementOutcome>> {
         let _ = self.load_persistent_params();
         #[cfg(feature = "auth")]
         if let Some(ref auth) = self.auth {
@@ -357,14 +379,18 @@ impl<'a> ExecContext<'a> {
                     .or_insert_with(|| Value::String(ac.clone()));
             }
         }
-        let mut last = Vec::new();
+        let mut outcomes = Vec::with_capacity(stmts.len());
         for stmt in stmts {
             #[cfg(feature = "auth")]
             self.check_rbac(stmt)?;
+            let started = Instant::now();
             match self.execute_one(stmt) {
-                Ok(res) => last = res,
+                Ok(res) => outcomes.push(StatementOutcome {
+                    status: "OK".to_string(),
+                    time_us: started.elapsed().as_micros() as u64,
+                    result: res,
+                }),
                 Err(e) => {
-                    // Atomic rollback on any error inside an active transaction!
                     if self.tx_overlay.is_some() {
                         self.tx_overlay = None;
                     }
@@ -372,7 +398,7 @@ impl<'a> ExecContext<'a> {
                 }
             }
         }
-        Ok(last)
+        Ok(outcomes)
     }
 
     fn resolve_target(&self, target: &Target) -> Result<(String, Option<String>)> {
@@ -647,6 +673,26 @@ impl<'a> ExecContext<'a> {
                                 tb
                             ));
                         }
+                    }
+                }
+            }
+        }
+
+        // 0b. Enforce field-level write PERMISSIONS when $auth is active
+        if self.params.contains_key("auth") {
+            let snap = Value::Object(obj.clone());
+            for f in &fields {
+                if let Some(ref wexpr) = f.permissions_write {
+                    let is_modified = match old_map {
+                        Some(prev) => obj.get(&f.name) != prev.get(&f.name),
+                        None => obj.contains_key(&f.name),
+                    };
+                    if is_modified && !self.eval_expr(wexpr, Some(&snap), 0)?.is_truthy() {
+                        return Err(anyhow!(
+                            "Field '{}' on table '{}' write denied by PERMISSIONS",
+                            f.name,
+                            tb
+                        ));
                     }
                 }
             }
@@ -1487,6 +1533,77 @@ impl<'a> ExecContext<'a> {
                     Err(anyhow!("Enable feature 'auth' to use DEFINE ACCESS"))
                 }
             }
+            Statement::AccessGrant {
+                name,
+                subject,
+                roles,
+            } => {
+                #[cfg(feature = "auth")]
+                {
+                    let (grant_id, token) = crate::auth::grant_bearer(
+                        self.storage,
+                        &self.ns,
+                        &self.db,
+                        name,
+                        subject,
+                        if roles.is_empty() {
+                            vec!["VIEWER".into()]
+                        } else {
+                            roles.clone()
+                        },
+                        Some(86_400),
+                    )?;
+                    let mut m = BTreeMap::new();
+                    m.insert("id".into(), Value::String(grant_id));
+                    m.insert("access".into(), Value::String(name.clone()));
+                    m.insert("subject".into(), Value::String(subject.clone()));
+                    m.insert("token".into(), Value::String(token));
+                    Ok(vec![Value::Object(m)])
+                }
+                #[cfg(not(feature = "auth"))]
+                {
+                    let _ = (name, subject, roles);
+                    Err(anyhow!("Enable feature 'auth' to use ACCESS GRANT"))
+                }
+            }
+            Statement::AccessRevoke { name, grant_id } => {
+                #[cfg(feature = "auth")]
+                {
+                    let revoked =
+                        crate::auth::revoke_bearer(self.storage, &self.ns, &self.db, name, grant_id)?;
+                    Ok(vec![Value::Bool(revoked)])
+                }
+                #[cfg(not(feature = "auth"))]
+                {
+                    let _ = (name, grant_id);
+                    Err(anyhow!("Enable feature 'auth' to use ACCESS REVOKE"))
+                }
+            }
+            Statement::AccessPurge { name } => {
+                #[cfg(feature = "auth")]
+                {
+                    let prefix = encode_key(
+                        crate::storage::PREFIX_BEARER_GRANT,
+                        &[&self.ns, &self.db, name],
+                    );
+                    let now = chrono::Utc::now().timestamp();
+                    let mut purged = 0i64;
+                    for (k, raw) in self.storage.scan_prefix(&prefix)? {
+                        if let Ok(g) = serde_json::from_slice::<crate::auth::BearerGrant>(&raw) {
+                            if g.revoked || g.expires_at.map(|e| now >= e).unwrap_or(false) {
+                                self.delete_raw(k)?;
+                                purged += 1;
+                            }
+                        }
+                    }
+                    Ok(vec![Value::Int(purged)])
+                }
+                #[cfg(not(feature = "auth"))]
+                {
+                    let _ = name;
+                    Err(anyhow!("Enable feature 'auth' to use ACCESS PURGE"))
+                }
+            }
             Statement::DefineAnalyzer {
                 name,
                 tokenizers,
@@ -1570,6 +1687,8 @@ impl<'a> ExecContext<'a> {
                 computed_expr,
                 readonly,
                 on_delete,
+                permissions_select,
+                permissions_write,
                 ..
             } => {
                 let key = encode_key(PREFIX_FIELD_META, &[&self.ns, &self.db, table, name]);
@@ -1582,6 +1701,8 @@ impl<'a> ExecContext<'a> {
                     computed_expr: computed_expr.clone(),
                     readonly: *readonly,
                     on_delete: *on_delete,
+                    permissions_select: permissions_select.clone(),
+                    permissions_write: permissions_write.clone(),
                 };
                 self.put_raw(key, serde_json::to_vec(&meta)?)?;
                 Ok(Vec::new())
@@ -1941,6 +2062,29 @@ impl<'a> ExecContext<'a> {
                                 }
                             }
                             raw_rows = allowed;
+                        }
+                    }
+                }
+
+                // Enforce field-level SELECT PERMISSIONS (redacting disallowed columns when $auth is set)
+                if self.params.contains_key("auth") {
+                    let restricted: Vec<FieldMeta> = self
+                        .load_fields(&tb)?
+                        .into_iter()
+                        .filter(|f| f.permissions_select.is_some())
+                        .collect();
+                    if !restricted.is_empty() {
+                        for row in &mut raw_rows {
+                            let snap = row.clone();
+                            if let Value::Object(ref mut map) = row {
+                                for rf in &restricted {
+                                    if let Some(ref pexpr) = rf.permissions_select {
+                                        if !self.eval_expr(pexpr, Some(&snap), 0)?.is_truthy() {
+                                            map.remove(&rf.name);
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }

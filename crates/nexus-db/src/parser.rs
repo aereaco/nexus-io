@@ -116,6 +116,18 @@ pub enum Statement {
         signin_sql: Option<String>,
         duration_session: Option<String>,
     },
+    AccessGrant {
+        name: String,
+        subject: String,
+        roles: Vec<String>,
+    },
+    AccessRevoke {
+        name: String,
+        grant_id: String,
+    },
+    AccessPurge {
+        name: String,
+    },
     DefineAnalyzer {
         name: String,
         tokenizers: Vec<String>,
@@ -149,6 +161,8 @@ pub enum Statement {
         computed_expr: Option<Expr>,
         readonly: bool,
         on_delete: OnDeleteAction,
+        permissions_select: Option<Expr>,
+        permissions_write: Option<Expr>,
     },
     DefineSequence {
         name: String,
@@ -917,6 +931,50 @@ impl Parser {
             let live_id = self.parse_expr()?;
             return Ok(Statement::Kill { live_id });
         }
+        if self.eat_kw("ACCESS") {
+            let name = self.expect_ident()?;
+            if self.eat_kw("ON") {
+                let _ = self.expect_ident()?;
+            }
+            if self.eat_kw("GRANT") {
+                let _ = self.eat_kw("FOR");
+                let _ = self.eat_kw("USER") || self.eat_kw("RECORD");
+                let subject = match self.next() {
+                    Token::Str(s) | Token::Ident(s) => s,
+                    other => return Err(anyhow!("Expected subject in ACCESS GRANT, got {:?}", other)),
+                };
+                let mut roles = Vec::new();
+                if self.eat_kw("ROLES") {
+                    loop {
+                        roles.push(self.expect_ident()?);
+                        if matches!(self.peek(), Token::Comma) {
+                            self.next();
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                return Ok(Statement::AccessGrant {
+                    name,
+                    subject,
+                    roles,
+                });
+            }
+            if self.eat_kw("REVOKE") {
+                let grant_id = match self.next() {
+                    Token::Str(s) | Token::Ident(s) => s,
+                    other => return Err(anyhow!("Expected grant_id in ACCESS REVOKE, got {:?}", other)),
+                };
+                return Ok(Statement::AccessRevoke { name, grant_id });
+            }
+            if self.eat_kw("PURGE") {
+                while !matches!(self.peek(), Token::Semicolon | Token::Eof) {
+                    self.next();
+                }
+                return Ok(Statement::AccessPurge { name });
+            }
+            return Err(anyhow!("Expected GRANT, REVOKE, or PURGE after ACCESS {}", name));
+        }
         if self.eat_kw("RELATE") {
             let from = self.parse_primary()?;
             if !matches!(self.next(), Token::ArrowRight) {
@@ -1355,6 +1413,8 @@ impl Parser {
             let mut computed_expr = None;
             let mut readonly = false;
             let mut on_delete = OnDeleteAction::Ignore;
+            let mut permissions_select = None;
+            let mut permissions_write = None;
             loop {
                 if self.eat_kw("TYPE") {
                     let mut ty = self.expect_ident()?;
@@ -1377,6 +1437,41 @@ impl Parser {
                     computed_expr = Some(self.parse_expr()?);
                 } else if self.eat_kw("READONLY") {
                     readonly = true;
+                } else if self.eat_kw("PERMISSIONS") {
+                    if self.eat_kw("NONE") {
+                        permissions_select = Some(Expr::Bool(false));
+                        permissions_write = Some(Expr::Bool(false));
+                    } else if self.eat_kw("FULL") {
+                        permissions_select = Some(Expr::Bool(true));
+                        permissions_write = Some(Expr::Bool(true));
+                    } else {
+                        while self.eat_kw("FOR") {
+                            let mut actions = Vec::new();
+                            loop {
+                                actions.push(self.expect_ident()?.to_ascii_lowercase());
+                                if matches!(self.peek(), Token::Comma) {
+                                    self.next();
+                                } else {
+                                    break;
+                                }
+                            }
+                            let rule = if self.eat_kw("NONE") {
+                                Expr::Bool(false)
+                            } else if self.eat_kw("FULL") {
+                                Expr::Bool(true)
+                            } else {
+                                let _ = self.eat_kw("WHERE");
+                                self.parse_expr()?
+                            };
+                            for act in actions {
+                                match act.as_str() {
+                                    "select" => permissions_select = Some(rule.clone()),
+                                    "create" | "update" => permissions_write = Some(rule.clone()),
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
                 } else if self.eat_kw("REFERENCE") {
                     if self.eat_kw("ON") {
                         let _ = self.eat_kw("DELETE");
@@ -1405,6 +1500,8 @@ impl Parser {
                 computed_expr,
                 readonly,
                 on_delete,
+                permissions_select,
+                permissions_write,
             });
         }
 

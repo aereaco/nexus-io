@@ -6,11 +6,38 @@ use base64::engine::general_purpose::STANDARD as BASE64_STD;
 use base64::Engine as _;
 use nexus_db::auth::AuthContext;
 use nexus_db::Value as DbValue;
+use once_cell::sync::Lazy;
 use salvo::async_trait;
 use salvo::prelude::*;
 use serde_json::{json, Value as JsonValue};
-use std::sync::Arc;
-use std::time::Instant;
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+/// Per-IP sliding-window rate limiter for `/signin` and `/signup` brute-force protection
+/// (max 20 attempts per 60 seconds per client IP).
+static AUTH_RATE_LIMITER: Lazy<Mutex<HashMap<String, VecDeque<Instant>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+fn check_auth_rate_limit(client_key: &str) -> bool {
+    const MAX_ATTEMPTS: usize = 20;
+    const WINDOW: Duration = Duration::from_secs(60);
+    let now = Instant::now();
+    let mut map = AUTH_RATE_LIMITER.lock().unwrap();
+    let q = map.entry(client_key.to_string()).or_default();
+    while let Some(&front) = q.front() {
+        if now.duration_since(front) > WINDOW {
+            q.pop_front();
+        } else {
+            break;
+        }
+    }
+    if q.len() >= MAX_ATTEMPTS {
+        return false;
+    }
+    q.push_back(now);
+    true
+}
 
 use crate::db::Database;
 
@@ -69,6 +96,15 @@ pub struct SurrealSqlHandler {
 #[async_trait]
 impl Handler for SurrealSqlHandler {
     async fn handle(&self, req: &mut Request, _depot: &mut Depot, res: &mut Response, _ctrl: &mut FlowCtrl) {
+        let client_ip = req.remote_addr().to_string();
+        if !check_auth_rate_limit(&client_ip) {
+            res.status_code(StatusCode::TOO_MANY_REQUESTS);
+            res.render(Json(json!({
+                "code": 429,
+                "details": "Too many authentication attempts; retry after 60 seconds"
+            })));
+            return;
+        }
         let (ns, database) = extract_ns_db(req);
         let auth = match resolve_http_auth(req, &self.db, &ns, &database) {
             Ok(a) => a,
@@ -86,25 +122,33 @@ impl Handler for SurrealSqlHandler {
                 return;
             }
         };
-        let started = Instant::now();
         let exec = match auth {
-            Some(ctx) => self.db.inner.query_scoped_with_auth(&ns, &database, &body, vec![], ctx),
-            None => self.db.inner.query_scoped(&ns, &database, &body, vec![]),
+            Some(ctx) => self
+                .db
+                .inner
+                .query_scoped_multi_with_auth(&ns, &database, &body, vec![], ctx),
+            None => self.db.inner.query_scoped_multi(&ns, &database, &body, vec![]),
         };
-        let elapsed = format!("{:?}", started.elapsed());
         match exec {
-            Ok(rows) => {
-                let json_rows: Vec<JsonValue> = rows.iter().map(DbValue::to_json).collect();
-                res.render(Json(json!([{
-                    "time": elapsed,
-                    "status": "OK",
-                    "result": json_rows
-                }])));
+            Ok(outcomes) => {
+                let frames: Vec<JsonValue> = outcomes
+                    .into_iter()
+                    .map(|o| {
+                        let json_rows: Vec<JsonValue> =
+                            o.result.iter().map(DbValue::to_json).collect();
+                        json!({
+                            "time": format!("{}µs", o.time_us),
+                            "status": o.status,
+                            "result": json_rows
+                        })
+                    })
+                    .collect();
+                res.render(Json(JsonValue::Array(frames)));
             }
             Err(e) => {
                 res.status_code(StatusCode::BAD_REQUEST);
                 res.render(Json(json!([{
-                    "time": elapsed,
+                    "time": "0µs",
                     "status": "ERR",
                     "result": e.to_string()
                 }])));
@@ -122,6 +166,15 @@ pub struct SurrealHttpRpcHandler {
 #[async_trait]
 impl Handler for SurrealHttpRpcHandler {
     async fn handle(&self, req: &mut Request, _depot: &mut Depot, res: &mut Response, _ctrl: &mut FlowCtrl) {
+        let client_ip = req.remote_addr().to_string();
+        if !check_auth_rate_limit(&client_ip) {
+            res.status_code(StatusCode::TOO_MANY_REQUESTS);
+            res.render(Json(json!({
+                "code": 429,
+                "details": "Too many authentication attempts; retry after 60 seconds"
+            })));
+            return;
+        }
         let (ns, database) = extract_ns_db(req);
         let mut session = self.db.inner.rpc_session(&ns, &database);
         match resolve_http_auth(req, &self.db, &ns, &database) {
@@ -175,6 +228,15 @@ pub struct SurrealAuthHandler {
 #[async_trait]
 impl Handler for SurrealAuthHandler {
     async fn handle(&self, req: &mut Request, _depot: &mut Depot, res: &mut Response, _ctrl: &mut FlowCtrl) {
+        let client_ip = req.remote_addr().to_string();
+        if !check_auth_rate_limit(&client_ip) {
+            res.status_code(StatusCode::TOO_MANY_REQUESTS);
+            res.render(Json(json!({
+                "code": 429,
+                "details": "Too many authentication attempts; retry after 60 seconds"
+            })));
+            return;
+        }
         let (ns, database) = extract_ns_db(req);
         let mut session = self.db.inner.rpc_session(&ns, &database);
         let body: JsonValue = match req.parse_json().await {
@@ -214,6 +276,15 @@ pub struct SurrealExportImportHandler {
 #[async_trait]
 impl Handler for SurrealExportImportHandler {
     async fn handle(&self, req: &mut Request, _depot: &mut Depot, res: &mut Response, _ctrl: &mut FlowCtrl) {
+        let client_ip = req.remote_addr().to_string();
+        if !check_auth_rate_limit(&client_ip) {
+            res.status_code(StatusCode::TOO_MANY_REQUESTS);
+            res.render(Json(json!({
+                "code": 429,
+                "details": "Too many authentication attempts; retry after 60 seconds"
+            })));
+            return;
+        }
         let (ns, database) = extract_ns_db(req);
         if self.is_import {
             let dump = match req.payload().await {
@@ -252,6 +323,15 @@ pub struct SurrealKeyHandler {
 #[async_trait]
 impl Handler for SurrealKeyHandler {
     async fn handle(&self, req: &mut Request, _depot: &mut Depot, res: &mut Response, _ctrl: &mut FlowCtrl) {
+        let client_ip = req.remote_addr().to_string();
+        if !check_auth_rate_limit(&client_ip) {
+            res.status_code(StatusCode::TOO_MANY_REQUESTS);
+            res.render(Json(json!({
+                "code": 429,
+                "details": "Too many authentication attempts; retry after 60 seconds"
+            })));
+            return;
+        }
         let (ns, database) = extract_ns_db(req);
         let table = req.param::<String>("table").unwrap_or_default();
         let id = req.param::<String>("id");

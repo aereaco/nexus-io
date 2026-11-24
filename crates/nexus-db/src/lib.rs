@@ -2,6 +2,7 @@ pub mod codec;
 pub mod engine;
 pub mod live;
 pub mod parser;
+pub mod replication;
 pub mod rpc;
 pub mod stdlib;
 pub mod storage;
@@ -34,6 +35,7 @@ use std::path::Path;
 use std::sync::{mpsc, Arc};
 
 use crate::engine::{ApiMeta, ExecContext};
+pub use crate::engine::StatementOutcome;
 use crate::live::{LiveBroker, LiveNotification};
 use crate::parser::{parse_surql, Statement};
 use crate::rpc::RpcSession;
@@ -374,6 +376,63 @@ impl NexusDb {
             ctx.module_invoker = Some(inv.as_ref());
         }
         ctx.execute_all(&stmts)
+    }
+
+    /// Execute multiple SurrealQL statements and return one `StatementOutcome` per statement.
+    pub fn query_scoped_multi(
+        &self,
+        ns: &str,
+        db: &str,
+        surql: &str,
+        bindings: Vec<(String, Value)>,
+    ) -> Result<Vec<StatementOutcome>> {
+        let stmts = parse_surql(surql)?;
+        let params: HashMap<String, Value> = bindings.into_iter().collect();
+        let mut ctx = ExecContext::new(
+            self.storage.as_ref(),
+            self.live.as_ref(),
+            sanitize_ident(ns),
+            sanitize_ident(db),
+            params,
+        );
+        #[cfg(feature = "ml")]
+        {
+            ctx.ml = Some(self.ml.as_ref());
+        }
+        if let Some(ref inv) = self.module_invoker {
+            ctx.module_invoker = Some(inv.as_ref());
+        }
+        ctx.execute_all_detailed(&stmts)
+    }
+
+    /// Execute multiple SurrealQL statements with explicit RBAC enforcement, returning per-statement outcomes.
+    #[cfg(feature = "auth")]
+    pub fn query_scoped_multi_with_auth(
+        &self,
+        ns: &str,
+        db: &str,
+        surql: &str,
+        bindings: Vec<(String, Value)>,
+        auth: crate::auth::AuthContext,
+    ) -> Result<Vec<StatementOutcome>> {
+        let stmts = parse_surql(surql)?;
+        let params: HashMap<String, Value> = bindings.into_iter().collect();
+        let mut ctx = ExecContext::new(
+            self.storage.as_ref(),
+            self.live.as_ref(),
+            sanitize_ident(ns),
+            sanitize_ident(db),
+            params,
+        );
+        ctx.auth = Some(auth);
+        #[cfg(feature = "ml")]
+        {
+            ctx.ml = Some(self.ml.as_ref());
+        }
+        if let Some(ref inv) = self.module_invoker {
+            ctx.module_invoker = Some(inv.as_ref());
+        }
+        ctx.execute_all_detailed(&stmts)
     }
 
     /// Fast-path KV `get(key)` in `(ns, db)`.
@@ -1307,5 +1366,134 @@ mod tests {
         .unwrap();
         assert!(blocked["error"].is_object());
         let _ = viewer_jwt;
+    }
+
+    #[cfg(feature = "auth")]
+    #[test]
+    fn eddsa_jwks_field_perms_access_sql_fetch_multistmt_and_wal_replication() {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine as _;
+
+        let db = NexusDb::open_mem();
+
+        // 1. Asymmetric EdDSA (Ed25519) JWT + JWKS verification
+        let sk_bytes = [7u8; 32];
+        let sk = ed25519_dalek::SigningKey::from_bytes(&sk_bytes);
+        let pk_bytes = sk.verifying_key().to_bytes();
+        let claims = crate::auth::JwtClaims {
+            sub: Some("oidc-user".into()),
+            ns: Some("adv".into()),
+            db: Some("main".into()),
+            rl: Some(vec!["Editor".into()]),
+            ..Default::default()
+        };
+        let ed_jwt = crate::auth::issue_eddsa_jwt(&claims, &sk_bytes).unwrap();
+        let jwks = crate::auth::Jwks {
+            keys: vec![crate::auth::Jwk {
+                kty: "OKP".into(),
+                alg: Some("EdDSA".into()),
+                kid: Some("k1".into()),
+                x: Some(URL_SAFE_NO_PAD.encode(pk_bytes)),
+                k: None,
+            }],
+        };
+        let verified = crate::auth::verify_jwt_with_jwks(&ed_jwt, &jwks).unwrap();
+        assert_eq!(verified.sub.as_deref(), Some("oidc-user"));
+
+        // 2. Field-level PERMISSIONS (select redaction + write denial)
+        db.query_scoped(
+            "adv",
+            "main",
+            "DEFINE TABLE profile SCHEMALESS;
+             DEFINE FIELD ssn ON profile TYPE string PERMISSIONS FOR select WHERE $auth = 'admin' FOR create, update WHERE $auth = 'admin';
+             CREATE profile:1 SET name = 'Alice', ssn = '123-45-6789';",
+            vec![],
+        )
+        .unwrap();
+        let viewer_auth = crate::auth::AuthContext {
+            level: crate::auth::AuthLevel::Database("adv".into(), "main".into()),
+            roles: vec![crate::auth::Role::Viewer],
+            actor: Some("bob".into()),
+            access_name: None,
+            token_claims: None,
+        };
+        let redacted = db
+            .query_scoped_with_auth("adv", "main", "SELECT * FROM profile:1;", vec![], viewer_auth)
+            .unwrap();
+        if let Value::Object(map) = &redacted[0] {
+            assert_eq!(map.get("name"), Some(&Value::String("Alice".into())));
+            assert!(!map.contains_key("ssn"), "ssn must be redacted for non-admin");
+        } else {
+            panic!("expected object");
+        }
+
+        // 3. ACCESS ... GRANT / REVOKE / PURGE SurrealQL statements
+        let grant_rows = db
+            .query_scoped(
+                "adv",
+                "main",
+                "DEFINE ACCESS m2m ON DATABASE TYPE BEARER;
+                 ACCESS m2m ON DATABASE GRANT FOR USER svc_worker ROLES EDITOR;",
+                vec![],
+            )
+            .unwrap();
+        let (gid, tok) = match &grant_rows[0] {
+            Value::Object(m) => (
+                m.get("id").unwrap().display_compact(),
+                m.get("token").unwrap().display_compact(),
+            ),
+            _ => panic!("expected grant object"),
+        };
+        assert!(db.authenticate_token("adv", "main", &tok).is_ok());
+        db.query_scoped(
+            "adv",
+            "main",
+            &format!("ACCESS m2m ON DATABASE REVOKE '{}'; ACCESS m2m ON DATABASE PURGE;", gid),
+            vec![],
+        )
+        .unwrap();
+        assert!(db.authenticate_token("adv", "main", &tok).is_err());
+
+        // 4. Multi-statement result array + FETCH hydration
+        let outcomes = db
+            .query_scoped_multi(
+                "adv",
+                "main",
+                "CREATE author:1 SET name = 'Ada';
+                 CREATE post:1 SET title = 'Hello', author = author:1;
+                 SELECT * FROM post:1 FETCH author;",
+                vec![],
+            )
+            .unwrap();
+        assert_eq!(outcomes.len(), 3);
+        if let Value::Object(post) = &outcomes[2].result[0] {
+            if let Some(Value::Object(author)) = post.get("author") {
+                assert_eq!(author.get("name"), Some(&Value::String("Ada".into())));
+            } else {
+                panic!("expected hydrated author object via FETCH");
+            }
+        }
+
+        // 5. Multi-node Raft-style WAL ReplicationLog
+        let leader_db = NexusDb::open_mem();
+        let follower_db = NexusDb::open_mem();
+        let leader_wal = crate::replication::ReplicationLog::new(1);
+        let follower_wal = crate::replication::ReplicationLog::new(1);
+
+        leader_wal
+            .replicate_write(&leader_db, "rep", "main", "CREATE item:1 SET v = 10;")
+            .unwrap();
+        leader_wal
+            .replicate_write(&leader_db, "rep", "main", "UPDATE item:1 SET v = 42;")
+            .unwrap();
+
+        let delta = leader_wal.entries_since(0);
+        assert_eq!(delta.len(), 2);
+        let applied_idx = follower_wal.apply_to_follower(&follower_db, &delta).unwrap();
+        assert_eq!(applied_idx, 2);
+        let replicated = follower_db
+            .query_scoped("rep", "main", "SELECT VALUE v FROM item:1;", vec![])
+            .unwrap();
+        assert_eq!(replicated, vec![Value::Int(42)]);
     }
 }

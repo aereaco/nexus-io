@@ -1,6 +1,7 @@
 pub mod compute;
 pub mod db;
 pub mod economy;
+pub mod ffi;
 pub mod iam;
 pub mod js;
 pub mod runtime;
