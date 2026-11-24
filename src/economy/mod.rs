@@ -130,11 +130,11 @@ impl BillingService {
     /// Get ZA credit balance for a user
     pub async fn get_balance(&self, user_id: &str) -> anyhow::Result<f64> {
         let mut response = self.db.client
-            .query("SELECT balance_za FROM wallet WHERE user_id = $user_id")
+            .query("SELECT VALUE balance_za FROM wallet WHERE user_id = $user_id")
             .bind(("user_id", user_id.to_string()))
             .await?;
 
-        let balance: Option<f64> = response.take("balance_za")?;
+        let balance: Option<f64> = response.take(0)?;
         Ok(balance.unwrap_or(0.0))
     }
 }

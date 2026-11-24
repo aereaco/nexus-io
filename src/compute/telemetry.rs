@@ -36,8 +36,9 @@ impl NodeResources {
         let memory_free = sys.free_memory();
         
         // 2. GPU Telemetry (NVML - Desktop/Server only; gated out on Android/iOS)
+        #[allow(unused_mut)]
         let mut gpus = vec![];
-        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        #[cfg(all(feature = "hardware-monitoring", not(any(target_os = "android", target_os = "ios"))))]
         if let Ok(nvml) = nvml_wrapper::Nvml::init() {
             if let Ok(count) = nvml.device_count() {
                 for i in 0..count {
@@ -88,13 +89,13 @@ impl NodeResources {
                          is_green = $green,
                          updated_at = time::now();";
         let bindings = vec![
-            ("id".to_string(), surrealdb::types::Value::String(node_id.to_string())),
-            ("cpu".to_string(), surrealdb::types::Value::Number(surrealdb::types::Number::Int(self.cpu_cores as i64))),
-            ("mem_total".to_string(), surrealdb::types::Value::Number(surrealdb::types::Number::Int(self.memory_total as i64))),
-            ("mem_free".to_string(), surrealdb::types::Value::Number(surrealdb::types::Number::Int(self.memory_free as i64))),
-            ("vram_total".to_string(), surrealdb::types::Value::Number(surrealdb::types::Number::Int(total_vram as i64))),
-            ("vram_free".to_string(), surrealdb::types::Value::Number(surrealdb::types::Number::Int(total_vram_free as i64))),
-            ("green".to_string(), surrealdb::types::Value::Bool(self.is_green)),
+            ("id".to_string(), nexus_db::Value::String(node_id.to_string())),
+            ("cpu".to_string(), nexus_db::Value::Int(self.cpu_cores as i64)),
+            ("mem_total".to_string(), nexus_db::Value::Int(self.memory_total as i64)),
+            ("mem_free".to_string(), nexus_db::Value::Int(self.memory_free as i64)),
+            ("vram_total".to_string(), nexus_db::Value::Int(total_vram as i64)),
+            ("vram_free".to_string(), nexus_db::Value::Int(total_vram_free as i64)),
+            ("green".to_string(), nexus_db::Value::Bool(self.is_green)),
         ];
         engine.query_scoped("nexus", "system", surql, bindings).await?;
         Ok(())

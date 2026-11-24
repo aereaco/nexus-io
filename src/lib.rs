@@ -3,6 +3,7 @@ pub mod db;
 pub mod economy;
 pub mod iam;
 pub mod js;
+pub mod runtime;
 pub mod shell;
 pub mod storage;
 pub mod ux;

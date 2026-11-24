@@ -389,23 +389,15 @@ mod tests {
     use crate::js::cell::{CellManager, CellPolicy};
     use crate::storage::BlobBridge;
     use std::sync::Arc;
-    use surrealdb::engine::local::Mem;
-    use surrealdb::Surreal;
 
     #[test]
     fn wintercg_globals_work_inside_cell_manager() {
-        std::thread::Builder::new()
-            .stack_size(16 * 1024 * 1024)
-            .spawn(|| {
-                let rt = tokio::runtime::Builder::new_multi_thread()
-                    .enable_all()
-                    .thread_stack_size(16 * 1024 * 1024)
-                    .build()
-                    .unwrap();
-                rt.block_on(Box::pin(async {
-                    let client = Surreal::new::<Mem>(()).await.unwrap();
-                    client.use_ns("nexus").use_db("system").await.unwrap();
-                    let db = Arc::new(Database { client });
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let db = Arc::new(Database::open_mem());
                     let blobs = Arc::new(BlobBridge::new(db.clone()).await.unwrap());
                     let manager = CellManager::new(db, blobs);
 
@@ -442,12 +434,8 @@ mod tests {
                     assert!(out.contains("\"mode\":\"fast\""), "unexpected: {}", out);
                     assert!(out.contains("\"dec\":\"hi\""), "unexpected: {}", out);
                     assert!(out.contains("\"b64\":\"nexus\""), "unexpected: {}", out);
-                    assert!(out.contains("\"hasUuid\":true"), "unexpected: {}", out);
-                    assert!(out.contains("\"header\":\"hello\""), "unexpected: {}", out);
-                }));
-            })
-            .unwrap()
-            .join()
-            .unwrap();
+            assert!(out.contains("\"hasUuid\":true"), "unexpected: {}", out);
+            assert!(out.contains("\"header\":\"hello\""), "unexpected: {}", out);
+        });
     }
 }

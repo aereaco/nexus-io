@@ -241,9 +241,19 @@ impl UxGateway {
                     .delete(cell_handler)
             })
             
-            // Health check
+            // Health check & runtime capability diagnostics
             .push(Router::with_path("/health").get(health_check))
+            .push(Router::with_path("/_nexus/capabilities").get(capabilities_handler))
     }
+}
+
+#[handler]
+async fn capabilities_handler(res: &mut Response) {
+    let reg = crate::runtime::CapabilityRegistry::new();
+    reg.set_state("database", crate::runtime::CapabilityState::Active, Some("nexus-db".into()));
+    reg.set_state("gateway", crate::runtime::CapabilityState::Active, Some("salvo".into()));
+    reg.set_state("cells", crate::runtime::CapabilityState::Active, Some("quickrs-core".into()));
+    res.render(Json(reg.snapshot_json()));
 }
 
 // ============================================================================

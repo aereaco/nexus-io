@@ -70,52 +70,25 @@ impl Command for SqlCommand {
                         });
 
                         match result {
-                            Ok(mut response) => {
-                                let sur_value: surrealdb::Result<Vec<surrealdb::types::Value>> = response.take(0);
-                                match sur_value {
-                                    Ok(val) => {
-                                        // Recursive mapper from SurrealDB Value -> NuValue
-                                        fn map_sur_to_nu(v: surrealdb::types::Value, span: Span) -> NuValue {
-                                            match v {
-                                                surrealdb::types::Value::None | surrealdb::types::Value::Null => NuValue::nothing(span),
-                                                surrealdb::types::Value::Bool(b) => NuValue::bool(b, span),
-                                                surrealdb::types::Value::Number(n) => {
-                                                    if let Some(i) = n.to_int() { NuValue::int(i, span) }
-                                                    else if let Some(f) = n.to_f64() { NuValue::float(f, span) }
-                                                    else { NuValue::string(format!("{:?}", n), span) }
-                                                },
-                                                surrealdb::types::Value::String(s) => NuValue::string(s, span),
-                                                surrealdb::types::Value::RecordId(t) => NuValue::string(format!("{}:{:?}", t.table.as_str(), t.key), span),
-                                                surrealdb::types::Value::Array(arr) => {
-                                                    let vals = arr.into_iter().map(|x| map_sur_to_nu(x, span)).collect();
-                                                    NuValue::list(vals, span)
-                                                },
-                                                surrealdb::types::Value::Object(obj) => {
-                                                    let mut records = vec![];
-                                                    for (k, v) in obj { records.push((k, map_sur_to_nu(v, span))); }
-                                                    NuValue::record(records.into_iter().collect(), span)
-                                                },
-                                                _ => NuValue::string(format!("{:?}", v), span),
-                                            }
-                                        }
+                            Ok(response) => {
+                                let val = response.take_values();
+                                if !val.is_empty() {
+                                    let nu_list: Vec<NuValue> = val
+                                        .into_iter()
+                                        .map(|v| map_db_to_nu(v, call.head))
+                                        .collect();
+                                    let table_val = NuValue::list(nu_list, call.head);
 
-                                        if !val.is_empty() {
-                                            let nu_list: Vec<NuValue> = val.into_iter().map(|v| map_sur_to_nu(v, call.head)).collect();
-                                            let table_val = NuValue::list(nu_list, call.head);
-                                            
-                                            let _ = nu_cli::evaluate_commands(
-                                                &nu_protocol::Spanned { item: "table".to_string(), span: call.head },
-                                                &mut engine_state.clone(),
-                                                &mut _stack.clone(),
-                                                table_val.into_pipeline_data(),
-                                                vec![],
-                                                nu_cli::EvaluateCommandsOpts::default(),
-                                            );
-                                        } else {
-                                            println!("[]");
-                                        }
-                                    },
-                                    Err(e) => eprintln!("❌ DB Error: {}", e),
+                                    let _ = nu_cli::evaluate_commands(
+                                        &nu_protocol::Spanned { item: "table".to_string(), span: call.head },
+                                        &mut engine_state.clone(),
+                                        &mut _stack.clone(),
+                                        table_val.into_pipeline_data(),
+                                        vec![],
+                                        nu_cli::EvaluateCommandsOpts::default(),
+                                    );
+                                } else {
+                                    println!("[]");
                                 }
                             },
                             Err(e) => eprintln!("❌ System Error: {}", e),
@@ -157,61 +130,15 @@ impl Command for SqlCommand {
         });
 
         match result {
-            Ok(mut response) => {
-                // Use native SurrealDB types to avoid serialization errors with Record/Thing
-                let sur_value: surrealdb::Result<Vec<surrealdb::types::Value>> = response.take(0);
-                
-                match sur_value {
-                    Ok(val) => {
-                         // Recursive mapper from SurrealDB Value -> NuValue
-                         fn map_surreal_to_nu(v: surrealdb::types::Value, span: Span) -> NuValue {
-                             match v {
-                                 surrealdb::types::Value::None | surrealdb::types::Value::Null => NuValue::nothing(span),
-                                 surrealdb::types::Value::Bool(b) => NuValue::bool(b, span),
-                                 surrealdb::types::Value::Number(n) => {
-                                     if let Some(i) = n.to_int() {
-                                         NuValue::int(i, span)
-                                     } else if let Some(f) = n.to_f64() {
-                                         NuValue::float(f, span)
-                                     } else {
-                                         NuValue::string(format!("{:?}", n), span)
-                                     }
-                                 },
-                                 surrealdb::types::Value::String(s) => NuValue::string(s, span),
-                                 surrealdb::types::Value::RecordId(t) => NuValue::string(format!("{}:{:?}", t.table.as_str(), t.key), span),
-                                 surrealdb::types::Value::Array(arr) => {
-                                     let vals = arr.into_iter().map(|x| map_surreal_to_nu(x, span)).collect();
-                                     NuValue::list(vals, span)
-                                 },
-                                 surrealdb::types::Value::Object(obj) => {
-                                     let mut records = vec![];
-                                     for (k, v) in obj {
-                                         records.push((k, map_surreal_to_nu(v, span)));
-                                     }
-                                     NuValue::record(records.into_iter().collect(), span)
-                                 },
-                                 _ => NuValue::string(format!("{:?}", v), span),
-                             }
-                         }
-
-                         let pipeline_data = if val.is_empty() {
-                            PipelineData::empty()
-                         } else {
-                             let nu_list = val.into_iter().map(|v| map_surreal_to_nu(v, call.head)).collect();
-                             NuValue::list(nu_list, call.head).into_pipeline_data()
-                         };
-                         
-                         Ok(pipeline_data)
-                    }
-                    Err(e) => {
-                        Err(crate::shell_err(
-                            "Database Error",
-                            e.to_string(),
-                            Some(call.head),
-                            None,
-                        ))
-                    }
-                }
+            Ok(response) => {
+                let val = response.take_values();
+                let pipeline_data = if val.is_empty() {
+                    PipelineData::empty()
+                } else {
+                    let nu_list = val.into_iter().map(|v| map_db_to_nu(v, call.head)).collect();
+                    NuValue::list(nu_list, call.head).into_pipeline_data()
+                };
+                Ok(pipeline_data)
             },
             Err(e) => {
                  Err(crate::shell_err(
@@ -221,6 +148,32 @@ impl Command for SqlCommand {
                     None,
                 ))
             }
+        }
+    }
+}
+
+fn map_db_to_nu(v: nexus_db::Value, span: Span) -> NuValue {
+    match v {
+        nexus_db::Value::None | nexus_db::Value::Null => NuValue::nothing(span),
+        nexus_db::Value::Bool(b) => NuValue::bool(b, span),
+        nexus_db::Value::Int(i) => NuValue::int(i, span),
+        nexus_db::Value::Float(f) => NuValue::float(f, span),
+        nexus_db::Value::String(s) | nexus_db::Value::DateTime(s) | nexus_db::Value::Decimal(s) => {
+            NuValue::string(s, span)
+        }
+        nexus_db::Value::Duration(secs) => NuValue::string(format!("{}s", secs), span),
+        nexus_db::Value::Bytes(b) => NuValue::binary(b, span),
+        nexus_db::Value::RecordId { tb, id } => NuValue::string(format!("{}:{}", tb, id), span),
+        nexus_db::Value::Array(arr) => {
+            let vals = arr.into_iter().map(|x| map_db_to_nu(x, span)).collect();
+            NuValue::list(vals, span)
+        }
+        nexus_db::Value::Object(obj) => {
+            let records: Vec<(String, NuValue)> = obj
+                .into_iter()
+                .map(|(k, v)| (k, map_db_to_nu(v, span)))
+                .collect();
+            NuValue::record(records.into_iter().collect(), span)
         }
     }
 }

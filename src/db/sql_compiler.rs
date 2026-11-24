@@ -5,18 +5,18 @@ use sqlparser::ast::{
 };
 use sqlparser::dialect::SQLiteDialect;
 use sqlparser::parser::Parser;
-use surrealdb::types::Value as SurValue;
+use nexus_db::Value as DbValue;
 
 /// Result of compiling a SQLite SQL statement into SurrealQL with named bindings.
 #[derive(Debug, Clone)]
 pub struct CompiledSql {
     pub surql: String,
-    pub bindings: Vec<(String, SurValue)>,
+    pub bindings: Vec<(String, DbValue)>,
 }
 
 /// Compile SQLite SQL (`ctx.storage.sql.exec(sql, ...args)`) into SurrealQL via `sqlparser` AST.
 /// Never uses regex heuristics.
-pub fn compile_sqlite_to_surql(sql: &str, args: Vec<SurValue>) -> Result<CompiledSql> {
+pub fn compile_sqlite_to_surql(sql: &str, args: Vec<DbValue>) -> Result<CompiledSql> {
     let trimmed = sql.trim();
 
     // Handle SQLite PRAGMA table_info(tbl) explicitly
@@ -67,9 +67,9 @@ fn table_name(name: &ObjectName) -> String {
 
 fn compile_statement(
     stmt: &Statement,
-    args: &[SurValue],
+    args: &[DbValue],
     param_idx: &mut usize,
-    bindings: &mut Vec<(String, SurValue)>,
+    bindings: &mut Vec<(String, DbValue)>,
 ) -> Result<String> {
     match stmt {
         Statement::CreateTable(ct) => {
@@ -163,9 +163,9 @@ fn compile_statement(
 
 fn compile_query(
     q: &Query,
-    args: &[SurValue],
+    args: &[DbValue],
     param_idx: &mut usize,
-    bindings: &mut Vec<(String, SurValue)>,
+    bindings: &mut Vec<(String, DbValue)>,
 ) -> Result<String> {
     let SetExpr::Select(sel) = q.body.as_ref() else {
         return Err(anyhow!("Only SELECT queries are supported in SQLite adapter"));
@@ -236,9 +236,9 @@ fn compile_query(
 
 fn compile_expr(
     expr: &Expr,
-    args: &[SurValue],
+    args: &[DbValue],
     param_idx: &mut usize,
-    bindings: &mut Vec<(String, SurValue)>,
+    bindings: &mut Vec<(String, DbValue)>,
 ) -> Result<String> {
     match expr {
         Expr::Identifier(ident) => Ok(ident.value.clone()),
@@ -259,7 +259,7 @@ fn compile_expr(
                     i
                 };
                 let bind_name = format!("p{}", idx);
-                let val = args.get(idx).cloned().unwrap_or(SurValue::Null);
+                let val = args.get(idx).cloned().unwrap_or(DbValue::Null);
                 if !bindings.iter().any(|(k, _)| k == &bind_name) {
                     bindings.push((bind_name.clone(), val));
                 }
@@ -341,10 +341,7 @@ mod tests {
 
         let insert = compile_sqlite_to_surql(
             "INSERT INTO items (name, qty) VALUES (?, ?)",
-            vec![
-                SurValue::String("widget".into()),
-                SurValue::Number(surrealdb::types::Number::Int(5)),
-            ],
+            vec![DbValue::String("widget".into()), DbValue::Int(5)],
         )
         .unwrap();
         assert_eq!(insert.surql, "CREATE items SET name = $p0, qty = $p1;");
@@ -352,7 +349,7 @@ mod tests {
 
         let select = compile_sqlite_to_surql(
             "SELECT name, qty FROM items WHERE qty >= ? ORDER BY qty DESC LIMIT 10",
-            vec![SurValue::Number(surrealdb::types::Number::Int(2))],
+            vec![DbValue::Int(2)],
         )
         .unwrap();
         assert_eq!(

@@ -5,6 +5,7 @@ use nu_protocol::{Category, PipelineData, ShellError, Signature, SyntaxShape, Va
 use std::collections::HashMap;
 use std::sync::Arc;
 
+#[cfg(feature = "wasm-runtime")]
 use crate::compute::crystal::CrystalEngine;
 use crate::db::sql_compiler::compile_sqlite_to_surql;
 use crate::db::{Database, StateEngine};
@@ -219,7 +220,7 @@ pub async fn deploy_markdown(
                     &node.app,
                     &node.cell_id,
                     k,
-                    surrealdb::types::Value::String(v.clone()),
+                    nexus_db::Value::String(v.clone()),
                 )
                 .await?;
         }
@@ -236,7 +237,7 @@ pub async fn deploy_markdown(
 
 /// Execute an exported `(i64, i64) -> i64` function from the first inline `wat` Crystal block
 /// on a `SystemNode` via `CrystalEngine` (pre-compiled AOT + fuel metering).
-#[cfg(not(target_os = "ios"))]
+#[cfg(all(feature = "wasm-runtime", not(target_os = "ios")))]
 pub fn execute_node_crystal_i64(
     node: &SystemNode,
     fn_name: &str,
@@ -326,23 +327,15 @@ mod tests {
     use crate::db::Database;
     use crate::storage::BlobBridge;
     use std::sync::Arc;
-    use surrealdb::engine::local::Mem;
-    use surrealdb::Surreal;
 
     #[test]
     fn deploys_and_executes_markdown_service_node() {
-        std::thread::Builder::new()
-            .stack_size(16 * 1024 * 1024)
-            .spawn(|| {
-                let rt = tokio::runtime::Builder::new_multi_thread()
-                    .enable_all()
-                    .thread_stack_size(16 * 1024 * 1024)
-                    .build()
-                    .unwrap();
-                rt.block_on(Box::pin(async {
-                    let client = Surreal::new::<Mem>(()).await.unwrap();
-                    client.use_ns("nexus").use_db("system").await.unwrap();
-                    let db = Arc::new(Database { client });
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let db = Arc::new(Database::open_mem());
                     let blobs = Arc::new(BlobBridge::new(db.clone()).await.unwrap());
                     let manager = CellManager::new(db.clone(), blobs);
 
@@ -392,12 +385,11 @@ function record(m: Metric): number {
                         .unwrap();
                     assert_eq!(out, "1");
 
-                    let prod = execute_node_crystal_i64(&nodes[0], "mul", 6, 7, 10_000).unwrap();
-                    assert_eq!(prod, 42);
-                }));
-            })
-            .unwrap()
-            .join()
-            .unwrap();
+            #[cfg(all(feature = "wasm-runtime", not(target_os = "ios")))]
+            {
+                let prod = execute_node_crystal_i64(&nodes[0], "mul", 6, 7, 10_000).unwrap();
+                assert_eq!(prod, 42);
+            }
+        });
     }
 }

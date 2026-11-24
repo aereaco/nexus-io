@@ -109,27 +109,27 @@ async fn async_main(args: Vec<String>, is_test: bool) -> Result<(), Box<dyn std:
     let kernel = Arc::new(iam::kernel::SecurityKernel::new(db.clone()));
     let economy = Arc::new(economy::EconomicKernel::new(db.clone()));
     
-    // Initialize Mesh Network (Background)
-    // Initialize Mesh Network (Background)
-    let db_clone = db.clone();
-    let bridge_clone = bridge.clone();
-    
-    tokio::spawn(async move {
-        // println!("DEBUG: Background Mesh Init Starting...");
-        match storage::WireGuardManager::init_mesh(db_clone.clone()).await {
-            Ok(Some(interface)) => {
-                println!("✅ Mesh Interface Active. Starting Reactor...");
-                let reactor = Arc::new(storage::MeshReactor::new(
-                    db_clone, 
-                    interface,
-                    bridge_clone
-                ));
-                reactor.start().await;
-            },
-            Ok(None) => {},
-            Err(e) => eprintln!("⚠️  Mesh Initialization Warning: {}", e),
-        }
-    });
+    // Initialize Mesh Network lazily (only when `vpn` feature is compiled AND `NEXUS_ENABLE_MESH=1`)
+    #[cfg(feature = "vpn")]
+    if std::env::var("NEXUS_ENABLE_MESH").as_deref() == Ok("1") {
+        let db_clone = db.clone();
+        let bridge_clone = bridge.clone();
+        tokio::spawn(async move {
+            match storage::WireGuardManager::init_mesh(db_clone.clone()).await {
+                Ok(Some(interface)) => {
+                    println!("✅ Mesh Interface Active. Starting Reactor...");
+                    let reactor = Arc::new(storage::MeshReactor::new(
+                        db_clone,
+                        interface,
+                        bridge_clone,
+                    ));
+                    reactor.start().await;
+                }
+                Ok(None) => {}
+                Err(e) => eprintln!("⚠️  Mesh Initialization Warning: {}", e),
+            }
+        });
+    }
 
     // 3. Presentation Plane (UX Gateway)
     let gateway_config = ux::GatewayConfig {
@@ -259,18 +259,21 @@ async fn async_main(args: Vec<String>, is_test: bool) -> Result<(), Box<dyn std:
         kernel: kernel.clone(),
     }));
 
-    working_set.add_decl(Box::new(iam::GuardedCommand {
-        inner: Box::new(compute::k8s_bridge::K8sImportCommand {
-            db: db.clone(),
-            bridge: bridge.clone(),
-        }),
-        kernel: kernel.clone(),
-    }));
+    #[cfg(feature = "k8s-bridge")]
+    {
+        working_set.add_decl(Box::new(iam::GuardedCommand {
+            inner: Box::new(compute::k8s_bridge::K8sImportCommand {
+                db: db.clone(),
+                bridge: bridge.clone(),
+            }),
+            kernel: kernel.clone(),
+        }));
 
-    working_set.add_decl(Box::new(iam::GuardedCommand {
-        inner: Box::new(compute::k8s_bridge::K8sExportCommand),
-        kernel: kernel.clone(),
-    }));
+        working_set.add_decl(Box::new(iam::GuardedCommand {
+            inner: Box::new(compute::k8s_bridge::K8sExportCommand),
+            kernel: kernel.clone(),
+        }));
+    }
 
     working_set.add_decl(Box::new(iam::GuardedCommand {
         inner: Box::new(shell::verify_command::VerifyCommand { 

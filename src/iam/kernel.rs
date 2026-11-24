@@ -1,7 +1,7 @@
 use nu_protocol::{ShellError, Span};
 use std::sync::Arc;
 use crate::db::Database;
-use surrealdb::types::Value as SurValue;
+use nexus_db::Value as DbValue;
 
 pub struct SecurityKernel {
     db: Arc<Database>,
@@ -22,7 +22,7 @@ impl SecurityKernel {
         _span: Span,
     ) -> Result<(), ShellError> {
         // 1. Fetch User and Role from DB
-        let mut response = self.db.client.query("SELECT VALUE active_role FROM user WHERE username = $user")
+        let response = self.db.client.query("SELECT VALUE active_role FROM user WHERE username = $user")
             .bind(("user", username))
             .await
             .map_err(|e| crate::shell_err(
@@ -32,17 +32,12 @@ impl SecurityKernel {
                 None,
             ))?;
 
-        let role_val: Option<SurValue> = response.take(0).map_err(|e| crate::shell_err(
-            "IAM Kernel Error",
-            format!("Data corruption in user table: {}", e),
-            Some(_span),
-            None,
-        ))?;
+        let role_val: Option<DbValue> = response.take_values().into_iter().next();
 
         // Convert role_val to string for comparison (e.g. "role:admin")
         let role_id = match role_val {
-            Some(SurValue::RecordId(rid)) => format!("{}:{:?}", rid.table.as_str(), rid.key),
-            Some(v) => format!("{:?}", v), // Use debug format as fallback
+            Some(DbValue::RecordId { tb, id }) => format!("{}:{}", tb, id),
+            Some(v) => v.display_compact(),
             None => "role:guest".to_string(),
         };
 

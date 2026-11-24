@@ -140,10 +140,10 @@ impl WireGuardManager {
     }
 }
 
-// Active WireGuard userspace interface (boringtun on Unix, wintun on Windows)
+// Active WireGuard userspace interface (boringtun on Unix, wintun on Windows; gated by `vpn` feature)
 pub struct WireGuardInterface {
     _name: String,
-    #[cfg(unix)]
+    #[cfg(all(feature = "vpn", unix, not(any(target_os = "android", target_os = "ios"))))]
     _handle: Option<boringtun::device::DeviceHandle>,
 }
 
@@ -152,10 +152,10 @@ impl WireGuardInterface {
     pub async fn start(name: &str, _privkey: &str, _port: u16) -> Result<Self> {
         println!("🚀 Starting WireGuard Interface: {}", name);
 
-        #[cfg(unix)]
+        #[cfg(all(feature = "vpn", unix, not(any(target_os = "android", target_os = "ios"))))]
         let mut _handle = None;
 
-        #[cfg(unix)]
+        #[cfg(all(feature = "vpn", unix, not(any(target_os = "android", target_os = "ios"))))]
         {
             let config = boringtun::device::DeviceConfig::default();
             // This starts the boringtun event loop
@@ -171,7 +171,7 @@ impl WireGuardInterface {
             }
         }
 
-        #[cfg(windows)]
+        #[cfg(all(feature = "vpn", windows))]
         {
             // Native Windows Wintun adapter hook (requires wintun.dll + elevation for L3 TUN)
             match unsafe { wintun_bindings::load() } {
@@ -184,9 +184,14 @@ impl WireGuardInterface {
             }
         }
 
+        #[cfg(not(feature = "vpn"))]
+        {
+            eprintln!("ℹ️ WireGuard VPN driver not compiled in this profile (enable `--features vpn`).");
+        }
+
         Ok(Self {
             _name: name.to_string(),
-            #[cfg(unix)]
+            #[cfg(all(feature = "vpn", unix, not(any(target_os = "android", target_os = "ios"))))]
             _handle,
         })
     }

@@ -1,5 +1,6 @@
-// Storage module for iroh-blobs, s3s, and WireGuard mesh integration
+// Storage module for iroh-blobs, s3s, and optional WireGuard VPN mesh integration
 pub mod wireguard;
+#[cfg(feature = "vpn")]
 pub mod mesh;
 pub mod storage_config;
 pub mod blob_bridge;
@@ -7,6 +8,7 @@ pub mod command;
 
 pub use blob_bridge::BlobBridge;
 pub use wireguard::WireGuardManager;
+#[cfg(feature = "vpn")]
 pub use mesh::MeshReactor;
 
 pub use command::{

@@ -1010,8 +1010,6 @@ impl Command for K8sExportCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use surrealdb::engine::local::Mem;
-    use surrealdb::Surreal;
 
     const SAMPLE_K8S: &str = r#"
 apiVersion: v1
@@ -1154,9 +1152,7 @@ spec:
                     assert!(report.warnings.iter().any(|w| w.contains("HPA")));
 
                     // 2. Deploy imported .md directly into CellManager & verify live execution
-                    let client = Surreal::new::<Mem>(()).await.unwrap();
-                    client.use_ns("nexus").use_db("system").await.unwrap();
-                    let db = Arc::new(Database { client });
+                    let db = Arc::new(Database::open_mem());
                     let blobs = Arc::new(BlobBridge::new(db.clone()).await.unwrap());
                     let manager = CellManager::new(db.clone(), blobs);
 

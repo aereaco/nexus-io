@@ -157,7 +157,7 @@ impl BlobBridge {
 
     /// Always pin `BlobBridge` metadata operations to the `pinned` `nexus::system` scope
     /// so concurrent `elastic` cell `(ns, db)` switches never leak into storage metadata.
-    async fn system_db(&self) -> Result<&surrealdb::Surreal<surrealdb::engine::local::Db>> {
+    async fn system_db(&self) -> Result<&crate::db::DbClient> {
         self.db.client.use_ns("nexus").use_db("system").await?;
         Ok(&self.db.client)
     }
@@ -599,8 +599,6 @@ impl S3 for BlobBridge {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use surrealdb::engine::local::Mem;
-    use surrealdb::Surreal;
 
     #[test]
     fn hrw_placement_is_deterministic_and_bounded() {
@@ -627,9 +625,7 @@ mod tests {
                     .build()
                     .unwrap();
                 rt.block_on(Box::pin(async {
-        let client = Surreal::new::<Mem>(()).await.unwrap();
-        client.use_ns("nexus").use_db("test").await.unwrap();
-        let db = Arc::new(Database { client });
+        let db = Arc::new(Database::open_mem());
         let bridge = BlobBridge::new(db).await.unwrap();
 
         bridge.create_bucket("cells").await.unwrap();

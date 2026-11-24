@@ -60,23 +60,15 @@ mod tests {
     use crate::db::Database;
     use crate::js::cell::{CellManager, CellPolicy};
     use std::sync::Arc;
-    use surrealdb::engine::local::Mem;
-    use surrealdb::Surreal;
 
     #[test]
     fn scans_hibernated_elastic_cells_without_waking() {
-        std::thread::Builder::new()
-            .stack_size(16 * 1024 * 1024)
-            .spawn(|| {
-                let rt = tokio::runtime::Builder::new_multi_thread()
-                    .enable_all()
-                    .thread_stack_size(16 * 1024 * 1024)
-                    .build()
-                    .unwrap();
-                rt.block_on(Box::pin(async {
-                    let client = Surreal::new::<Mem>(()).await.unwrap();
-                    client.use_ns("nexus").use_db("system").await.unwrap();
-                    let db = Arc::new(Database { client });
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let db = Arc::new(Database::open_mem());
                     let blobs = Arc::new(BlobBridge::new(db.clone()).await.unwrap());
                     let manager = CellManager::new(db.clone(), blobs.clone());
 
@@ -97,14 +89,10 @@ mod tests {
                         manager.hibernate("analytics_app", id).await.unwrap();
                     }
 
-                    let summary = scan_hibernated_cells(&blobs, "analytics-cells").await.unwrap();
-                    assert_eq!(summary.cells_scanned, 2);
-                    assert_eq!(summary.total_kv_keys, 2);
-                    assert_eq!(summary.kv_counts_by_app.get("analytics_app"), Some(&2));
-                }));
-            })
-            .unwrap()
-            .join()
-            .unwrap();
+            let summary = scan_hibernated_cells(&blobs, "analytics-cells").await.unwrap();
+            assert_eq!(summary.cells_scanned, 2);
+            assert_eq!(summary.total_kv_keys, 2);
+            assert_eq!(summary.kv_counts_by_app.get("analytics_app"), Some(&2));
+        });
     }
 }

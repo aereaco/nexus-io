@@ -189,7 +189,7 @@ fn nexus_load_file_callback(
     Ok(JsValue::Str(ctx.intern(&content)))
 }
 
-/// Zero-copy-oriented `sql(query)` bridge mapping `surrealdb::types::Value` directly to `quickrs_core::Value`.
+/// Zero-copy-oriented `sql(query)` bridge mapping `nexus_db::Value` directly to `quickrs_core::Value`.
 fn nexus_sql_callback(
     ctx: &mut Context,
     _this: &JsValue,
@@ -206,13 +206,11 @@ fn nexus_sql_callback(
     };
 
     let rt = tokio::runtime::Handle::current();
-    let rows: Result<Vec<surrealdb::types::Value>, String> = tokio::task::block_in_place(|| {
+    let rows: Result<Vec<nexus_db::Value>, String> = tokio::task::block_in_place(|| {
         rt.block_on(async move {
             let _ = db.client.use_ns("nexus").use_db("system").await;
             match db.client.query(query).await {
-                Ok(mut response) => response
-                    .take::<Vec<surrealdb::types::Value>>(0)
-                    .map_err(|e| format!("Fetch error: {}", e)),
+                Ok(response) => Ok(response.take_values()),
                 Err(e) => Err(format!("DB error: {}", e)),
             }
         })
@@ -234,32 +232,31 @@ fn nexus_sql_callback(
     }
 }
 
-/// Direct `surrealdb::types::Value` -> `quickrs_core::value::Value` conversion (no `serde_json` hop).
-fn surreal_to_js(ctx: &mut Context, val: surrealdb::types::Value) -> JsValue {
+/// Direct `nexus_db::Value` -> `quickrs_core::value::Value` conversion (no `serde_json` hop).
+fn surreal_to_js(ctx: &mut Context, val: nexus_db::Value) -> JsValue {
     match val {
-        surrealdb::types::Value::None | surrealdb::types::Value::Null => JsValue::Null,
-        surrealdb::types::Value::Bool(b) => JsValue::Bool(b),
-        surrealdb::types::Value::Number(n) => match n {
-            surrealdb::types::Number::Int(i) => {
-                if let Ok(i32_val) = i32::try_from(i) {
-                    JsValue::Int(i32_val)
-                } else {
-                    JsValue::Float(i as f64)
-                }
+        nexus_db::Value::None | nexus_db::Value::Null => JsValue::Null,
+        nexus_db::Value::Bool(b) => JsValue::Bool(b),
+        nexus_db::Value::Int(i) => {
+            if let Ok(i32_val) = i32::try_from(i) {
+                JsValue::Int(i32_val)
+            } else {
+                JsValue::Float(i as f64)
             }
-            surrealdb::types::Number::Float(f) => JsValue::Float(f),
-            surrealdb::types::Number::Decimal(d) => JsValue::Str(ctx.intern(&d.to_string())),
-            other => JsValue::Str(ctx.intern(&other.to_string())),
-        },
-        surrealdb::types::Value::String(s) => JsValue::Str(ctx.intern(&s)),
-        surrealdb::types::Value::RecordId(rid) => {
-            JsValue::Str(ctx.intern(&format!("{}:{:?}", rid.table.as_str(), rid.key)))
         }
-        surrealdb::types::Value::Array(arr) => {
+        nexus_db::Value::Float(f) => JsValue::Float(f),
+        nexus_db::Value::String(s)
+        | nexus_db::Value::DateTime(s)
+        | nexus_db::Value::Decimal(s) => JsValue::Str(ctx.intern(&s)),
+        nexus_db::Value::Duration(secs) => JsValue::Str(ctx.intern(&format!("{}s", secs))),
+        nexus_db::Value::RecordId { tb, id } => {
+            JsValue::Str(ctx.intern(&format!("{}:{}", tb, id)))
+        }
+        nexus_db::Value::Array(arr) => {
             let items: Vec<JsValue> = arr.into_iter().map(|v| surreal_to_js(ctx, v)).collect();
             JsValue::Object(ctx.new_array_from(items))
         }
-        surrealdb::types::Value::Object(map) => {
+        nexus_db::Value::Object(map) => {
             let obj = ctx.new_object();
             for (k, v) in map {
                 let key = PropKey::from_string(&ctx.intern(&k));

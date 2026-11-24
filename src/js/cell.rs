@@ -5,7 +5,7 @@ use quickrs_core::value::{JsResult, PropKey, Value as JsValue};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use surrealdb::types::Value as SurValue;
+use nexus_db::Value as DbValue;
 use tokio::sync::RwLock;
 
 use crate::db::sql_compiler::compile_sqlite_to_surql;
@@ -283,14 +283,14 @@ fn create_cell_context() -> Context {
     ctx
 }
 
-fn js_to_sur(val: &JsValue) -> SurValue {
+fn js_to_db(val: &JsValue) -> DbValue {
     match val {
-        JsValue::Undefined | JsValue::Uninitialized | JsValue::Null => SurValue::Null,
-        JsValue::Bool(b) => SurValue::Bool(*b),
-        JsValue::Int(i) => SurValue::Number(surrealdb::types::Number::Int(*i as i64)),
-        JsValue::Float(f) => SurValue::Number(surrealdb::types::Number::Float(*f)),
-        JsValue::Str(s) => SurValue::String(s.to_string()),
-        other => SurValue::String(format!("{:?}", other)),
+        JsValue::Undefined | JsValue::Uninitialized | JsValue::Null => DbValue::Null,
+        JsValue::Bool(b) => DbValue::Bool(*b),
+        JsValue::Int(i) => DbValue::Int(*i as i64),
+        JsValue::Float(f) => DbValue::Float(*f),
+        JsValue::Str(s) => DbValue::String(s.to_string()),
+        other => DbValue::String(format!("{:?}", other)),
     }
 }
 
@@ -318,7 +318,7 @@ fn cell_sql_exec_cb(
         let borrowed = arr_obj.borrow();
         if let quickrs_core::object::ObjectData::Array(arr) = &borrowed.data {
             for elem in &arr.elements {
-                sur_args.push(js_to_sur(elem));
+                sur_args.push(js_to_db(elem));
             }
         }
     }
@@ -350,7 +350,7 @@ fn cell_surreal_query_cb(
 fn run_cell_query(
     ctx: &mut Context,
     surql: &str,
-    bindings: Vec<(String, SurValue)>,
+    bindings: Vec<(String, DbValue)>,
 ) -> JsResult<JsValue> {
     let scope = ACTIVE_CELL_SCOPE.with(|s| {
         s.borrow().as_ref().map(|sc| (sc.engine.clone(), sc.app.clone(), sc.cell_id.clone()))
@@ -404,7 +404,7 @@ fn cell_kv_put_cb(
     _magic: i32,
 ) -> JsResult<JsValue> {
     let key = args.first().map(js_val_to_string).unwrap_or_default();
-    let val = args.get(1).map(js_to_sur).unwrap_or(SurValue::Null);
+    let val = args.get(1).map(js_to_db).unwrap_or(DbValue::Null);
     let scope = ACTIVE_CELL_SCOPE.with(|s| {
         s.borrow().as_ref().map(|sc| (sc.engine.clone(), sc.app.clone(), sc.cell_id.clone()))
     });
@@ -438,8 +438,6 @@ fn cell_kv_delete_cb(
 mod tests {
     use super::*;
     use crate::db::Database;
-    use surrealdb::engine::local::Mem;
-    use surrealdb::Surreal;
 
     #[test]
     fn elastic_cell_supports_sqlite_api_surrealql_and_hibernation() {
@@ -452,9 +450,7 @@ mod tests {
                     .build()
                     .unwrap();
                 rt.block_on(Box::pin(async {
-                    let client = Surreal::new::<Mem>(()).await.unwrap();
-                    client.use_ns("nexus").use_db("system").await.unwrap();
-                    let db = Arc::new(Database { client });
+                    let db = Arc::new(Database::open_mem());
                     let blobs = Arc::new(BlobBridge::new(db.clone()).await.unwrap());
                     let manager = CellManager::new(db.clone(), blobs);
 

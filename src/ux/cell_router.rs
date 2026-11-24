@@ -4,6 +4,7 @@ use salvo::prelude::*;
 use salvo::websocket::{Message, WebSocketUpgrade};
 use std::sync::Arc;
 
+#[cfg(feature = "k8s-bridge")]
 use crate::compute::k8s_bridge::{export_k8s_yaml, import_k8s_yaml, ExportOptions};
 use crate::compute::md_runtime::deploy_markdown;
 use crate::db::Database;
@@ -81,6 +82,7 @@ impl Handler for CellGatewayHandler {
         }
 
         // POST /cells/import-k8s -> import Kubernetes YAML into Nexus .md (and optionally deploy with ?deploy=true)
+        #[cfg(feature = "k8s-bridge")]
         if req.method() == &Method::POST && req.uri().path().trim_end_matches('/') == "/cells/import-k8s" {
             let yaml = match req.payload().await {
                 Ok(bytes) => String::from_utf8_lossy(bytes).to_string(),
@@ -122,6 +124,7 @@ impl Handler for CellGatewayHandler {
         }
 
         // POST /cells/export-k8s -> export Nexus .md service document to standard Kubernetes YAML
+        #[cfg(feature = "k8s-bridge")]
         if req.method() == &Method::POST && req.uri().path().trim_end_matches('/') == "/cells/export-k8s" {
             let md = match req.payload().await {
                 Ok(bytes) => String::from_utf8_lossy(bytes).to_string(),
