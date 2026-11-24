@@ -37,77 +37,89 @@ impl Command for SqlCommand {
         let query = if let Some(q) = query {
             q
         } else {
-            // Interactive Sub-REPL
-            use rustyline::error::ReadlineError;
-            use rustyline::DefaultEditor;
-            
-            println!("--- Nexus Mind Plane (SurrealQL) ---");
-            println!("Type 'exit' to return to nexus shell.");
-            
-            let mut rl = DefaultEditor::new().map_err(|e| crate::shell_err(
-                "REPL Error",
-                e.to_string(),
-                Some(call.head),
-                None,
-            ))?;
+            #[cfg(all(feature = "shell", not(any(target_os = "android", target_os = "ios"))))]
+            {
+                // Interactive Sub-REPL
+                use rustyline::error::ReadlineError;
+                use rustyline::DefaultEditor;
 
-            loop {
-                let readline = rl.readline("nexus [sql]> ");
-                match readline {
-                    Ok(line) => {
-                        let line = line.trim();
-                        if line.is_empty() { continue; }
-                        if line == "exit" || line == "quit" { break; }
-                        
-                        let _ = rl.add_history_entry(line);
-                        
-                        // Execute query
-                        let db = self.db.clone();
-                        let result = tokio::task::block_in_place(|| {
-                            tokio::runtime::Handle::current().block_on(async move {
-                                db.client.query(line).await
-                            })
-                        });
+                println!("--- Nexus Mind Plane (SurrealQL) ---");
+                println!("Type 'exit' to return to nexus shell.");
 
-                        match result {
-                            Ok(response) => {
-                                let val = response.take_values();
-                                if !val.is_empty() {
-                                    let nu_list: Vec<NuValue> = val
-                                        .into_iter()
-                                        .map(|v| map_db_to_nu(v, call.head))
-                                        .collect();
-                                    let table_val = NuValue::list(nu_list, call.head);
+                let mut rl = DefaultEditor::new().map_err(|e| crate::shell_err(
+                    "REPL Error",
+                    e.to_string(),
+                    Some(call.head),
+                    None,
+                ))?;
 
-                                    let _ = nu_cli::evaluate_commands(
-                                        &nu_protocol::Spanned { item: "table".to_string(), span: call.head },
-                                        &mut engine_state.clone(),
-                                        &mut _stack.clone(),
-                                        table_val.into_pipeline_data(),
-                                        vec![],
-                                        nu_cli::EvaluateCommandsOpts::default(),
-                                    );
-                                } else {
-                                    println!("[]");
-                                }
-                            },
-                            Err(e) => eprintln!("❌ System Error: {}", e),
+                loop {
+                    let readline = rl.readline("nexus [sql]> ");
+                    match readline {
+                        Ok(line) => {
+                            let line = line.trim();
+                            if line.is_empty() { continue; }
+                            if line == "exit" || line == "quit" { break; }
+
+                            let _ = rl.add_history_entry(line);
+
+                            // Execute query
+                            let db = self.db.clone();
+                            let result = tokio::task::block_in_place(|| {
+                                tokio::runtime::Handle::current().block_on(async move {
+                                    db.client.query(line).await
+                                })
+                            });
+
+                            match result {
+                                Ok(response) => {
+                                    let val = response.take_values();
+                                    if !val.is_empty() {
+                                        let nu_list: Vec<NuValue> = val
+                                            .into_iter()
+                                            .map(|v| map_db_to_nu(v, call.head))
+                                            .collect();
+                                        let table_val = NuValue::list(nu_list, call.head);
+
+                                        let _ = nu_cli::evaluate_commands(
+                                            &nu_protocol::Spanned { item: "table".to_string(), span: call.head },
+                                            &mut engine_state.clone(),
+                                            &mut _stack.clone(),
+                                            table_val.into_pipeline_data(),
+                                            vec![],
+                                            nu_cli::EvaluateCommandsOpts::default(),
+                                        );
+                                    } else {
+                                        println!("[]");
+                                    }
+                                },
+                                Err(e) => eprintln!("❌ System Error: {}", e),
+                            }
+                        },
+                        Err(ReadlineError::Interrupted) => {
+                            println!("Interrupted");
+                            break;
+                        },
+                        Err(ReadlineError::Eof) => {
+                            break;
+                        },
+                        Err(err) => {
+                            println!("Error: {:?}", err);
+                            break;
                         }
-                    },
-                    Err(ReadlineError::Interrupted) => {
-                        println!("Interrupted");
-                        break;
-                    },
-                    Err(ReadlineError::Eof) => {
-                        break;
-                    },
-                    Err(err) => {
-                        println!("Error: {:?}", err);
-                        break;
                     }
                 }
+                return Ok(PipelineData::empty());
             }
-            return Ok(PipelineData::empty());
+            #[cfg(not(all(feature = "shell", not(any(target_os = "android", target_os = "ios")))))]
+            {
+                return Err(crate::shell_err(
+                    "Interactive SQL REPL not compiled",
+                    "Pass an inline query argument or rebuild with `--features shell`.",
+                    Some(call.head),
+                    None,
+                ));
+            }
         };
 
         // Capture pipeline input as Value

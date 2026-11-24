@@ -473,4 +473,131 @@ mod differential_tests {
             .join()
             .unwrap();
     }
+
+    /// Second differential suite covering GROUP BY aggregates, DEFINE FUNCTION,
+    /// UPSERT/DELETE/LIMIT/START/OMIT/SPLIT, and array/string stdlib parity.
+    #[test]
+    fn differential_aggregates_functions_dml_and_stdlib() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let rt = tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .thread_stack_size(16 * 1024 * 1024)
+                    .build()
+                    .unwrap();
+                rt.block_on(Box::pin(async {
+                    let client = Surreal::new::<Mem>(()).await.unwrap();
+                    client.use_ns("nexus").use_db("system").await.unwrap();
+                    let surreal_engine = SurrealRefEngine { client };
+                    let nexus_engine = NexusDb::open_mem();
+
+                    let engines: [&dyn StateEngine; 2] = [&surreal_engine, &nexus_engine];
+                    let mut results = Vec::new();
+
+                    for eng in engines {
+                        // 1. Seed sales data & test GROUP BY + count/sum/min/max
+                        eng.query_scoped(
+                            "diff_agg",
+                            "room_2",
+                            "CREATE sale:1 SET region = 'east', amount = 10;
+                             CREATE sale:2 SET region = 'east', amount = 30;
+                             CREATE sale:3 SET region = 'west', amount = 50;",
+                            vec![],
+                        )
+                        .await
+                        .unwrap();
+
+                        let agg_rows = eng
+                            .query_scoped(
+                                "diff_agg",
+                                "room_2",
+                                "SELECT region, count() AS n, math::sum(amount) AS total, math::min(amount) AS lo, math::max(amount) AS hi FROM sale GROUP BY region ORDER BY region ASC;",
+                                vec![],
+                            )
+                            .await
+                            .unwrap();
+
+                        // 2. UPSERT + DELETE + LIMIT/START + OMIT
+                        eng.query_scoped(
+                            "diff_agg",
+                            "room_2",
+                            "UPSERT item:a SET name = 'a', rank = 1, secret = 'x';
+                             UPSERT item:b SET name = 'b', rank = 2, secret = 'y';
+                             UPSERT item:c SET name = 'c', rank = 3, secret = 'z';
+                             UPSERT item:b SET name = 'b2', rank = 2, secret = 'y2';
+                             DELETE item:c;",
+                            vec![],
+                        )
+                        .await
+                        .unwrap();
+
+                        let page_rows = eng
+                            .query_scoped(
+                                "diff_agg",
+                                "room_2",
+                                "SELECT * OMIT id, secret FROM item ORDER BY rank ASC LIMIT 1 START 1;",
+                                vec![],
+                            )
+                            .await
+                            .unwrap();
+
+                        // 3. SPLIT on array field
+                        eng.query_scoped(
+                            "diff_agg",
+                            "room_2",
+                            "CREATE post:1 SET title = 'hi', tags = ['rust', 'db'];",
+                            vec![],
+                        )
+                        .await
+                        .unwrap();
+
+                        let split_rows = eng
+                            .query_scoped(
+                                "diff_agg",
+                                "room_2",
+                                "SELECT VALUE tags FROM post:1 SPLIT tags ORDER BY tags ASC;",
+                                vec![],
+                            )
+                            .await
+                            .unwrap();
+
+                        // 4. DEFINE FUNCTION + array/string stdlib
+                        eng.query_scoped(
+                            "diff_agg",
+                            "room_2",
+                            "DEFINE FUNCTION fn::double($x: int) { RETURN $x * 2; };",
+                            vec![],
+                        )
+                        .await
+                        .unwrap();
+
+                        let fn_and_stdlib = eng
+                            .query_scoped(
+                                "diff_agg",
+                                "room_2",
+                                "RETURN [fn::double(21), array::len([1, 2, 3]), array::distinct([3, 1, 3, 2]), string::concat('nexus', '-', 'io')];",
+                                vec![],
+                            )
+                            .await
+                            .unwrap();
+
+                        results.push((
+                            agg_rows.iter().map(DbValue::to_json).collect::<Vec<_>>(),
+                            page_rows.iter().map(DbValue::to_json).collect::<Vec<_>>(),
+                            split_rows.iter().map(DbValue::to_json).collect::<Vec<_>>(),
+                            fn_and_stdlib.iter().map(DbValue::to_json).collect::<Vec<_>>(),
+                        ));
+                    }
+
+                    assert_eq!(
+                        results[0], results[1],
+                        "nexus-db diverged from SurrealDB 4.0 on aggregates/functions/DML/stdlib!"
+                    );
+                }));
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
 }

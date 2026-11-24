@@ -27,6 +27,8 @@ profile-core = [
 
 profile-app = [
     "profile-core",
+    "p2p-storage",
+    "s3-gateway",
     "nexus-db/fts",
     "nexus-db/vector",
     "nexus-db/files",
@@ -40,6 +42,7 @@ profile-full = [
     "k8s-bridge",
     "vpn",
     "hardware-monitoring",
+    "shell",
     "nexus-db/full",
 ]
 
@@ -54,6 +57,7 @@ profile-windows = [
     "wasm-runtime",
     "vpn",
     "hardware-monitoring",
+    "shell",
 ]
 
 profile-linux = [
@@ -62,12 +66,14 @@ profile-linux = [
     "vpn",
     "k8s-bridge",
     "hardware-monitoring",
+    "shell",
 ]
 
 profile-macos = [
     "profile-app",
     "wasm-runtime",
     "vpn",
+    "shell",
 ]
 
 profile-android = [
@@ -86,6 +92,9 @@ gateway = []
 js-runtime = []
 cells = []
 iam = []
+p2p-storage = ["dep:iroh", "dep:iroh-blobs"]
+s3-gateway = ["dep:s3s"]
+shell = ["dep:nu-cli", "dep:rustyline"]
 wasm-runtime = ["dep:wasmtime"]
 k8s-bridge = ["dep:serde_norway"]
 vpn = ["dep:boringtun", "dep:wintun-bindings"]
@@ -120,10 +129,10 @@ oxc_codegen = "0.144.0"
 oxc_span = { version = "0.144.0", features = ["serialize"] }
 oxc_ast = { version = "0.144.0", features = ["serialize"] }
 
-# 4. The Cloud (Cross-Platform Distributed Storage & Networking)
-s3s = "0.17.0"
-iroh = "1.0.3"
-iroh-blobs = "0.104.1"
+# 4. The Cloud (Cross-Platform Distributed Storage & Networking — optional behind `p2p-storage` / `s3-gateway`)
+s3s = { version = "0.17.0", optional = true }
+iroh = { version = "1.0.3", optional = true }
+iroh-blobs = { version = "0.104.1", optional = true }
 
 # WireGuard - Zero-Trust VPN Mesh (optional behind `vpn`)
 boringtun = { version = "0.7.1", optional = true }
@@ -157,8 +166,8 @@ get_if_addrs = "0.5.3"
 wasmtime = { version = "51.0.0", optional = true, default-features = false, features = ["cranelift", "runtime", "wat"] }
 
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
-nu-cli = "0.117.0"
-rustyline = "15.0"
+nu-cli = { version = "0.117.0", optional = true }
+rustyline = { version = "15.0", optional = true }
 nvml-wrapper = { version = "0.10", optional = true }
 wry = { version = "0.51", optional = true }
 tao = { version = "0.33", optional = true }

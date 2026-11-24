@@ -44,71 +44,83 @@ impl Command for JsCommand {
             }
             c
         } else {
-            // Interactive Sub-REPL
-            use rustyline::error::ReadlineError;
-            use rustyline::DefaultEditor;
-            
-            println!("--- Nexus Sovereign Logic (JavaScript) ---");
-            println!("Type 'exit' to return to nexus shell.");
-            
-            let mut rl = DefaultEditor::new().map_err(|e| crate::shell_err(
-                "REPL Error",
-                e.to_string(),
-                Some(call.head),
-                None,
-            ))?;
+            #[cfg(all(feature = "shell", not(any(target_os = "android", target_os = "ios"))))]
+            {
+                // Interactive Sub-REPL
+                use rustyline::error::ReadlineError;
+                use rustyline::DefaultEditor;
 
-            loop {
-                let readline = rl.readline("nexus [js]> ");
-                match readline {
-                    Ok(line) => {
-                        let line = line.trim();
-                        if line.is_empty() { continue; }
-                        if line == "exit" || line == "quit" { break; }
-                        
-                        let _ = rl.add_history_entry(line);
-                        
-                        // Transform TS if needed
-                        let mut exec_code = line.to_string();
-                        if transformer::is_likely_ts(&exec_code) {
-                            if let Ok(js) = transformer::transform_ts_to_js(&exec_code, call.head) {
-                                exec_code = js;
-                            }
-                        }
+                println!("--- Nexus Sovereign Logic (JavaScript) ---");
+                println!("Type 'exit' to return to nexus shell.");
 
-                        match self.engine.execute(exec_code, call.head) {
-                            Ok(val) => {
-                                let result = nu_cli::evaluate_commands(
-                                    &nu_protocol::Spanned { item: "table".to_string(), span: call.head },
-                                    &mut engine_state.clone(),
-                                    &mut _stack.clone(),
-                                    val.into_pipeline_data(),
-                                    vec![],
-                                    nu_cli::EvaluateCommandsOpts::default(),
-                                );
-                                if let Err(e) = result {
-                                    eprintln!("❌ Rendering Error: {:?}", e);
+                let mut rl = DefaultEditor::new().map_err(|e| crate::shell_err(
+                    "REPL Error",
+                    e.to_string(),
+                    Some(call.head),
+                    None,
+                ))?;
+
+                loop {
+                    let readline = rl.readline("nexus [js]> ");
+                    match readline {
+                        Ok(line) => {
+                            let line = line.trim();
+                            if line.is_empty() { continue; }
+                            if line == "exit" || line == "quit" { break; }
+
+                            let _ = rl.add_history_entry(line);
+
+                            // Transform TS if needed
+                            let mut exec_code = line.to_string();
+                            if transformer::is_likely_ts(&exec_code) {
+                                if let Ok(js) = transformer::transform_ts_to_js(&exec_code, call.head) {
+                                    exec_code = js;
                                 }
                             }
-                            Err(e) => {
-                                eprintln!("❌ Error: {:?}", e);
+
+                            match self.engine.execute(exec_code, call.head) {
+                                Ok(val) => {
+                                    let result = nu_cli::evaluate_commands(
+                                        &nu_protocol::Spanned { item: "table".to_string(), span: call.head },
+                                        &mut engine_state.clone(),
+                                        &mut _stack.clone(),
+                                        val.into_pipeline_data(),
+                                        vec![],
+                                        nu_cli::EvaluateCommandsOpts::default(),
+                                    );
+                                    if let Err(e) = result {
+                                        eprintln!("❌ Rendering Error: {:?}", e);
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("❌ Error: {:?}", e);
+                                }
                             }
+                        },
+                        Err(ReadlineError::Interrupted) => {
+                            println!("Interrupted");
+                            break;
+                        },
+                        Err(ReadlineError::Eof) => {
+                            break;
+                        },
+                        Err(err) => {
+                            println!("Error: {:?}", err);
+                            break;
                         }
-                    },
-                    Err(ReadlineError::Interrupted) => {
-                        println!("Interrupted");
-                        break;
-                    },
-                    Err(ReadlineError::Eof) => {
-                        break;
-                    },
-                    Err(err) => {
-                        println!("Error: {:?}", err);
-                        break;
                     }
                 }
+                return Ok(PipelineData::empty());
             }
-            return Ok(PipelineData::empty());
+            #[cfg(not(all(feature = "shell", not(any(target_os = "android", target_os = "ios")))))]
+            {
+                return Err(crate::shell_err(
+                    "Interactive JS REPL not compiled",
+                    "Pass a JS/TS snippet or file path, or rebuild with `--features shell`.",
+                    Some(call.head),
+                    None,
+                ));
+            }
         };
 
         if transformer::is_likely_ts(&code) {

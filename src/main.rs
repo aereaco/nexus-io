@@ -58,6 +58,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
             
+            #[cfg(all(feature = "shell", not(any(target_os = "android", target_os = "ios"))))]
             if let Err(e) = nu_cli::evaluate_commands(
                 &nu_protocol::Spanned { item: "table".to_string(), span: nu_protocol::Span::unknown() },
                 &mut engine_state,
@@ -68,6 +69,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ) {
                  nu_protocol::report_shell_error(None, &engine_state, &e);
                  std::process::exit(1);
+            }
+            #[cfg(not(all(feature = "shell", not(any(target_os = "android", target_os = "ios")))))]
+            {
+                println!("{}", result.to_abbreviated_string(&nu_protocol::Config::default()));
             }
             return Ok(());
             } // End of else (implied by indentation, but explicit check needed)
@@ -359,34 +364,75 @@ async fn async_main(args: Vec<String>, is_test: bool) -> Result<(), Box<dyn std:
             positional_args.join(" ")
         };
 
-        let command_spanned = nu_protocol::Spanned {
-            item: command,
-            span: nu_protocol::Span::unknown(),
-        };
-        let result = nu_cli::evaluate_commands(
-            &command_spanned,
-            &mut engine_state,
-            &mut stack,
-            nu_protocol::PipelineData::empty(),
-            vec![],
-            nu_cli::EvaluateCommandsOpts::default(),
-        );
+        #[cfg(all(feature = "shell", not(any(target_os = "android", target_os = "ios"))))]
+        {
+            let command_spanned = nu_protocol::Spanned {
+                item: command,
+                span: nu_protocol::Span::unknown(),
+            };
+            let result = nu_cli::evaluate_commands(
+                &command_spanned,
+                &mut engine_state,
+                &mut stack,
+                nu_protocol::PipelineData::empty(),
+                vec![],
+                nu_cli::EvaluateCommandsOpts::default(),
+            );
 
-        if let Err(e) = result {
-            nu_protocol::report_shell_error(None, &engine_state, &e);
-            std::process::exit(1);
+            if let Err(e) = result {
+                nu_protocol::report_shell_error(None, &engine_state, &e);
+                std::process::exit(1);
+            }
+        }
+        #[cfg(not(all(feature = "shell", not(any(target_os = "android", target_os = "ios")))))]
+        {
+            let mut working_set = StateWorkingSet::new(&engine_state);
+            let block = nu_parser::parse(&mut working_set, None, command.as_bytes(), false);
+            if let Some(err) = working_set.parse_errors.first() {
+                eprintln!("Parse error: {:?}", err);
+                std::process::exit(1);
+            }
+            let _ = engine_state.merge_delta(working_set.render());
+            match nu_engine::eval_block::<nu_protocol::debugger::WithoutDebug>(
+                &engine_state,
+                &mut stack,
+                &block,
+                nu_protocol::PipelineData::empty(),
+            ) {
+                Ok(out) => {
+                    if let Ok(val) = out.body.into_value(nu_protocol::Span::unknown()) {
+                        if !matches!(val, Value::Nothing { .. }) {
+                            println!("{}", val.to_abbreviated_string(&nu_protocol::Config::default()));
+                        }
+                    }
+                }
+                Err(e) => {
+                    nu_protocol::report_shell_error(None, &engine_state, &e);
+                    std::process::exit(1);
+                }
+            }
         }
     } else {
-        let result = nu_cli::evaluate_repl(
-            &mut engine_state,
-            stack,
-            None, 
-            None, 
-        );
+        #[cfg(all(feature = "shell", not(any(target_os = "android", target_os = "ios"))))]
+        {
+            let result = nu_cli::evaluate_repl(
+                &mut engine_state,
+                stack,
+                None, 
+                None, 
+            );
 
-        if let Err(e) = result {
-            eprintln!("REPL Error: {:?}", e);
-            std::process::exit(1);
+            if let Err(e) = result {
+                eprintln!("REPL Error: {:?}", e);
+                std::process::exit(1);
+            }
+        }
+        #[cfg(not(all(feature = "shell", not(any(target_os = "android", target_os = "ios")))))]
+        {
+            println!(
+                "🚀 Nexus-IO ({}) ready (headless profile — pass a command or rebuild with `--features shell` for interactive REPL).",
+                nexus_io::runtime::CapabilityRegistry::active_profile()
+            );
         }
     }
 

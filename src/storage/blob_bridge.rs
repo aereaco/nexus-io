@@ -1,17 +1,24 @@
 use anyhow::Result;
 use bytes::Bytes;
+#[cfg(feature = "s3-gateway")]
 use futures::StreamExt;
+#[cfg(feature = "p2p-storage")]
 use iroh::protocol::Router;
+#[cfg(feature = "p2p-storage")]
 use iroh::Endpoint;
+#[cfg(feature = "p2p-storage")]
 use iroh_blobs::store::fs::FsStore;
+#[cfg(feature = "p2p-storage")]
 use iroh_blobs::{BlobsProtocol, Hash as BlobHash};
 use once_cell::sync::Lazy;
+#[cfg(feature = "s3-gateway")]
 use s3s::dto::{
     Bucket as S3Bucket, CreateBucketInput, CreateBucketOutput, DeleteObjectInput,
     DeleteObjectOutput, ETag, GetObjectInput, GetObjectOutput, HeadObjectInput, HeadObjectOutput,
     ListBucketsInput, ListBucketsOutput, ListObjectsV2Input, ListObjectsV2Output,
     Object as S3Object, PutObjectInput, PutObjectOutput, StreamingBlob,
 };
+#[cfg(feature = "s3-gateway")]
 use s3s::{s3_error, S3Request, S3Response, S3Result, S3};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -20,18 +27,24 @@ use tokio::sync::RwLock;
 use super::storage_config::create_dev_config;
 use crate::db::Database;
 
-/// Global singleton `FsStore` + `iroh` P2P router (cross-platform Windows/Linux/macOS).
+/// Global singleton blob store (`iroh-blobs` P2P router when `p2p-storage` is enabled,
+/// or lightweight local BLAKE3 CAS directory in `profile-core`).
 struct BlobNode {
+    #[cfg(feature = "p2p-storage")]
     store: Arc<FsStore>,
+    #[cfg(feature = "p2p-storage")]
     endpoint: Endpoint,
+    #[cfg(feature = "p2p-storage")]
     _router: Router,
+    #[cfg(not(feature = "p2p-storage"))]
+    local_dir: std::path::PathBuf,
     node_id: String,
 }
 
 static BLOB_NODE: Lazy<Arc<RwLock<Option<Arc<BlobNode>>>>> =
     Lazy::new(|| Arc::new(RwLock::new(None)));
 
-/// Initialize or get the global `iroh-blobs` `FsStore` + `iroh` P2P endpoint in `data_dir`.
+/// Initialize or get the global blob store in `data_dir`.
 async fn init_blob_node(data_dir: &std::path::Path) -> Result<Arc<BlobNode>> {
     let mut node_lock = BLOB_NODE.write().await;
 
@@ -48,31 +61,45 @@ async fn init_blob_node(data_dir: &std::path::Path) -> Result<Arc<BlobNode>> {
             println!("⚠️  Secure Mesh NOT Detected: Localhost storage mode");
         }
 
-        let store = Arc::new(
-            FsStore::load(&config.data_dir)
+        #[cfg(feature = "p2p-storage")]
+        let node = {
+            let store = Arc::new(
+                FsStore::load(&config.data_dir)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Failed to initialize iroh-blobs FsStore: {}", e))?,
+            );
+
+            let endpoint = Endpoint::bind(iroh::endpoint::presets::N0)
                 .await
-                .map_err(|e| anyhow::anyhow!("Failed to initialize iroh-blobs FsStore: {}", e))?,
-        );
+                .map_err(|e| anyhow::anyhow!("Failed to bind iroh Endpoint: {}", e))?;
+            let node_id = endpoint.id().to_string();
 
-        let endpoint = Endpoint::bind(iroh::endpoint::presets::N0)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to bind iroh Endpoint: {}", e))?;
-        let node_id = endpoint.id().to_string();
+            let blobs_proto = BlobsProtocol::new(&store, None);
+            let router = Router::builder(endpoint.clone())
+                .accept(iroh_blobs::ALPN, blobs_proto)
+                .spawn();
 
-        let blobs_proto = BlobsProtocol::new(&store, None);
-        let router = Router::builder(endpoint.clone())
-            .accept(iroh_blobs::ALPN, blobs_proto)
-            .spawn();
+            println!("✅ iroh-blobs FsStore + P2P Endpoint {} ready at {}", node_id, config.data_dir);
+            Arc::new(BlobNode {
+                store,
+                endpoint,
+                _router: router,
+                node_id,
+            })
+        };
 
-        let node = Arc::new(BlobNode {
-            store,
-            endpoint,
-            _router: router,
-            node_id: node_id.clone(),
-        });
+        #[cfg(not(feature = "p2p-storage"))]
+        let node = {
+            tokio::fs::create_dir_all(&blob_path).await?;
+            let node_id = format!("local-{}", blake3::hash(config.data_dir.as_bytes()).to_hex());
+            println!("✅ Local BLAKE3 CAS BlobStore ({}) ready at {}", &node_id[..16], config.data_dir);
+            Arc::new(BlobNode {
+                local_dir: blob_path,
+                node_id,
+            })
+        };
 
         *node_lock = Some(node);
-        println!("✅ iroh-blobs FsStore + P2P Endpoint {} ready at {}", node_id, config.data_dir);
     }
 
     Ok(node_lock.as_ref().unwrap().clone())
@@ -177,6 +204,7 @@ impl BlobBridge {
     }
 
     /// Run one pass of HRW anti-entropy verification/repair.
+    #[cfg(feature = "p2p-storage")]
     pub async fn repair_once(&self, replication_factor: usize) -> Result<usize> {
         let client = self.system_db().await?;
         let mut peer_resp = client
@@ -234,6 +262,11 @@ impl BlobBridge {
         }
 
         Ok(repaired)
+    }
+
+    #[cfg(not(feature = "p2p-storage"))]
+    pub async fn repair_once(&self, _replication_factor: usize) -> Result<usize> {
+        Ok(0)
     }
 
     /// Create a bucket in SurrealDB metadata (`sys::bucket`).
@@ -324,8 +357,20 @@ impl BlobBridge {
         }
 
         let len = value.len() as u64;
-        let outcome = self.node.store.blobs().add_bytes(value).await?;
-        let hash_hex = outcome.hash.to_hex().to_string();
+        #[cfg(feature = "p2p-storage")]
+        let hash_hex = {
+            let outcome = self.node.store.blobs().add_bytes(value).await?;
+            outcome.hash.to_hex().to_string()
+        };
+        #[cfg(not(feature = "p2p-storage"))]
+        let hash_hex = {
+            let hex = blake3::hash(&value).to_hex().to_string();
+            let path = self.node.local_dir.join(&hex);
+            if !path.exists() {
+                tokio::fs::write(&path, &value).await?;
+            }
+            hex
+        };
 
         let obj_id = format!("{}/{}", bucket, key);
         let client = self.system_db().await?;
@@ -406,19 +451,29 @@ impl BlobBridge {
         Ok(out)
     }
 
-    /// Get object - zero-copy read (`bytes::Bytes`) from `iroh-blobs`.
+    /// Get object - zero-copy read (`bytes::Bytes`) from `iroh-blobs` or local BLAKE3 CAS.
     pub async fn get_object(&self, bucket: &str, key: &str) -> Result<Option<Bytes>> {
         let Some(meta) = self.head_object(bucket, key).await? else {
             return Ok(None);
         };
 
-        let hash: BlobHash = meta
-            .etag
-            .parse()
-            .map_err(|e| anyhow::anyhow!("Invalid BLAKE3 hash '{}': {:?}", meta.etag, e))?;
+        #[cfg(feature = "p2p-storage")]
+        {
+            let hash: BlobHash = meta
+                .etag
+                .parse()
+                .map_err(|e| anyhow::anyhow!("Invalid BLAKE3 hash '{}': {:?}", meta.etag, e))?;
 
-        let data = self.node.store.blobs().get_bytes(hash).await?;
-        Ok(Some(data))
+            let data = self.node.store.blobs().get_bytes(hash).await?;
+            Ok(Some(data))
+        }
+
+        #[cfg(not(feature = "p2p-storage"))]
+        {
+            let path = self.node.local_dir.join(&meta.etag);
+            let raw = tokio::fs::read(&path).await?;
+            Ok(Some(Bytes::from(raw)))
+        }
     }
 
     /// Delete object - mark tombstone in SurrealDB metadata.
@@ -434,6 +489,7 @@ impl BlobBridge {
     }
 }
 
+#[cfg(feature = "s3-gateway")]
 #[salvo::prelude::async_trait]
 impl S3 for BlobBridge {
     async fn create_bucket(
