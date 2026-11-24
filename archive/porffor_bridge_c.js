@@ -1,1 +1,0 @@
-import compile from './node_modules/porffor/compiler/index.js'; export const porffor_compile = (code, args) => { globalThis.Prefs = { target: 'c' }; globalThis.defaultPrefs = { target: 'c' }; globalThis.performance = { now: () => Date.now() }; globalThis.console = { log: print, error: print }; return compile(code, args); };
