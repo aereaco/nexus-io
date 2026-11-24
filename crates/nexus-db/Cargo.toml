@@ -3,7 +3,7 @@ name = "nexus-db"
 version = "0.1.0"
 edition = "2021"
 description = "Clean-room, ultra-low-footprint SurrealQL-compatible embedded multi-model database (Synchronous Volcano Engine on redb)"
-license = "Apache-2.0"
+license = "MIT"
 
 [dependencies]
 anyhow = "1.0"
