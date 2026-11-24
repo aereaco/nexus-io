@@ -63,7 +63,7 @@ impl StateEngine for Database {
             q = q.bind((k, v));
         }
 
-        let mut response = q.await?;
+        let mut response = q.await?.check()?;
         let mut last_rows: Vec<SurValue> = Vec::new();
         let num_stmts = response.num_statements();
         for idx in 0..num_stmts {
@@ -256,6 +256,12 @@ impl StateEngine for nexus_db::NexusDb {
             .map(|(k, v)| (k, sur_to_nexus(&v)))
             .collect();
         let rows = nexus_db::NexusDb::query_scoped(self, ns, db, surql, converted)?;
+        // Match SurrealDB's `response.take::<Vec<Value>>` unwrapping of a top-level Array return
+        if rows.len() == 1 {
+            if let nexus_db::Value::Array(items) = &rows[0] {
+                return Ok(items.iter().map(nexus_to_sur).collect());
+            }
+        }
         Ok(rows.iter().map(nexus_to_sur).collect())
     }
 
@@ -363,14 +369,17 @@ mod tests {
                             .await
                             .unwrap();
 
-                        // 2. Graph RELATE + traversal + UPDATE/MERGE + stdlib
+                        // 2. Graph RELATE + traversal + UPDATE/MERGE/UNSET/+= + UNIQUE + expressions
                         eng.query_scoped(
                             "diff_app",
                             "room_1",
                             "CREATE person:alice SET name = 'alice';
                              CREATE person:bob SET name = 'bob';
                              RELATE person:alice->knows->person:bob;
-                             UPDATE person:bob MERGE { role: 'eng' };",
+                             UPDATE person:bob MERGE { role: 'eng' };
+                             CREATE counter:1 SET val = 5, tmp = 'dropme';
+                             UPDATE counter:1 SET val += 7;
+                             UPDATE counter:1 UNSET tmp;",
                             vec![],
                         )
                         .await
@@ -381,6 +390,48 @@ mod tests {
                                 "diff_app",
                                 "room_1",
                                 "SELECT VALUE string::uppercase(name) FROM person:bob;",
+                                vec![],
+                            )
+                            .await
+                            .unwrap();
+
+                        let counter_rows = eng
+                            .query_scoped(
+                                "diff_app",
+                                "room_1",
+                                "SELECT VALUE val FROM counter:1;",
+                                vec![],
+                            )
+                            .await
+                            .unwrap();
+
+                        // 2b. UNIQUE constraint enforcement (both engines must reject duplicate!)
+                        eng.query_scoped(
+                            "diff_app",
+                            "room_1",
+                            "DEFINE TABLE uniq_u SCHEMALESS;
+                             DEFINE INDEX idx_u_email ON uniq_u FIELDS email UNIQUE;
+                             CREATE uniq_u:1 SET email = 'dup@nexus.io';",
+                            vec![],
+                        )
+                        .await
+                        .unwrap();
+                        let dup_rejected = eng
+                            .query_scoped(
+                                "diff_app",
+                                "room_1",
+                                "CREATE uniq_u:2 SET email = 'dup@nexus.io';",
+                                vec![],
+                            )
+                            .await
+                            .is_err();
+
+                        // 2c. Expressions: `??`, inline IF, string::lowercase, math::abs
+                        let expr_rows = eng
+                            .query_scoped(
+                                "diff_app",
+                                "room_1",
+                                "RETURN [NONE ?? 'ok', IF 3 > 1 THEN 'yes' ELSE 'no' END, string::lowercase('NEXUS'), math::abs(-9)];",
                                 vec![],
                             )
                             .await
@@ -399,6 +450,9 @@ mod tests {
                         results.push((
                             rows.iter().map(sur_to_json).collect::<Vec<_>>(),
                             graph_rows.iter().map(sur_to_json).collect::<Vec<_>>(),
+                            counter_rows.iter().map(sur_to_json).collect::<Vec<_>>(),
+                            dup_rejected,
+                            expr_rows.iter().map(sur_to_json).collect::<Vec<_>>(),
                             kv_val.as_ref().map(sur_to_json),
                             kv_after.as_ref().map(sur_to_json),
                         ));

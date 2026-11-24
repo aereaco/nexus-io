@@ -1,3 +1,4 @@
+pub mod codec;
 pub mod engine;
 pub mod live;
 pub mod parser;
@@ -681,5 +682,133 @@ mod tests {
             .query_scoped("ext", "main", "RETURN ml::price([4.0, 5.0]);", vec![])
             .unwrap();
         assert_eq!(pred, vec![Value::Float(24.0)]);
+    }
+
+    #[test]
+    fn option1_binary_codec_atomic_rollback_index_seek_cascade_closures_and_remove() {
+        let db = NexusDb::open_mem();
+
+        // 1. Atomic transaction rollback on UNIQUE violation (zero partial writes!)
+        db.query_scoped(
+            "prod",
+            "main",
+            "DEFINE TABLE acct SCHEMALESS;
+             DEFINE INDEX idx_code ON acct FIELDS code UNIQUE;
+             CREATE acct:1 SET code = 'A1', bal = 100;",
+            vec![],
+        )
+        .unwrap();
+
+        let failed_tx = db.query_scoped(
+            "prod",
+            "main",
+            "BEGIN TRANSACTION;
+             CREATE acct:2 SET code = 'A2', bal = 200;
+             CREATE acct:3 SET code = 'A1', bal = 300;
+             COMMIT TRANSACTION;",
+            vec![],
+        );
+        assert!(failed_tx.is_err(), "Duplicate UNIQUE in tx must fail");
+        let after_rollback = db
+            .query_scoped("prod", "main", "SELECT * FROM acct;", vec![])
+            .unwrap();
+        assert_eq!(after_rollback.len(), 1, "acct:2 must have been rolled back!");
+
+        // 2. EXPLAIN verifies IndexSeek planner on indexed equality
+        let plan = db
+            .query_scoped(
+                "prod",
+                "main",
+                "SELECT * FROM acct WHERE code = 'A1' EXPLAIN;",
+                vec![],
+            )
+            .unwrap();
+        assert_eq!(plan[0].to_json()["operation"], "IndexSeek(acct.idx_code)");
+
+        // 3. Computed VALUE field + SET +=/-= + UNSET + DEFINE PARAM + REMOVE
+        db.query_scoped(
+            "prod",
+            "main",
+            "DEFINE PARAM $tax VALUE 10;
+             DEFINE TABLE order_item SCHEMALESS;
+             DEFINE FIELD total ON order_item VALUE qty * price + $tax;
+             CREATE order_item:1 SET qty = 2, price = 50, temp = 'x', tags = ['a'];",
+            vec![],
+        )
+        .unwrap();
+        let tot = db
+            .query_scoped("prod", "main", "SELECT VALUE total FROM order_item:1;", vec![])
+            .unwrap();
+        assert_eq!(tot, vec![Value::Int(110)]);
+
+        db.query_scoped(
+            "prod",
+            "main",
+            "UPDATE order_item:1 SET qty += 1, tags += 'b';
+             UPDATE order_item:1 UNSET temp;",
+            vec![],
+        )
+        .unwrap();
+        let updated = db
+            .query_scoped("prod", "main", "SELECT * FROM order_item:1;", vec![])
+            .unwrap();
+        assert_eq!(updated[0].to_json()["qty"], 3);
+        assert_eq!(updated[0].to_json()["total"], 160);
+        assert!(updated[0].to_json().get("temp").is_none());
+
+        // 4. REFERENCE ON DELETE CASCADE
+        db.query_scoped(
+            "prod",
+            "main",
+            "DEFINE TABLE author SCHEMALESS;
+             DEFINE TABLE post SCHEMALESS;
+             DEFINE FIELD author ON post TYPE record REFERENCE ON DELETE CASCADE;
+             CREATE author:1 SET name = 'Ada';
+             CREATE post:1 SET title = 'Hello', author = author:1;
+             DELETE author:1;",
+            vec![],
+        )
+        .unwrap();
+        let posts = db
+            .query_scoped("prod", "main", "SELECT * FROM post;", vec![])
+            .unwrap();
+        assert!(posts.is_empty(), "post:1 must cascade-delete when author:1 is deleted");
+
+        // 5. Closures, array indexing/filtering, null-coalesce ??, ranges, casts, inline IF, REMOVE + REBUILD INDEX
+        let expr_res = db
+            .query_scoped(
+                "prod",
+                "main",
+                "RETURN [
+                    array::map([1, 2, 3], |$x| $x * 10),
+                    array::filter([1, 2, 3, 4], |$x| $x > 2),
+                    (1..=4)[2],
+                    NONE ?? 'fallback',
+                    <int>'42',
+                    IF 5 > 2 THEN 'yes' ELSE 'no' END
+                ];",
+                vec![],
+            )
+            .unwrap();
+        let arr = expr_res[0].to_json();
+        assert_eq!(arr[0], serde_json::json!([10, 20, 30]));
+        assert_eq!(arr[1], serde_json::json!([3, 4]));
+        assert_eq!(arr[2], serde_json::json!(3));
+        assert_eq!(arr[3], serde_json::json!("fallback"));
+        assert_eq!(arr[4], serde_json::json!(42));
+        assert_eq!(arr[5], serde_json::json!("yes"));
+
+        db.query_scoped(
+            "prod",
+            "main",
+            "REBUILD INDEX idx_code ON acct;
+             REMOVE TABLE order_item;",
+            vec![],
+        )
+        .unwrap();
+        assert!(db
+            .query_scoped("prod", "main", "SELECT * FROM order_item;", vec![])
+            .unwrap()
+            .is_empty());
     }
 }

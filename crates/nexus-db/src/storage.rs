@@ -26,6 +26,7 @@ pub const PREFIX_FILE_BLOB: u8 = 0x10;
 pub const PREFIX_USER_META: u8 = 0x11;
 pub const PREFIX_ACCESS_META: u8 = 0x12;
 pub const PREFIX_ANALYZER_META: u8 = 0x13;
+pub const PREFIX_PARAM_META: u8 = 0x14;
 
 /// Build a `\x00`-delimited ordered binary key for prefix scans.
 pub fn encode_key(prefix: u8, parts: &[&str]) -> Vec<u8> {

@@ -15,6 +15,8 @@ pub enum Value {
     Bytes(Vec<u8>),
     RecordId { tb: String, id: String },
     DateTime(String),
+    Duration(i64),
+    Decimal(String),
     Array(Vec<Value>),
     Object(BTreeMap<String, Value>),
 }
@@ -26,9 +28,10 @@ impl Value {
             Value::Bool(b) => *b,
             Value::Int(i) => *i != 0,
             Value::Float(f) => *f != 0.0 && !f.is_nan(),
-            Value::String(s) => !s.is_empty(),
+            Value::String(s) | Value::Decimal(s) => !s.is_empty(),
             Value::Bytes(b) => !b.is_empty(),
             Value::RecordId { .. } | Value::DateTime(_) => true,
+            Value::Duration(d) => *d != 0,
             Value::Array(a) => !a.is_empty(),
             Value::Object(o) => !o.is_empty(),
         }
@@ -38,13 +41,15 @@ impl Value {
         match self {
             Value::Int(i) => Some(*i as f64),
             Value::Float(f) => Some(*f),
+            Value::Decimal(d) => d.parse::<f64>().ok(),
+            Value::Duration(s) => Some(*s as f64),
             _ => None,
         }
     }
 
     pub fn as_str(&self) -> Option<&str> {
         match self {
-            Value::String(s) | Value::DateTime(s) => Some(s.as_str()),
+            Value::String(s) | Value::DateTime(s) | Value::Decimal(s) => Some(s.as_str()),
             _ => None,
         }
     }
@@ -56,7 +61,10 @@ impl Value {
             Value::Bool(b) => serde_json::Value::Bool(*b),
             Value::Int(i) => serde_json::json!(*i),
             Value::Float(f) => serde_json::json!(*f),
-            Value::String(s) | Value::DateTime(s) => serde_json::Value::String(s.clone()),
+            Value::String(s) | Value::DateTime(s) | Value::Decimal(s) => {
+                serde_json::Value::String(s.clone())
+            }
+            Value::Duration(s) => serde_json::Value::String(format!("{}s", s)),
             Value::Bytes(b) => serde_json::Value::Array(b.iter().map(|x| serde_json::json!(*x)).collect()),
             Value::RecordId { tb, id } => serde_json::Value::String(format!("{}:{}", tb, id)),
             Value::Array(arr) => serde_json::Value::Array(arr.iter().map(Value::to_json).collect()),
@@ -125,7 +133,8 @@ impl Value {
             Value::Bool(b) => b.to_string(),
             Value::Int(i) => i.to_string(),
             Value::Float(f) => f.to_string(),
-            Value::String(s) | Value::DateTime(s) => s.clone(),
+            Value::String(s) | Value::DateTime(s) | Value::Decimal(s) => s.clone(),
+            Value::Duration(s) => format!("{}s", s),
             Value::RecordId { tb, id } => format!("{}:{}", tb, id),
             _ => self.to_json().to_string(),
         }

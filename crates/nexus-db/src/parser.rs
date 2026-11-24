@@ -43,7 +43,22 @@ pub enum ReturnMode {
     Diff,
 }
 
-/// SurrealQL AST Statements (Full Parity: CRUD, Graph, Schema, Indexes, Events, Functions, Live Queries, Info, Subqueries).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OnDeleteAction {
+    Ignore,
+    Cascade,
+    Reject,
+    Unset,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SetOp {
+    Assign,
+    AddAssign,
+    SubAssign,
+}
+
+/// SurrealQL AST Statements (Complete Parity: CRUD, Graph, Schema, REMOVE, PARAM, REBUILD, Indexes, Events, Functions, Live Queries, Info, Subqueries).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Statement {
     Use {
@@ -60,6 +75,19 @@ pub enum Statement {
     Begin,
     Commit,
     Cancel,
+    DefineParam {
+        name: String,
+        value: Expr,
+    },
+    Remove {
+        kind: String, // TABLE, FIELD, INDEX, EVENT, FUNCTION, USER, ACCESS, ANALYZER, BUCKET, PARAM
+        name: String,
+        table: Option<String>,
+    },
+    RebuildIndex {
+        name: String,
+        table: String,
+    },
     DefineTable {
         name: String,
         if_not_exists: bool,
@@ -111,6 +139,8 @@ pub enum Statement {
         field_type: Option<String>,
         assert_expr: Option<Expr>,
         default_expr: Option<Expr>,
+        value_expr: Option<Expr>,
+        on_delete: OnDeleteAction,
     },
     DefineIndex {
         name: String,
@@ -144,6 +174,8 @@ pub enum Statement {
         start: Option<usize>,
         fetch: Vec<String>,
         version: Option<u64>,
+        explain: bool,
+        timeout_ms: Option<u64>,
     },
     Create {
         target: Target,
@@ -181,6 +213,7 @@ pub enum Statement {
     },
     LiveSelect {
         table: String,
+        diff: bool,
     },
     Kill {
         live_id: Expr,
@@ -204,7 +237,8 @@ pub enum Target {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum MutationData {
     None,
-    Set(Vec<(String, Expr)>),
+    Set(Vec<(String, SetOp, Expr)>),
+    Unset(Vec<String>),
     Content(Expr),
     Merge(Expr),
     Patch(Expr),
@@ -225,6 +259,12 @@ pub enum Expr {
     Array(Vec<Expr>),
     Object(Vec<(String, Expr)>),
     FunctionCall { name: String, args: Vec<Expr> },
+    Closure { params: Vec<String>, body: Box<Expr> },
+    Index { target: Box<Expr>, index: Box<Expr> },
+    ArrayFilter { target: Box<Expr>, pred: Box<Expr> },
+    Range { start: Box<Expr>, end: Box<Expr>, inclusive: bool },
+    Cast { ty: String, expr: Box<Expr> },
+    IfExpr { cond: Box<Expr>, then_expr: Box<Expr>, else_expr: Box<Expr> },
     GraphTraverse {
         hops: Vec<GraphHop>,
         tail_field: Option<String>,
@@ -254,6 +294,7 @@ pub enum BinaryOp {
     Div,
     And,
     Or,
+    NullCoalesce,
     Contains,
     In,
     FtsMatch,
@@ -279,7 +320,12 @@ enum Token {
     DoubleColon,
     Dot,
     DotDot,
+    DotDotEq,
     At,
+    Pipe,
+    QuestionQuestion,
+    PlusEq,
+    MinusEq,
     Star,
     Plus,
     Minus,
@@ -386,9 +432,27 @@ impl<'a> Lexer<'a> {
                     self.chars.next();
                     if self.chars.peek() == Some(&'.') {
                         self.chars.next();
-                        tokens.push(Token::DotDot);
+                        if self.chars.peek() == Some(&'=') {
+                            self.chars.next();
+                            tokens.push(Token::DotDotEq);
+                        } else {
+                            tokens.push(Token::DotDot);
+                        }
                     } else {
                         tokens.push(Token::Dot);
+                    }
+                }
+                '|' => {
+                    self.chars.next();
+                    tokens.push(Token::Pipe);
+                }
+                '?' => {
+                    self.chars.next();
+                    if self.chars.peek() == Some(&'?') || self.chars.peek() == Some(&':') {
+                        self.chars.next();
+                        tokens.push(Token::QuestionQuestion);
+                    } else {
+                        tokens.push(Token::QuestionQuestion);
                     }
                 }
                 '*' => {
@@ -397,11 +461,21 @@ impl<'a> Lexer<'a> {
                 }
                 '+' => {
                     self.chars.next();
-                    tokens.push(Token::Plus);
+                    if self.chars.peek() == Some(&'=') {
+                        self.chars.next();
+                        tokens.push(Token::PlusEq);
+                    } else {
+                        tokens.push(Token::Plus);
+                    }
                 }
                 '-' => {
                     self.chars.next();
-                    tokens.push(Token::Minus);
+                    if self.chars.peek() == Some(&'=') {
+                        self.chars.next();
+                        tokens.push(Token::MinusEq);
+                    } else {
+                        tokens.push(Token::Minus);
+                    }
                 }
                 '/' => {
                     self.chars.next();
@@ -778,16 +852,43 @@ impl Parser {
         if self.eat_kw("DEFINE") {
             return self.parse_define();
         }
+        if self.eat_kw("REMOVE") {
+            let kind = self.expect_ident()?.to_ascii_uppercase();
+            let _ = self.eat_kw("IF");
+            let _ = self.eat_kw("EXISTS");
+            let name = match self.next() {
+                Token::Ident(s) | Token::Param(s) | Token::Str(s) => s,
+                other => return Err(anyhow!("Expected name in REMOVE {}, got {:?}", kind, other)),
+            };
+            let table = if self.eat_kw("ON") {
+                let _ = self.eat_kw("TABLE");
+                Some(self.expect_ident()?)
+            } else {
+                None
+            };
+            return Ok(Statement::Remove { kind, name, table });
+        }
+        if self.eat_kw("REBUILD") {
+            let _ = self.eat_kw("INDEX");
+            let _ = self.eat_kw("IF");
+            let _ = self.eat_kw("EXISTS");
+            let name = self.expect_ident()?;
+            let _ = self.eat_kw("ON");
+            let _ = self.eat_kw("TABLE");
+            let table = self.expect_ident()?;
+            return Ok(Statement::RebuildIndex { name, table });
+        }
         if self.eat_kw("LIVE") {
             if !self.eat_kw("SELECT") {
                 return Err(anyhow!("Expected SELECT after LIVE"));
             }
+            let diff = self.eat_kw("DIFF");
             if matches!(self.peek(), Token::Star) {
                 self.next();
             }
             let _ = self.eat_kw("FROM");
             let table = self.expect_ident()?;
-            return Ok(Statement::LiveSelect { table });
+            return Ok(Statement::LiveSelect { table, diff });
         }
         if self.eat_kw("KILL") {
             let live_id = self.parse_expr()?;
@@ -1108,6 +1209,17 @@ impl Parser {
             });
         }
 
+        if self.eat_kw("PARAM") {
+            let _ = self.eat_if_not_exists();
+            let name = match self.next() {
+                Token::Param(p) | Token::Ident(p) => p,
+                other => return Err(anyhow!("Expected $name in DEFINE PARAM, got {:?}", other)),
+            };
+            let _ = self.eat_kw("VALUE");
+            let value = self.parse_expr()?;
+            return Ok(Statement::DefineParam { name, value });
+        }
+
         if self.eat_kw("FIELD") {
             let if_not_exists = self.eat_if_not_exists();
             let name = self.expect_ident()?;
@@ -1117,6 +1229,8 @@ impl Parser {
             let mut field_type = None;
             let mut assert_expr = None;
             let mut default_expr = None;
+            let mut value_expr = None;
+            let mut on_delete = OnDeleteAction::Ignore;
             loop {
                 if self.eat_kw("TYPE") {
                     let mut ty = self.expect_ident()?;
@@ -1133,6 +1247,21 @@ impl Parser {
                     assert_expr = Some(self.parse_expr()?);
                 } else if self.eat_kw("DEFAULT") {
                     default_expr = Some(self.parse_expr()?);
+                } else if self.eat_kw("VALUE") {
+                    value_expr = Some(self.parse_expr()?);
+                } else if self.eat_kw("REFERENCE") {
+                    if self.eat_kw("ON") {
+                        let _ = self.eat_kw("DELETE");
+                        if self.eat_kw("CASCADE") {
+                            on_delete = OnDeleteAction::Cascade;
+                        } else if self.eat_kw("REJECT") {
+                            on_delete = OnDeleteAction::Reject;
+                        } else if self.eat_kw("UNSET") {
+                            on_delete = OnDeleteAction::Unset;
+                        } else {
+                            let _ = self.eat_kw("IGNORE");
+                        }
+                    }
                 } else {
                     break;
                 }
@@ -1144,6 +1273,8 @@ impl Parser {
                 field_type,
                 assert_expr,
                 default_expr,
+                value_expr,
+                on_delete,
             });
         }
 
@@ -1408,6 +1539,24 @@ impl Parser {
         } else {
             None
         };
+        let timeout_ms = if self.eat_kw("TIMEOUT") {
+            let dur = match self.next() {
+                Token::Str(s) | Token::Ident(s) => s,
+                Token::Int(n) => {
+                    let unit = if matches!(self.peek(), Token::Ident(_)) {
+                        self.expect_ident().unwrap_or_default()
+                    } else {
+                        "ms".to_string()
+                    };
+                    format!("{}{}", n, unit)
+                }
+                _ => "0ms".to_string(),
+            };
+            Some((crate::stdlib::parse_duration_secs(&dur).max(0) as u64) * 1000)
+        } else {
+            None
+        };
+        let explain = self.eat_kw("EXPLAIN");
 
         Ok(Statement::Select {
             value_only,
@@ -1422,6 +1571,8 @@ impl Parser {
             start,
             fetch,
             version,
+            explain,
+            timeout_ms,
         })
     }
 
@@ -1497,11 +1648,14 @@ impl Parser {
             let mut pairs = Vec::new();
             loop {
                 let k = self.expect_ident()?;
-                if !matches!(self.next(), Token::Eq) {
-                    return Err(anyhow!("Expected '=' in SET clause"));
-                }
+                let op = match self.next() {
+                    Token::Eq => SetOp::Assign,
+                    Token::PlusEq => SetOp::AddAssign,
+                    Token::MinusEq => SetOp::SubAssign,
+                    other => return Err(anyhow!("Expected '=', '+=' or '-=' in SET clause, got {:?}", other)),
+                };
                 let v = self.parse_expr()?;
-                pairs.push((k, v));
+                pairs.push((k, op, v));
                 if matches!(self.peek(), Token::Comma) {
                     self.next();
                 } else {
@@ -1509,6 +1663,18 @@ impl Parser {
                 }
             }
             return Ok(MutationData::Set(pairs));
+        }
+        if self.eat_kw("UNSET") {
+            let mut fields = Vec::new();
+            loop {
+                fields.push(self.expect_ident()?);
+                if matches!(self.peek(), Token::Comma) {
+                    self.next();
+                } else {
+                    break;
+                }
+            }
+            return Ok(MutationData::Unset(fields));
         }
         if self.eat_kw("CONTENT") {
             return Ok(MutationData::Content(self.parse_expr()?));
@@ -1523,7 +1689,21 @@ impl Parser {
     }
 
     fn parse_expr(&mut self) -> Result<Expr> {
-        self.parse_or()
+        self.parse_coalesce()
+    }
+
+    fn parse_coalesce(&mut self) -> Result<Expr> {
+        let mut left = self.parse_or()?;
+        while matches!(self.peek(), Token::QuestionQuestion) {
+            self.next();
+            let right = self.parse_or()?;
+            left = Expr::Binary {
+                left: Box::new(left),
+                op: BinaryOp::NullCoalesce,
+                right: Box::new(right),
+            };
+        }
+        Ok(left)
     }
 
     fn parse_or(&mut self) -> Result<Expr> {
@@ -1671,7 +1851,55 @@ impl Parser {
                 expr: Box::new(self.parse_unary()?),
             });
         }
-        self.parse_primary()
+        // Type cast `<int>expr`, `<string>expr`, `<float>expr`, `<bool>expr`
+        if matches!(self.peek(), Token::Lt)
+            && matches!(self.peek_next(), Token::Ident(_))
+        {
+            self.next();
+            let ty = self.expect_ident()?;
+            if matches!(self.peek(), Token::Gt) {
+                self.next();
+                return Ok(Expr::Cast {
+                    ty,
+                    expr: Box::new(self.parse_unary()?),
+                });
+            }
+        }
+        let mut base = self.parse_primary()?;
+        // Postfix array indexing `expr[idx]` / inline filter `expr[WHERE pred]`
+        while matches!(self.peek(), Token::LBracket) {
+            self.next();
+            if self.eat_kw("WHERE") {
+                let pred = self.parse_expr()?;
+                if matches!(self.peek(), Token::RBracket) {
+                    self.next();
+                }
+                base = Expr::ArrayFilter {
+                    target: Box::new(base),
+                    pred: Box::new(pred),
+                };
+            } else {
+                let idx = self.parse_expr()?;
+                if matches!(self.peek(), Token::RBracket) {
+                    self.next();
+                }
+                base = Expr::Index {
+                    target: Box::new(base),
+                    index: Box::new(idx),
+                };
+            }
+        }
+        // Range expression `start..end` / `start..=end`
+        if matches!(self.peek(), Token::DotDot | Token::DotDotEq) {
+            let inclusive = matches!(self.next(), Token::DotDotEq);
+            let end = self.parse_primary()?;
+            base = Expr::Range {
+                start: Box::new(base),
+                end: Box::new(end),
+                inclusive,
+            };
+        }
+        Ok(base)
     }
 
     fn parse_graph_traversal(&mut self) -> Result<Expr> {
@@ -1739,6 +1967,41 @@ impl Parser {
     fn parse_primary(&mut self) -> Result<Expr> {
         if matches!(self.peek(), Token::ArrowRight | Token::ArrowLeft) {
             return self.parse_graph_traversal();
+        }
+        // Closure `|$x, $y| expr`
+        if matches!(self.peek(), Token::Pipe) {
+            self.next();
+            let mut params = Vec::new();
+            while !matches!(self.peek(), Token::Pipe | Token::Eof) {
+                if let Token::Param(p) | Token::Ident(p) = self.next() {
+                    params.push(p);
+                }
+                if matches!(self.peek(), Token::Comma) {
+                    self.next();
+                }
+            }
+            if matches!(self.peek(), Token::Pipe) {
+                self.next();
+            }
+            let body = self.parse_expr()?;
+            return Ok(Expr::Closure {
+                params,
+                body: Box::new(body),
+            });
+        }
+        // Inline IF expression: `IF cond THEN a ELSE b END`
+        if self.eat_kw("IF") {
+            let cond = self.parse_expr()?;
+            let _ = self.eat_kw("THEN");
+            let then_expr = self.parse_expr()?;
+            let _ = self.eat_kw("ELSE");
+            let else_expr = self.parse_expr()?;
+            let _ = self.eat_kw("END");
+            return Ok(Expr::IfExpr {
+                cond: Box::new(cond),
+                then_expr: Box::new(then_expr),
+                else_expr: Box::new(else_expr),
+            });
         }
 
         match self.next() {

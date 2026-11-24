@@ -1,22 +1,26 @@
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
+use crate::codec::{decode_value, encode_value};
 use crate::live::{LiveAction, LiveBroker};
-use crate::parser::{
-    BinaryOp, Expr, GraphDir, GraphHop, IndexKind, MutationData, Projection, ReturnMode, Statement,
-    Target, UnaryOp,
-};
 #[cfg(not(feature = "vector"))]
 use crate::parser::VectorMetric;
-use crate::stdlib::{eval_stdlib, tokenize_fts, value_to_vec};
+use crate::parser::{
+    BinaryOp, Expr, GraphDir, GraphHop, IndexKind, MutationData, OnDeleteAction, Projection,
+    ReturnMode, SetOp, Statement, Target, UnaryOp,
+};
 #[cfg(not(feature = "vector"))]
 use crate::stdlib::{cosine_similarity, euclidean_distance, manhattan_distance};
+use crate::stdlib::{eval_stdlib, tokenize_fts, value_to_vec};
 use crate::storage::{
-    encode_key, BatchOp, StorageBackend, PREFIX_ANALYZER_META, PREFIX_CHANGEFEED, PREFIX_EDGE_IN,
-    PREFIX_EDGE_OUT, PREFIX_EVENT_META, PREFIX_FIELD_META, PREFIX_FTS, PREFIX_FUNCTION_META,
-    PREFIX_INDEX, PREFIX_INDEX_META, PREFIX_RECORD, PREFIX_TABLE_META, PREFIX_VEC, PREFIX_VERSION,
+    encode_key, BatchOp, StorageBackend, PREFIX_ACCESS_META, PREFIX_ANALYZER_META,
+    PREFIX_BUCKET_META, PREFIX_CHANGEFEED, PREFIX_EDGE_IN, PREFIX_EDGE_OUT, PREFIX_EVENT_META,
+    PREFIX_FIELD_META, PREFIX_FTS, PREFIX_FUNCTION_META, PREFIX_INDEX, PREFIX_INDEX_META,
+    PREFIX_PARAM_META, PREFIX_RECORD, PREFIX_TABLE_META, PREFIX_USER_META, PREFIX_VEC,
+    PREFIX_VERSION,
 };
 use crate::value::Value;
 
@@ -40,6 +44,14 @@ struct FieldMeta {
     field_type: Option<String>,
     assert_expr: Option<Expr>,
     default_expr: Option<Expr>,
+    #[serde(default)]
+    value_expr: Option<Expr>,
+    #[serde(default = "default_on_delete")]
+    on_delete: OnDeleteAction,
+}
+
+fn default_on_delete() -> OnDeleteAction {
+    OnDeleteAction::Ignore
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -109,7 +121,9 @@ impl<'a, I: RowIter<'a>> RowIter<'a> for LimitOffsetIter<I> {
     }
 }
 
-/// Execution context for a scoped `(ns, db)` query batch.
+/// Execution context with read-your-own-writes transactional overlay (`tx_overlay`).
+/// When a transaction is active (`BEGIN ... COMMIT`), all writes stage in `tx_overlay`;
+/// any error discards the overlay cleanly with zero partial writes to `redb`/`MemStorage`.
 pub struct ExecContext<'a> {
     pub storage: &'a dyn StorageBackend,
     pub live: &'a LiveBroker,
@@ -119,7 +133,7 @@ pub struct ExecContext<'a> {
     pub db: String,
     pub params: HashMap<String, Value>,
     pub step_budget: usize,
-    tx_buffer: Option<Vec<BatchOp>>,
+    tx_overlay: Option<BTreeMap<Vec<u8>, Option<Vec<u8>>>>,
     in_event: bool,
     last_fts_score: f64,
 }
@@ -141,15 +155,48 @@ impl<'a> ExecContext<'a> {
             db,
             params,
             step_budget: 250_000,
-            tx_buffer: None,
+            tx_overlay: None,
             in_event: false,
             last_fts_score: 0.0,
         }
     }
 
+    /// Read-your-own-writes `get`: checks active `tx_overlay` before falling through to `storage`.
+    fn get_raw(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        if let Some(ref overlay) = self.tx_overlay {
+            if let Some(entry) = overlay.get(key) {
+                return Ok(entry.clone());
+            }
+        }
+        self.storage.get(key)
+    }
+
+    /// Read-your-own-writes prefix scan: merges `tx_overlay` puts & tombstones on top of `storage`.
+    fn scan_prefix_raw(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let base = self.storage.scan_prefix(prefix)?;
+        let Some(ref overlay) = self.tx_overlay else {
+            return Ok(base);
+        };
+        let mut merged: BTreeMap<Vec<u8>, Vec<u8>> = base.into_iter().collect();
+        for (k, v_opt) in overlay.range(prefix.to_vec()..) {
+            if !k.starts_with(prefix) {
+                break;
+            }
+            match v_opt {
+                Some(v) => {
+                    merged.insert(k.clone(), v.clone());
+                }
+                None => {
+                    merged.remove(k);
+                }
+            }
+        }
+        Ok(merged.into_iter().collect())
+    }
+
     fn put_raw(&mut self, key: Vec<u8>, val: Vec<u8>) -> Result<()> {
-        if let Some(buf) = self.tx_buffer.as_mut() {
-            buf.push(BatchOp::Put(key, val));
+        if let Some(overlay) = self.tx_overlay.as_mut() {
+            overlay.insert(key, Some(val));
             Ok(())
         } else {
             self.storage.put(&key, &val)
@@ -157,8 +204,8 @@ impl<'a> ExecContext<'a> {
     }
 
     fn delete_raw(&mut self, key: Vec<u8>) -> Result<()> {
-        if let Some(buf) = self.tx_buffer.as_mut() {
-            buf.push(BatchOp::Delete(key));
+        if let Some(overlay) = self.tx_overlay.as_mut() {
+            overlay.insert(key, None);
             Ok(())
         } else {
             let _ = self.storage.delete(&key)?;
@@ -166,10 +213,33 @@ impl<'a> ExecContext<'a> {
         }
     }
 
+    fn load_persistent_params(&mut self) -> Result<()> {
+        let pfx = encode_key(PREFIX_PARAM_META, &[&self.ns, &self.db]);
+        for (k_bytes, raw) in self.scan_prefix_raw(&pfx)? {
+            let name = extract_last_key_part(&k_bytes);
+            if !self.params.contains_key(&name) {
+                if let Ok(val) = decode_value(&raw) {
+                    self.params.insert(name, val);
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn execute_all(&mut self, stmts: &[Statement]) -> Result<Vec<Value>> {
+        let _ = self.load_persistent_params();
         let mut last = Vec::new();
         for stmt in stmts {
-            last = self.execute_one(stmt)?;
+            match self.execute_one(stmt) {
+                Ok(res) => last = res,
+                Err(e) => {
+                    // Atomic rollback on any error inside an active transaction!
+                    if self.tx_overlay.is_some() {
+                        self.tx_overlay = None;
+                    }
+                    return Err(e);
+                }
+            }
         }
         Ok(last)
     }
@@ -186,31 +256,54 @@ impl<'a> ExecContext<'a> {
         }
     }
 
-    fn scan_target_with_range(
+    fn get_record(&self, tb: &str, id: &str) -> Result<Option<Value>> {
+        let key = encode_key(PREFIX_RECORD, &[&self.ns, &self.db, tb, id]);
+        if let Some(raw) = self.get_raw(&key)? {
+            return Ok(Some(decode_value(&raw)?));
+        }
+        Ok(None)
+    }
+
+    fn scan_target(&self, tb: &str, id: Option<&str>) -> Result<Vec<Value>> {
+        if let Some(rec_id) = id {
+            return Ok(self.get_record(tb, rec_id)?.into_iter().collect());
+        }
+        let prefix = encode_key(PREFIX_RECORD, &[&self.ns, &self.db, tb]);
+        let entries = self.scan_prefix_raw(&prefix)?;
+        let mut rows = Vec::with_capacity(entries.len());
+        for (_, raw) in entries {
+            rows.push(decode_value(&raw)?);
+        }
+        Ok(rows)
+    }
+
+    /// Index-aware Volcano scan planner: chooses `IndexSeek` (`PREFIX_INDEX`), `FtsPostingScan`
+    /// (`PREFIX_FTS`), `RecordRange`, `VersionScan`, `MaterializedView`, or `TableScan`.
+    fn plan_and_scan(
         &self,
         target: &Target,
+        where_clause: Option<&Expr>,
         version: Option<u64>,
-    ) -> Result<Vec<Value>> {
+    ) -> Result<(String, Vec<Value>)> {
         if let Target::RecordRange { tb, start, end } = target {
             let prefix = encode_key(PREFIX_RECORD, &[&self.ns, &self.db, tb]);
-            let entries = self.storage.scan_prefix(&prefix)?;
+            let entries = self.scan_prefix_raw(&prefix)?;
             let mut rows = Vec::new();
             for (k_bytes, raw) in entries {
                 let rec_id = extract_last_key_part(&k_bytes);
                 if rec_id.as_str() >= start.as_str() && rec_id.as_str() <= end.as_str() {
-                    rows.push(serde_json::from_slice(&raw)?);
+                    rows.push(decode_value(&raw)?);
                 }
             }
-            return Ok(rows);
+            return Ok((format!("RecordRangeScan({}:{}..{})", tb, start, end), rows));
         }
 
         let (tb, id_opt) = self.resolve_target(target)?;
 
-        // MVCC historical version lookup (`SELECT ... VERSION <seq>`)
         if let Some(ver) = version {
             let ver_pfx = encode_key(PREFIX_VERSION, &[&self.ns, &self.db, &tb]);
             let mut by_id: BTreeMap<String, Value> = BTreeMap::new();
-            for (k_bytes, raw) in self.storage.scan_prefix(&ver_pfx)? {
+            for (k_bytes, raw) in self.scan_prefix_raw(&ver_pfx)? {
                 let tail = &k_bytes[ver_pfx.len()..];
                 let parts: Vec<String> = tail
                     .split(|&b| b == 0x00)
@@ -226,17 +319,19 @@ impl<'a> ExecContext<'a> {
                     }
                     if let Ok(seq) = parts[1].parse::<u64>() {
                         if seq <= ver {
-                            if let Ok(v) = serde_json::from_slice::<Value>(&raw) {
+                            if let Ok(v) = decode_value(&raw) {
                                 by_id.insert(rec_id.clone(), v);
                             }
                         }
                     }
                 }
             }
-            return Ok(by_id.into_values().collect());
+            return Ok((
+                format!("VersionScan({}@v{})", tb, ver),
+                by_id.into_values().collect(),
+            ));
         }
 
-        // Materialized view (`DEFINE TABLE <view> AS SELECT ...`)
         if id_opt.is_none() {
             if let Some(meta) = self.load_table_meta(&tb)? {
                 if let Some(view_stmt) = meta.as_view {
@@ -247,38 +342,103 @@ impl<'a> ExecContext<'a> {
                         self.db.clone(),
                         self.params.clone(),
                     );
-                    return sub.execute_one(&view_stmt);
+                    return Ok((format!("MaterializedView({})", tb), sub.execute_one(&view_stmt)?));
+                }
+            }
+
+            // IndexSeek optimization for `WHERE <col> = <literal/$param>`
+            if let Some(Expr::Binary {
+                left,
+                op: BinaryOp::Eq,
+                right,
+            }) = where_clause
+            {
+                if let Expr::Ident(col) = left.as_ref() {
+                    let indexes = self.load_indexes(&tb)?;
+                    for idx in indexes {
+                        if matches!(idx.kind, IndexKind::Standard | IndexKind::Unique)
+                            && idx.columns.len() == 1
+                            && &idx.columns[0] == col
+                        {
+                            if let Ok(val) = self.eval_expr(right, None, 0) {
+                                let key_val = val.display_compact();
+                                let scan_pfx = encode_key(
+                                    PREFIX_INDEX,
+                                    &[&self.ns, &self.db, &tb, &idx.name, &key_val],
+                                );
+                                let hits = self.scan_prefix_raw(&scan_pfx)?;
+                                let mut rows = Vec::with_capacity(hits.len());
+                                for (k_bytes, _) in hits {
+                                    let rec_id = extract_last_key_part(&k_bytes);
+                                    if let Some(rec) = self.get_record(&tb, &rec_id)? {
+                                        rows.push(rec);
+                                    }
+                                }
+                                return Ok((format!("IndexSeek({}.{})", tb, idx.name), rows));
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Persisted FTS posting intersection optimization for `WHERE <col> @@ <query>`
+            if let Some(Expr::Binary {
+                left,
+                op: BinaryOp::FtsMatch,
+                right,
+            }) = where_clause
+            {
+                if let Expr::Ident(col) = left.as_ref() {
+                    let indexes = self.load_indexes(&tb)?;
+                    for idx in indexes {
+                        if idx.kind == IndexKind::FtsBm25 && idx.columns.contains(col) {
+                            if let Ok(q_val) = self.eval_expr(right, None, 0) {
+                                let terms = tokenize_fts(&q_val.display_compact());
+                                if !terms.is_empty() {
+                                    let mut doc_ids: Option<HashSet<String>> = None;
+                                    for term in &terms {
+                                        let pfx = encode_key(
+                                            PREFIX_FTS,
+                                            &[&self.ns, &self.db, &tb, &idx.name, term],
+                                        );
+                                        let hits: HashSet<String> = self
+                                            .scan_prefix_raw(&pfx)?
+                                            .into_iter()
+                                            .map(|(k, _)| extract_last_key_part(&k))
+                                            .collect();
+                                        doc_ids = Some(match doc_ids {
+                                            Some(prev) => prev.intersection(&hits).cloned().collect(),
+                                            None => hits,
+                                        });
+                                    }
+                                    let mut rows = Vec::new();
+                                    for rid in doc_ids.unwrap_or_default() {
+                                        if let Some(rec) = self.get_record(&tb, &rid)? {
+                                            rows.push(rec);
+                                        }
+                                    }
+                                    return Ok((
+                                        format!("FtsPostingScan({}.{})", tb, idx.name),
+                                        rows,
+                                    ));
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
 
-        self.scan_target(&tb, id_opt.as_deref())
-    }
-
-    fn get_record(&self, tb: &str, id: &str) -> Result<Option<Value>> {
-        let key = encode_key(PREFIX_RECORD, &[&self.ns, &self.db, tb, id]);
-        if let Some(raw) = self.storage.get(&key)? {
-            return Ok(Some(serde_json::from_slice(&raw)?));
-        }
-        Ok(None)
-    }
-
-    fn scan_target(&self, tb: &str, id: Option<&str>) -> Result<Vec<Value>> {
-        if let Some(rec_id) = id {
-            return Ok(self.get_record(tb, rec_id)?.into_iter().collect());
-        }
-        let prefix = encode_key(PREFIX_RECORD, &[&self.ns, &self.db, tb]);
-        let entries = self.storage.scan_prefix(&prefix)?;
-        let mut rows = Vec::with_capacity(entries.len());
-        for (_, raw) in entries {
-            rows.push(serde_json::from_slice(&raw)?);
-        }
-        Ok(rows)
+        let op_name = match &id_opt {
+            Some(rid) => format!("RecordGet({}:{})", tb, rid),
+            None => format!("TableScan({})", tb),
+        };
+        Ok((op_name, self.scan_target(&tb, id_opt.as_deref())?))
     }
 
     fn load_table_meta(&self, tb: &str) -> Result<Option<TableMeta>> {
         let key = encode_key(PREFIX_TABLE_META, &[&self.ns, &self.db, tb]);
-        if let Some(raw) = self.storage.get(&key)? {
+        if let Some(raw) = self.get_raw(&key)? {
             return Ok(Some(serde_json::from_slice(&raw)?));
         }
         Ok(None)
@@ -287,7 +447,7 @@ impl<'a> ExecContext<'a> {
     fn load_fields(&self, tb: &str) -> Result<Vec<FieldMeta>> {
         let pfx = encode_key(PREFIX_FIELD_META, &[&self.ns, &self.db, tb]);
         let mut out = Vec::new();
-        for (_, raw) in self.storage.scan_prefix(&pfx)? {
+        for (_, raw) in self.scan_prefix_raw(&pfx)? {
             out.push(serde_json::from_slice(&raw)?);
         }
         Ok(out)
@@ -296,7 +456,7 @@ impl<'a> ExecContext<'a> {
     fn load_indexes(&self, tb: &str) -> Result<Vec<IndexMeta>> {
         let pfx = encode_key(PREFIX_INDEX_META, &[&self.ns, &self.db, tb]);
         let mut out = Vec::new();
-        for (_, raw) in self.storage.scan_prefix(&pfx)? {
+        for (_, raw) in self.scan_prefix_raw(&pfx)? {
             out.push(serde_json::from_slice(&raw)?);
         }
         Ok(out)
@@ -305,7 +465,7 @@ impl<'a> ExecContext<'a> {
     fn load_events(&self, tb: &str) -> Result<Vec<EventMeta>> {
         let pfx = encode_key(PREFIX_EVENT_META, &[&self.ns, &self.db, tb]);
         let mut out = Vec::new();
-        for (_, raw) in self.storage.scan_prefix(&pfx)? {
+        for (_, raw) in self.scan_prefix_raw(&pfx)? {
             out.push(serde_json::from_slice(&raw)?);
         }
         Ok(out)
@@ -313,13 +473,34 @@ impl<'a> ExecContext<'a> {
 
     fn load_function(&self, name: &str) -> Result<Option<FunctionMeta>> {
         let key = encode_key(PREFIX_FUNCTION_META, &[&self.ns, &self.db, name]);
-        if let Some(raw) = self.storage.get(&key)? {
+        if let Some(raw) = self.get_raw(&key)? {
             return Ok(Some(serde_json::from_slice(&raw)?));
         }
         Ok(None)
     }
 
-    fn apply_defaults_and_validate(&self, tb: &str, obj: &mut BTreeMap<String, Value>) -> Result<()> {
+    fn check_mutation_permission(&self, tb: &str, row: &Value) -> Result<()> {
+        if !self.params.contains_key("auth") {
+            return Ok(());
+        }
+        if let Some(meta) = self.load_table_meta(tb)? {
+            if let Some(ref perm_expr) = meta.permissions_where {
+                if !self.eval_expr(perm_expr, Some(row), 0)?.is_truthy() {
+                    return Err(anyhow!(
+                        "Permission denied on table '{}' for current $auth",
+                        tb
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_defaults_computed_and_validate(
+        &self,
+        tb: &str,
+        obj: &mut BTreeMap<String, Value>,
+    ) -> Result<()> {
         let fields = self.load_fields(tb)?;
 
         // 1. Apply DEFAULT expressions for missing fields
@@ -332,7 +513,16 @@ impl<'a> ExecContext<'a> {
             }
         }
 
-        // 2. SCHEMAFULL check
+        // 2. Compute `VALUE <expr>` derived fields
+        let row_snapshot = Value::Object(obj.clone());
+        for f in &fields {
+            if let Some(ref val_expr) = f.value_expr {
+                let computed = self.eval_expr(val_expr, Some(&row_snapshot), 0)?;
+                obj.insert(f.name.clone(), computed);
+            }
+        }
+
+        // 3. SCHEMAFULL check
         if let Some(meta) = self.load_table_meta(tb)? {
             if meta.schemafull {
                 let allowed: Vec<&str> = fields.iter().map(|f| f.name.as_str()).collect();
@@ -348,7 +538,7 @@ impl<'a> ExecContext<'a> {
             }
         }
 
-        // 3. TYPE and ASSERT checks (binding `$value`)
+        // 4. TYPE and ASSERT checks (binding `$value`)
         for f in &fields {
             if let Some(val) = obj.get(&f.name) {
                 if let Some(ref expected_ty) = f.field_type {
@@ -448,70 +638,80 @@ impl<'a> ExecContext<'a> {
             if let Some(old) = old_row {
                 self.remove_index_entries(tb, rec_id, &idx, old)?;
             }
+            self.write_index_entries(tb, rec_id, &idx, new_row)?;
+        }
+        Ok(())
+    }
 
-            match idx.kind {
-                IndexKind::Unique | IndexKind::Standard => {
-                    let key_val: String = idx
-                        .columns
-                        .iter()
-                        .map(|c| {
-                            new_row
-                                .get(c)
-                                .map(|v| v.display_compact())
-                                .unwrap_or_default()
-                        })
-                        .collect::<Vec<_>>()
-                        .join("|");
-                    if idx.kind == IndexKind::Unique {
-                        let scan_pfx =
-                            encode_key(PREFIX_INDEX, &[&self.ns, &self.db, tb, &idx.name, &key_val]);
-                        let existing = self.storage.scan_prefix(&scan_pfx)?;
-                        for (k_bytes, _) in existing {
-                            let existing_id = extract_last_key_part(&k_bytes);
-                            if existing_id != rec_id {
-                                return Err(anyhow!(
-                                    "UNIQUE index '{}' violation on table '{}' for value '{}'",
-                                    idx.name,
-                                    tb,
-                                    key_val
-                                ));
-                            }
-                        }
-                    }
-                    let ikey = encode_key(
-                        PREFIX_INDEX,
-                        &[&self.ns, &self.db, tb, &idx.name, &key_val, rec_id],
-                    );
-                    self.put_raw(ikey, vec![1])?;
-                }
-                IndexKind::FtsBm25 => {
-                    for col in &idx.columns {
-                        if let Some(text) = new_row.get(col).and_then(|v| v.as_str()) {
-                            for term in tokenize_fts(text) {
-                                let fkey = encode_key(
-                                    PREFIX_FTS,
-                                    &[&self.ns, &self.db, tb, &idx.name, &term, rec_id],
-                                );
-                                self.put_raw(fkey, vec![1])?;
-                            }
+    fn write_index_entries(
+        &mut self,
+        tb: &str,
+        rec_id: &str,
+        idx: &IndexMeta,
+        new_row: &BTreeMap<String, Value>,
+    ) -> Result<()> {
+        match idx.kind {
+            IndexKind::Unique | IndexKind::Standard => {
+                let key_val: String = idx
+                    .columns
+                    .iter()
+                    .map(|c| {
+                        new_row
+                            .get(c)
+                            .map(|v| v.display_compact())
+                            .unwrap_or_default()
+                    })
+                    .collect::<Vec<_>>()
+                    .join("|");
+                if idx.kind == IndexKind::Unique {
+                    let scan_pfx =
+                        encode_key(PREFIX_INDEX, &[&self.ns, &self.db, tb, &idx.name, &key_val]);
+                    let existing = self.scan_prefix_raw(&scan_pfx)?;
+                    for (k_bytes, _) in existing {
+                        let existing_id = extract_last_key_part(&k_bytes);
+                        if existing_id != rec_id {
+                            return Err(anyhow!(
+                                "UNIQUE index '{}' violation on table '{}' for value '{}'",
+                                idx.name,
+                                tb,
+                                key_val
+                            ));
                         }
                     }
                 }
-                IndexKind::VectorHnsw { dim, .. } => {
-                    if let Some(col) = idx.columns.first() {
-                        if let Some(vec_val) = new_row.get(col).and_then(value_to_vec) {
-                            if vec_val.len() != dim {
-                                return Err(anyhow!(
-                                    "Vector index '{}' expects dimension {}, got {}",
-                                    idx.name,
-                                    dim,
-                                    vec_val.len()
-                                ));
-                            }
-                            let vkey =
-                                encode_key(PREFIX_VEC, &[&self.ns, &self.db, tb, &idx.name, rec_id]);
-                            self.put_raw(vkey, serde_json::to_vec(&vec_val)?)?;
+                let ikey = encode_key(
+                    PREFIX_INDEX,
+                    &[&self.ns, &self.db, tb, &idx.name, &key_val, rec_id],
+                );
+                self.put_raw(ikey, vec![1])?;
+            }
+            IndexKind::FtsBm25 => {
+                for col in &idx.columns {
+                    if let Some(text) = new_row.get(col).and_then(|v| v.as_str()) {
+                        for term in tokenize_fts(text) {
+                            let fkey = encode_key(
+                                PREFIX_FTS,
+                                &[&self.ns, &self.db, tb, &idx.name, &term, rec_id],
+                            );
+                            self.put_raw(fkey, vec![1])?;
                         }
+                    }
+                }
+            }
+            IndexKind::VectorHnsw { dim, .. } => {
+                if let Some(col) = idx.columns.first() {
+                    if let Some(vec_val) = new_row.get(col).and_then(value_to_vec) {
+                        if vec_val.len() != dim {
+                            return Err(anyhow!(
+                                "Vector index '{}' expects dimension {}, got {}",
+                                idx.name,
+                                dim,
+                                vec_val.len()
+                            ));
+                        }
+                        let vkey =
+                            encode_key(PREFIX_VEC, &[&self.ns, &self.db, tb, &idx.name, rec_id]);
+                        self.put_raw(vkey, serde_json::to_vec(&vec_val)?)?;
                     }
                 }
             }
@@ -561,6 +761,74 @@ impl<'a> ExecContext<'a> {
         Ok(())
     }
 
+    fn enforce_references_on_delete(&mut self, deleted_tb: &str, deleted_id: &str) -> Result<()> {
+        let deleted_rid = Value::RecordId {
+            tb: deleted_tb.to_string(),
+            id: deleted_id.to_string(),
+        };
+        // Scan all defined fields across all tables in `(ns, db)` for `REFERENCE ON DELETE ...`
+        let f_pfx = encode_key(PREFIX_FIELD_META, &[&self.ns, &self.db]);
+        let all_fields = self.scan_prefix_raw(&f_pfx)?;
+        for (k_bytes, raw) in all_fields {
+            let Ok(fmeta) = serde_json::from_slice::<FieldMeta>(&raw) else {
+                continue;
+            };
+            if fmeta.on_delete == OnDeleteAction::Ignore {
+                continue;
+            }
+            // Key layout: 0x09 | ns | db | table | field_name
+            let tail = &k_bytes[f_pfx.len()..];
+            let parts: Vec<String> = tail
+                .split(|&b| b == 0x00)
+                .filter(|p| !p.is_empty())
+                .map(|p| String::from_utf8_lossy(p).to_string())
+                .collect();
+            let Some(ref_tb) = parts.first() else {
+                continue;
+            };
+            let rows = self.scan_target(ref_tb, None)?;
+            for row in rows {
+                if let Value::Object(mut map) = row {
+                    if map.get(&fmeta.name) == Some(&deleted_rid) {
+                        let child_id = match map.get("id") {
+                            Some(Value::RecordId { id, .. }) => id.clone(),
+                            _ => continue,
+                        };
+                        match fmeta.on_delete {
+                            OnDeleteAction::Reject => {
+                                return Err(anyhow!(
+                                    "Cannot delete {}:{}: referenced by {}:{}",
+                                    deleted_tb,
+                                    deleted_id,
+                                    ref_tb,
+                                    child_id
+                                ));
+                            }
+                            OnDeleteAction::Cascade => {
+                                let k = encode_key(
+                                    PREFIX_RECORD,
+                                    &[&self.ns, &self.db, ref_tb, &child_id],
+                                );
+                                self.delete_raw(k)?;
+                            }
+                            OnDeleteAction::Unset => {
+                                map.remove(&fmeta.name);
+                                let _ = self.save_record(
+                                    ref_tb,
+                                    &child_id,
+                                    map,
+                                    LiveAction::Update,
+                                )?;
+                            }
+                            OnDeleteAction::Ignore => {}
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn save_record(
         &mut self,
         tb: &str,
@@ -580,17 +848,19 @@ impl<'a> ExecContext<'a> {
                 id: id.to_string(),
             },
         );
-        self.apply_defaults_and_validate(tb, &mut obj)?;
+        self.apply_defaults_computed_and_validate(tb, &mut obj)?;
+        let candidate = Value::Object(obj.clone());
+        self.check_mutation_permission(tb, &candidate)?;
         self.maintain_indexes_on_write(tb, id, old_map.as_ref(), &obj)?;
 
         let val = Value::Object(obj);
         let key = encode_key(PREFIX_RECORD, &[&self.ns, &self.db, tb, id]);
-        let bytes = serde_json::to_vec(&val)?;
+        let bytes = encode_value(&val);
         self.put_raw(key, bytes.clone())?;
 
         // Append MVCC version entry (for `SELECT ... VERSION <seq>`)
         let ver_pfx = encode_key(PREFIX_VERSION, &[&self.ns, &self.db, tb, id]);
-        let next_seq = (self.storage.scan_prefix(&ver_pfx)?.len() as u64) + 1;
+        let next_seq = (self.scan_prefix_raw(&ver_pfx)?.len() as u64) + 1;
         let ver_key = encode_key(
             PREFIX_VERSION,
             &[&self.ns, &self.db, tb, id, &format!("{:020}", next_seq)],
@@ -601,7 +871,7 @@ impl<'a> ExecContext<'a> {
         if let Some(meta) = self.load_table_meta(tb)? {
             if meta.changefeed.is_some() {
                 let cf_pfx = encode_key(PREFIX_CHANGEFEED, &[&self.ns, &self.db, tb]);
-                let cf_seq = (self.storage.scan_prefix(&cf_pfx)?.len() as u64) + 1;
+                let cf_seq = (self.scan_prefix_raw(&cf_pfx)?.len() as u64) + 1;
                 let cf_key = encode_key(
                     PREFIX_CHANGEFEED,
                     &[&self.ns, &self.db, tb, &format!("{:020}", cf_seq)],
@@ -634,10 +904,52 @@ impl<'a> ExecContext<'a> {
     ) -> Result<BTreeMap<String, Value>> {
         match data {
             MutationData::None => Ok(base),
+            MutationData::Unset(fields) => {
+                for f in fields {
+                    base.remove(f);
+                }
+                Ok(base)
+            }
             MutationData::Set(pairs) => {
-                for (k, expr) in pairs {
+                for (k, op, expr) in pairs {
                     let v = self.eval_expr(expr, current_row, 0)?;
-                    base.insert(k.clone(), v);
+                    match op {
+                        SetOp::Assign => {
+                            base.insert(k.clone(), v);
+                        }
+                        SetOp::AddAssign => {
+                            let next = match (base.get(k), v) {
+                                (Some(Value::Int(a)), Value::Int(b)) => Value::Int(a + b),
+                                (Some(Value::Array(arr)), item) => {
+                                    let mut a = arr.clone();
+                                    a.push(item);
+                                    Value::Array(a)
+                                }
+                                (Some(a), b) => match (a.as_f64(), b.as_f64()) {
+                                    (Some(x), Some(y)) => Value::Float(x + y),
+                                    _ => b,
+                                },
+                                (None, b) => b,
+                            };
+                            base.insert(k.clone(), next);
+                        }
+                        SetOp::SubAssign => {
+                            let next = match (base.get(k), v) {
+                                (Some(Value::Int(a)), Value::Int(b)) => Value::Int(a - b),
+                                (Some(Value::Array(arr)), item) => {
+                                    let a: Vec<Value> =
+                                        arr.iter().filter(|x| *x != &item).cloned().collect();
+                                    Value::Array(a)
+                                }
+                                (Some(a), b) => match (a.as_f64(), b.as_f64()) {
+                                    (Some(x), Some(y)) => Value::Float(x - y),
+                                    _ => b,
+                                },
+                                (None, b) => b,
+                            };
+                            base.insert(k.clone(), next);
+                        }
+                    }
                 }
                 Ok(base)
             }
@@ -712,7 +1024,9 @@ impl<'a> ExecContext<'a> {
                             let mut op = BTreeMap::new();
                             op.insert(
                                 "op".into(),
-                                Value::String(if b.contains_key(k) { "replace" } else { "add" }.into()),
+                                Value::String(
+                                    if b.contains_key(k) { "replace" } else { "add" }.into(),
+                                ),
                             );
                             op.insert("path".into(), Value::String(format!("/{}", k)));
                             op.insert("value".into(), v.clone());
@@ -749,11 +1063,100 @@ impl<'a> ExecContext<'a> {
                 self.params.insert(name.clone(), val);
                 Ok(Vec::new())
             }
+            Statement::DefineParam { name, value } => {
+                let val = self.eval_expr(value, None, 0)?;
+                let key = encode_key(PREFIX_PARAM_META, &[&self.ns, &self.db, name]);
+                self.put_raw(key, encode_value(&val))?;
+                self.params.insert(name.clone(), val);
+                Ok(Vec::new())
+            }
+            Statement::Remove { kind, name, table } => {
+                match kind.as_str() {
+                    "TABLE" => {
+                        let mkey = encode_key(PREFIX_TABLE_META, &[&self.ns, &self.db, name]);
+                        self.delete_raw(mkey)?;
+                        let rpfx = encode_key(PREFIX_RECORD, &[&self.ns, &self.db, name]);
+                        for (k, _) in self.scan_prefix_raw(&rpfx)? {
+                            self.delete_raw(k)?;
+                        }
+                    }
+                    "FIELD" => {
+                        let tb = table.as_deref().unwrap_or("");
+                        let k = encode_key(PREFIX_FIELD_META, &[&self.ns, &self.db, tb, name]);
+                        self.delete_raw(k)?;
+                    }
+                    "INDEX" => {
+                        let tb = table.as_deref().unwrap_or("");
+                        let k = encode_key(PREFIX_INDEX_META, &[&self.ns, &self.db, tb, name]);
+                        self.delete_raw(k)?;
+                        for pfx_byte in [PREFIX_INDEX, PREFIX_FTS, PREFIX_VEC] {
+                            let ipfx = encode_key(pfx_byte, &[&self.ns, &self.db, tb, name]);
+                            for (ek, _) in self.scan_prefix_raw(&ipfx)? {
+                                self.delete_raw(ek)?;
+                            }
+                        }
+                    }
+                    "EVENT" => {
+                        let tb = table.as_deref().unwrap_or("");
+                        let k = encode_key(PREFIX_EVENT_META, &[&self.ns, &self.db, tb, name]);
+                        self.delete_raw(k)?;
+                    }
+                    "FUNCTION" => {
+                        let k = encode_key(PREFIX_FUNCTION_META, &[&self.ns, &self.db, name]);
+                        self.delete_raw(k)?;
+                    }
+                    "USER" => {
+                        let k = encode_key(PREFIX_USER_META, &[&self.ns, &self.db, name]);
+                        self.delete_raw(k)?;
+                    }
+                    "ACCESS" => {
+                        let k = encode_key(PREFIX_ACCESS_META, &[&self.ns, &self.db, name]);
+                        self.delete_raw(k)?;
+                    }
+                    "ANALYZER" => {
+                        let k = encode_key(PREFIX_ANALYZER_META, &[&self.ns, &self.db, name]);
+                        self.delete_raw(k)?;
+                    }
+                    "BUCKET" => {
+                        let k = encode_key(PREFIX_BUCKET_META, &[&self.ns, &self.db, name]);
+                        self.delete_raw(k)?;
+                    }
+                    "PARAM" => {
+                        let k = encode_key(PREFIX_PARAM_META, &[&self.ns, &self.db, name]);
+                        self.delete_raw(k)?;
+                        self.params.remove(name);
+                    }
+                    other => return Err(anyhow!("Unsupported REMOVE kind '{}'", other)),
+                }
+                Ok(Vec::new())
+            }
+            Statement::RebuildIndex { name, table } => {
+                let ikey = encode_key(PREFIX_INDEX_META, &[&self.ns, &self.db, table, name]);
+                let raw = self
+                    .get_raw(&ikey)?
+                    .ok_or_else(|| anyhow!("Index '{}' not found on table '{}'", name, table))?;
+                let idx: IndexMeta = serde_json::from_slice(&raw)?;
+                for pfx_byte in [PREFIX_INDEX, PREFIX_FTS, PREFIX_VEC] {
+                    let ipfx = encode_key(pfx_byte, &[&self.ns, &self.db, table, name]);
+                    for (ek, _) in self.scan_prefix_raw(&ipfx)? {
+                        self.delete_raw(ek)?;
+                    }
+                }
+                let rows = self.scan_target(table, None)?;
+                for row in rows {
+                    if let Value::Object(map) = row {
+                        if let Some(Value::RecordId { id, .. }) = map.get("id") {
+                            self.write_index_entries(table, id, &idx, &map)?;
+                        }
+                    }
+                }
+                Ok(Vec::new())
+            }
             Statement::Return(expr) => Ok(vec![self.eval_expr(expr, None, 0)?]),
             Statement::InfoForDb => {
                 let tb_pfx = encode_key(PREFIX_TABLE_META, &[&self.ns, &self.db]);
                 let mut tables = BTreeMap::new();
-                for (_, raw) in self.storage.scan_prefix(&tb_pfx)? {
+                for (_, raw) in self.scan_prefix_raw(&tb_pfx)? {
                     if let Ok(m) = serde_json::from_slice::<TableMeta>(&raw) {
                         tables.insert(
                             m.name.clone(),
@@ -767,9 +1170,12 @@ impl<'a> ExecContext<'a> {
                 }
                 let fn_pfx = encode_key(PREFIX_FUNCTION_META, &[&self.ns, &self.db]);
                 let mut functions = BTreeMap::new();
-                for (_, raw) in self.storage.scan_prefix(&fn_pfx)? {
+                for (_, raw) in self.scan_prefix_raw(&fn_pfx)? {
                     if let Ok(f) = serde_json::from_slice::<FunctionMeta>(&raw) {
-                        functions.insert(f.name.clone(), Value::String(format!("DEFINE FUNCTION {}", f.name)));
+                        functions.insert(
+                            f.name.clone(),
+                            Value::String(format!("DEFINE FUNCTION {}", f.name)),
+                        );
                     }
                 }
                 let mut info = BTreeMap::new();
@@ -800,17 +1206,24 @@ impl<'a> ExecContext<'a> {
                 Ok(vec![Value::Object(info)])
             }
             Statement::Begin => {
-                self.tx_buffer = Some(Vec::new());
+                self.tx_overlay = Some(BTreeMap::new());
                 Ok(Vec::new())
             }
             Statement::Commit => {
-                if let Some(ops) = self.tx_buffer.take() {
+                if let Some(overlay) = self.tx_overlay.take() {
+                    let ops: Vec<BatchOp> = overlay
+                        .into_iter()
+                        .map(|(k, v_opt)| match v_opt {
+                            Some(v) => BatchOp::Put(k, v),
+                            None => BatchOp::Delete(k),
+                        })
+                        .collect();
                     self.storage.apply_batch(ops)?;
                 }
                 Ok(Vec::new())
             }
             Statement::Cancel => {
-                self.tx_buffer = None;
+                self.tx_overlay = None;
                 Ok(Vec::new())
             }
             Statement::DefineTable {
@@ -909,7 +1322,7 @@ impl<'a> ExecContext<'a> {
             } => {
                 let cf_pfx = encode_key(PREFIX_CHANGEFEED, &[&self.ns, &self.db, table]);
                 let mut out = Vec::new();
-                for (_, raw) in self.storage.scan_prefix(&cf_pfx)? {
+                for (_, raw) in self.scan_prefix_raw(&cf_pfx)? {
                     if let Ok(jv) = serde_json::from_slice::<serde_json::Value>(&raw) {
                         let seq = jv.get("seq").and_then(|v| v.as_u64()).unwrap_or(0);
                         if let Some(min_seq) = since {
@@ -957,7 +1370,7 @@ impl<'a> ExecContext<'a> {
             Statement::Sleep(dur) => {
                 let secs = crate::stdlib::parse_duration_secs(dur).clamp(0, 5) as u64;
                 if secs > 0 {
-                    std::thread::sleep(std::time::Duration::from_secs(secs));
+                    std::thread::sleep(Duration::from_secs(secs));
                 }
                 Ok(Vec::new())
             }
@@ -967,6 +1380,8 @@ impl<'a> ExecContext<'a> {
                 field_type,
                 assert_expr,
                 default_expr,
+                value_expr,
+                on_delete,
                 ..
             } => {
                 let key = encode_key(PREFIX_FIELD_META, &[&self.ns, &self.db, table, name]);
@@ -975,6 +1390,8 @@ impl<'a> ExecContext<'a> {
                     field_type: field_type.clone(),
                     assert_expr: assert_expr.clone(),
                     default_expr: default_expr.clone(),
+                    value_expr: value_expr.clone(),
+                    on_delete: *on_delete,
                 };
                 self.put_raw(key, serde_json::to_vec(&meta)?)?;
                 Ok(Vec::new())
@@ -1021,7 +1438,7 @@ impl<'a> ExecContext<'a> {
                 self.put_raw(key, serde_json::to_vec(&meta)?)?;
                 Ok(Vec::new())
             }
-            Statement::LiveSelect { table } => {
+            Statement::LiveSelect { table, .. } => {
                 let (live_id, _rx) = self.live.subscribe(&self.ns, &self.db, table);
                 Ok(vec![Value::String(live_id)])
             }
@@ -1079,7 +1496,7 @@ impl<'a> ExecContext<'a> {
                 let (tb, id_opt) = self.resolve_target(target)?;
                 let id = id_opt.unwrap_or_else(|| Uuid::new_v4().simple().to_string());
                 let key = encode_key(PREFIX_RECORD, &[&self.ns, &self.db, &tb, &id]);
-                if self.storage.get(&key)?.is_some() {
+                if self.get_raw(&key)?.is_some() {
                     return Err(anyhow!("Record {}:{} already exists", tb, id));
                 }
                 let obj = self.apply_mutation_data(BTreeMap::new(), data, None)?;
@@ -1221,8 +1638,10 @@ impl<'a> ExecContext<'a> {
                             continue;
                         }
                     }
+                    self.check_mutation_permission(&tb, &row)?;
                     if let Value::Object(map) = &row {
                         if let Some(Value::RecordId { id, .. }) = map.get("id") {
+                            self.enforce_references_on_delete(&tb, id)?;
                             for idx in &indexes {
                                 self.remove_index_entries(&tb, id, idx, map)?;
                             }
@@ -1252,9 +1671,20 @@ impl<'a> ExecContext<'a> {
                 start,
                 fetch,
                 version,
+                explain,
+                timeout_ms,
             } => {
+                let started_at = Instant::now();
                 let (tb, _) = self.resolve_target(target)?;
-                let mut raw_rows = self.scan_target_with_range(target, *version)?;
+                let (plan_op, mut raw_rows) =
+                    self.plan_and_scan(target, where_clause.as_ref(), *version)?;
+
+                if *explain {
+                    let mut plan = BTreeMap::new();
+                    plan.insert("operation".into(), Value::String(plan_op));
+                    plan.insert("rows_scanned".into(), Value::Int(raw_rows.len() as i64));
+                    return Ok(vec![Value::Object(plan)]);
+                }
 
                 // Enforce row-level PERMISSIONS WHERE if defined on table and $auth is set
                 if let Some(meta) = self.load_table_meta(&tb)? {
@@ -1271,7 +1701,7 @@ impl<'a> ExecContext<'a> {
                     }
                 }
 
-                // 1. WHERE filter (with HNSW Vector KNN and BM25 FTS scoring support)
+                // WHERE filter (with HNSW Vector KNN, BM25 FTS scoring, and TIMEOUT check)
                 let mut filtered: Vec<Value> = if let Some(Expr::Binary {
                     left,
                     op: BinaryOp::VecKnn { k, metric },
@@ -1309,15 +1739,23 @@ impl<'a> ExecContext<'a> {
                             if let Ok(v) = self.eval_expr(left, Some(&row), 0) {
                                 if let Some(rv) = value_to_vec(&v) {
                                     let dist = match metric {
-                                        VectorMetric::Cosine => 1.0 - cosine_similarity(&rv, &query_vec),
-                                        VectorMetric::Euclidean => euclidean_distance(&rv, &query_vec),
-                                        VectorMetric::Manhattan => manhattan_distance(&rv, &query_vec),
+                                        VectorMetric::Cosine => {
+                                            1.0 - cosine_similarity(&rv, &query_vec)
+                                        }
+                                        VectorMetric::Euclidean => {
+                                            euclidean_distance(&rv, &query_vec)
+                                        }
+                                        VectorMetric::Manhattan => {
+                                            manhattan_distance(&rv, &query_vec)
+                                        }
                                     };
                                     scored.push((dist, row));
                                 }
                             }
                         }
-                        scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+                        scored.sort_by(|a, b| {
+                            a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)
+                        });
                         scored.into_iter().take(*k).map(|(_, r)| r).collect()
                     }
                 } else if let Some(Expr::Binary {
@@ -1347,7 +1785,9 @@ impl<'a> ExecContext<'a> {
                                 scored.push((sc, row));
                             }
                         }
-                        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+                        scored.sort_by(|a, b| {
+                            b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)
+                        });
                         if let Some((top_sc, _)) = scored.first() {
                             self.last_fts_score = *top_sc;
                         }
@@ -1357,7 +1797,10 @@ impl<'a> ExecContext<'a> {
                     {
                         let mut acc = Vec::new();
                         for row in raw_rows {
-                            if self.eval_expr(where_clause.as_ref().unwrap(), Some(&row), 0)?.is_truthy() {
+                            if self
+                                .eval_expr(where_clause.as_ref().unwrap(), Some(&row), 0)?
+                                .is_truthy()
+                            {
                                 acc.push(row);
                             }
                         }
@@ -1374,6 +1817,11 @@ impl<'a> ExecContext<'a> {
                                 self.step_budget
                             ));
                         }
+                        if let Some(ms) = timeout_ms {
+                            if *ms > 0 && started_at.elapsed().as_millis() as u64 > *ms {
+                                return Err(anyhow!("Query exceeded TIMEOUT ({}ms)", ms));
+                            }
+                        }
                         if self.eval_expr(pred, Some(&row), 0)?.is_truthy() {
                             acc.push(row);
                         }
@@ -1383,7 +1831,7 @@ impl<'a> ExecContext<'a> {
                     raw_rows
                 };
 
-                // 2. Optional SPLIT ON <array_field>
+                // Optional SPLIT ON <array_field>
                 if let Some(split_field) = split {
                     let mut expanded = Vec::new();
                     for row in filtered {
@@ -1402,7 +1850,7 @@ impl<'a> ExecContext<'a> {
                     filtered = expanded;
                 }
 
-                // 3. Optional GROUP BY aggregation
+                // Optional GROUP BY aggregation
                 if !group_by.is_empty() {
                     let mut groups: BTreeMap<String, Vec<Value>> = BTreeMap::new();
                     for row in filtered {
@@ -1507,7 +1955,6 @@ impl<'a> ExecContext<'a> {
                         Value::Object(out)
                     };
 
-                    // Optional OMIT <fields...>
                     if !omit.is_empty() {
                         if let Value::Object(ref mut map) = out_val {
                             for f in omit {
@@ -1582,14 +2029,14 @@ impl<'a> ExecContext<'a> {
             };
             let mut collected: Vec<(String, String)> = Vec::new();
             let mut current_level = frontier.clone();
-            let mut visited = std::collections::HashSet::new();
+            let mut visited = HashSet::new();
 
             for depth in 1..=hop.max_depth.max(1) {
                 let mut next_level = Vec::new();
                 for (cur_tb, cur_id) in &current_level {
                     let cur_ref = format!("{}:{}", cur_tb, cur_id);
                     let pfx = encode_key(prefix_byte, &[&self.ns, &self.db, &cur_ref, &hop.edge]);
-                    for (_, target_bytes) in self.storage.scan_prefix(&pfx)? {
+                    for (_, target_bytes) in self.scan_prefix_raw(&pfx)? {
                         let target_str = String::from_utf8_lossy(&target_bytes);
                         if let Some((t_tb, t_id)) = target_str.split_once(':') {
                             if let Some(ref want_tb) = hop.target_table {
@@ -1626,6 +2073,21 @@ impl<'a> ExecContext<'a> {
             }
         }
         Ok(Value::Array(out))
+    }
+
+    fn eval_closure(&self, params: &[String], body: &Expr, args: &[Value], depth: u16) -> Result<Value> {
+        let mut pmap = self.params.clone();
+        for (p, v) in params.iter().zip(args.iter()) {
+            pmap.insert(p.clone(), v.clone());
+        }
+        let sub = ExecContext::new(
+            self.storage,
+            self.live,
+            self.ns.clone(),
+            self.db.clone(),
+            pmap,
+        );
+        sub.eval_expr(body, None, depth + 1)
     }
 
     fn eval_expr(&self, expr: &Expr, row: Option<&Value>, depth: u16) -> Result<Value> {
@@ -1668,6 +2130,82 @@ impl<'a> ExecContext<'a> {
                 }
                 Ok(cur)
             }
+            Expr::Index { target, index } => {
+                let tv = self.eval_expr(target, row, depth + 1)?;
+                let iv = self.eval_expr(index, row, depth + 1)?;
+                match (tv, iv) {
+                    (Value::Array(arr), Value::Int(i)) => {
+                        let idx = if i < 0 {
+                            (arr.len() as i64 + i) as usize
+                        } else {
+                            i as usize
+                        };
+                        Ok(arr.get(idx).cloned().unwrap_or(Value::None))
+                    }
+                    (Value::Object(map), Value::String(k)) => {
+                        Ok(map.get(&k).cloned().unwrap_or(Value::None))
+                    }
+                    _ => Ok(Value::None),
+                }
+            }
+            Expr::ArrayFilter { target, pred } => {
+                let tv = self.eval_expr(target, row, depth + 1)?;
+                if let Value::Array(arr) = tv {
+                    let mut out = Vec::new();
+                    for item in arr {
+                        let mut pmap = self.params.clone();
+                        pmap.insert("this".into(), item.clone());
+                        let sub = ExecContext::new(
+                            self.storage,
+                            self.live,
+                            self.ns.clone(),
+                            self.db.clone(),
+                            pmap,
+                        );
+                        if sub.eval_expr(pred, Some(&item), depth + 1)?.is_truthy() {
+                            out.push(item);
+                        }
+                    }
+                    return Ok(Value::Array(out));
+                }
+                Ok(Value::Array(Vec::new()))
+            }
+            Expr::Range {
+                start,
+                end,
+                inclusive,
+            } => {
+                let s = self.eval_expr(start, row, depth + 1)?;
+                let e = self.eval_expr(end, row, depth + 1)?;
+                if let (Value::Int(a), Value::Int(b)) = (s, e) {
+                    let limit = 10_000i64;
+                    let upper = if *inclusive { b } else { b - 1 };
+                    let mut out = Vec::new();
+                    let mut cur = a;
+                    while cur <= upper && (out.len() as i64) < limit {
+                        out.push(Value::Int(cur));
+                        cur += 1;
+                    }
+                    return Ok(Value::Array(out));
+                }
+                Ok(Value::Array(Vec::new()))
+            }
+            Expr::Cast { ty, expr } => {
+                let v = self.eval_expr(expr, row, depth + 1)?;
+                eval_stdlib(&format!("type::{}", ty.to_ascii_lowercase()), &[v])
+            }
+            Expr::IfExpr {
+                cond,
+                then_expr,
+                else_expr,
+            } => {
+                if self.eval_expr(cond, row, depth + 1)?.is_truthy() {
+                    self.eval_expr(then_expr, row, depth + 1)
+                } else {
+                    self.eval_expr(else_expr, row, depth + 1)
+                }
+            }
+            Expr::Closure { .. } => Ok(Value::None),
             Expr::GraphTraverse { hops, tail_field } => {
                 self.eval_graph_traverse(hops, tail_field.as_deref(), row)
             }
@@ -1708,6 +2246,14 @@ impl<'a> ExecContext<'a> {
                 }
             }
             Expr::Binary { left, op, right } => {
+                if *op == BinaryOp::NullCoalesce {
+                    let l = self.eval_expr(left, row, depth + 1)?;
+                    return if matches!(l, Value::None | Value::Null) {
+                        self.eval_expr(right, row, depth + 1)
+                    } else {
+                        Ok(l)
+                    };
+                }
                 if *op == BinaryOp::And {
                     let l = self.eval_expr(left, row, depth + 1)?;
                     if !l.is_truthy() {
@@ -1784,33 +2330,87 @@ impl<'a> ExecContext<'a> {
                         Ok(Value::Bool(matched))
                     }
                     BinaryOp::VecKnn { .. } => Ok(Value::Bool(true)),
-                    BinaryOp::And | BinaryOp::Or => unreachable!(),
+                    BinaryOp::And | BinaryOp::Or | BinaryOp::NullCoalesce => unreachable!(),
                 }
             }
             Expr::FunctionCall { name, args } => {
+                // Higher-order closure array functions (`array::map`, `array::filter`, `array::any`, `array::all`)
+                let lname = name.to_ascii_lowercase();
+                if matches!(
+                    lname.as_str(),
+                    "array::map" | "array::filter" | "array::any" | "array::all"
+                ) && args.len() == 2
+                {
+                    if let Expr::Closure { params, body } = &args[1] {
+                        let arr_val = self.eval_expr(&args[0], row, depth + 1)?;
+                        if let Value::Array(items) = arr_val {
+                            match lname.as_str() {
+                                "array::map" => {
+                                    let mut out = Vec::with_capacity(items.len());
+                                    for it in items {
+                                        out.push(self.eval_closure(params, body, &[it], depth)?);
+                                    }
+                                    return Ok(Value::Array(out));
+                                }
+                                "array::filter" => {
+                                    let mut out = Vec::new();
+                                    for it in items {
+                                        if self
+                                            .eval_closure(params, body, &[it.clone()], depth)?
+                                            .is_truthy()
+                                        {
+                                            out.push(it);
+                                        }
+                                    }
+                                    return Ok(Value::Array(out));
+                                }
+                                "array::any" => {
+                                    for it in items {
+                                        if self.eval_closure(params, body, &[it], depth)?.is_truthy()
+                                        {
+                                            return Ok(Value::Bool(true));
+                                        }
+                                    }
+                                    return Ok(Value::Bool(false));
+                                }
+                                "array::all" => {
+                                    for it in items {
+                                        if !self.eval_closure(params, body, &[it], depth)?.is_truthy()
+                                        {
+                                            return Ok(Value::Bool(false));
+                                        }
+                                    }
+                                    return Ok(Value::Bool(true));
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+
                 let mut eval_args = Vec::with_capacity(args.len());
                 for a in args {
                     eval_args.push(self.eval_expr(a, row, depth + 1)?);
                 }
-                if name.eq_ignore_ascii_case("search::score") {
+                if lname == "search::score" {
                     return Ok(Value::Float(self.last_fts_score));
                 }
-                if name.eq_ignore_ascii_case("session::ns") {
+                if lname == "session::ns" {
                     return Ok(Value::String(self.ns.clone()));
                 }
-                if name.eq_ignore_ascii_case("session::db") {
+                if lname == "session::db" {
                     return Ok(Value::String(self.db.clone()));
                 }
-                if name.eq_ignore_ascii_case("graph::shortest_path") {
+                if lname == "graph::shortest_path" {
                     return self.eval_shortest_path(&eval_args);
                 }
                 #[cfg(feature = "files")]
-                if name.starts_with("file::") {
+                if lname.starts_with("file::") {
                     return crate::files::eval_file_fn(
                         self.storage,
                         &self.ns,
                         &self.db,
-                        &name.to_ascii_lowercase(),
+                        &lname,
                         &eval_args,
                     );
                 }
@@ -1822,18 +2422,7 @@ impl<'a> ExecContext<'a> {
                 }
                 if name.starts_with("fn::") {
                     if let Some(fmeta) = self.load_function(name)? {
-                        let mut fn_params = self.params.clone();
-                        for (pname, pval) in fmeta.params.iter().zip(eval_args.into_iter()) {
-                            fn_params.insert(pname.clone(), pval);
-                        }
-                        let sub_ctx = ExecContext::new(
-                            self.storage,
-                            self.live,
-                            self.ns.clone(),
-                            self.db.clone(),
-                            fn_params,
-                        );
-                        return sub_ctx.eval_expr(&fmeta.body, None, depth + 1);
+                        return self.eval_closure(&fmeta.params, &fmeta.body, &eval_args, depth);
                     }
                 }
                 eval_stdlib(name, &eval_args)
@@ -1841,7 +2430,6 @@ impl<'a> ExecContext<'a> {
         }
     }
 
-    /// BFS shortest path between two RecordIds over `edge`: `graph::shortest_path(from, 'knows', to)`.
     fn eval_shortest_path(&self, args: &[Value]) -> Result<Value> {
         let start = args
             .first()
@@ -1857,7 +2445,7 @@ impl<'a> ExecContext<'a> {
             .display_compact();
 
         let mut queue = std::collections::VecDeque::new();
-        let mut visited = std::collections::HashSet::new();
+        let mut visited = HashSet::new();
         queue.push_back(vec![start.clone()]);
         visited.insert(start);
 
@@ -1883,7 +2471,7 @@ impl<'a> ExecContext<'a> {
                 continue;
             }
             let pfx = encode_key(PREFIX_EDGE_OUT, &[&self.ns, &self.db, curr, &edge]);
-            for (_, target_bytes) in self.storage.scan_prefix(&pfx)? {
+            for (_, target_bytes) in self.scan_prefix_raw(&pfx)? {
                 let next = String::from_utf8_lossy(&target_bytes).to_string();
                 if visited.insert(next.clone()) {
                     let mut next_path = path.clone();
@@ -1906,12 +2494,15 @@ fn matches_field_type(val: &Value, expected: &str) -> bool {
         "any" | "option" => true,
         "string" => matches!(val, Value::String(_)),
         "int" => matches!(val, Value::Int(_)),
-        "float" | "number" => matches!(val, Value::Int(_) | Value::Float(_)),
+        "float" | "number" => matches!(val, Value::Int(_) | Value::Float(_) | Value::Decimal(_)),
+        "decimal" => matches!(val, Value::Decimal(_) | Value::Float(_) | Value::Int(_)),
+        "duration" => matches!(val, Value::Duration(_) | Value::String(_)),
         "bool" => matches!(val, Value::Bool(_)),
         "array" => matches!(val, Value::Array(_)),
         "object" => matches!(val, Value::Object(_)),
         "record" => matches!(val, Value::RecordId { .. }),
         "datetime" => matches!(val, Value::DateTime(_) | Value::String(_)),
+        "bytes" => matches!(val, Value::Bytes(_)),
         _ => true,
     }
 }

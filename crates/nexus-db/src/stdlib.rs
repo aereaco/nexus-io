@@ -388,6 +388,58 @@ pub fn eval_stdlib(name: &str, args: &[Value]) -> Result<Value> {
             }
             Ok(Value::Array(out))
         }
+        "array::first" => match args.first() {
+            Some(Value::Array(a)) => Ok(a.first().cloned().unwrap_or(Value::None)),
+            _ => Ok(Value::None),
+        },
+        "array::last" => match args.first() {
+            Some(Value::Array(a)) => Ok(a.last().cloned().unwrap_or(Value::None)),
+            _ => Ok(Value::None),
+        },
+        "array::includes" => match (args.first(), args.get(1)) {
+            (Some(Value::Array(a)), Some(item)) => Ok(Value::Bool(a.contains(item))),
+            _ => Ok(Value::Bool(false)),
+        },
+        "array::slice" => match args.first() {
+            Some(Value::Array(a)) => {
+                let start = args.get(1).and_then(|v| v.as_f64()).unwrap_or(0.0).max(0.0) as usize;
+                let len = args.get(2).and_then(|v| v.as_f64()).map(|n| n.max(0.0) as usize);
+                let slice = if start >= a.len() {
+                    Vec::new()
+                } else if let Some(l) = len {
+                    a[start..(start + l).min(a.len())].to_vec()
+                } else {
+                    a[start..].to_vec()
+                };
+                Ok(Value::Array(slice))
+            }
+            _ => Ok(Value::Array(Vec::new())),
+        },
+        "array::union" => {
+            let mut out = Vec::new();
+            for arg in args {
+                if let Value::Array(a) = arg {
+                    for item in a {
+                        if !out.contains(item) {
+                            out.push(item.clone());
+                        }
+                    }
+                }
+            }
+            Ok(Value::Array(out))
+        }
+        "array::intersect" => match (args.first(), args.get(1)) {
+            (Some(Value::Array(a)), Some(Value::Array(b))) => {
+                let mut out = Vec::new();
+                for item in a {
+                    if b.contains(item) && !out.contains(item) {
+                        out.push(item.clone());
+                    }
+                }
+                Ok(Value::Array(out))
+            }
+            _ => Ok(Value::Array(Vec::new())),
+        },
 
         // --- object::* ---
         "object::keys" => match args.first() {
