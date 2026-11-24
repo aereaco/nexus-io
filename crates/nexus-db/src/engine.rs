@@ -1080,7 +1080,8 @@ impl<'a> ExecContext<'a> {
             }
         }
 
-        self.live.publish(&self.ns, &self.db, tb, action, &val);
+        self.live
+            .publish_with_before(&self.ns, &self.db, tb, action, old_val.as_ref(), &val);
 
         let ev_name = match action {
             LiveAction::Create => "CREATE",

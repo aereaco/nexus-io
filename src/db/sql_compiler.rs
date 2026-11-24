@@ -3,11 +3,19 @@ use sqlparser::ast::{
     Assignment, AssignmentTarget, BinaryOperator, Expr, ObjectName, Query, SelectItem, SetExpr,
     Statement, TableFactor, Value as SqlValue, Values,
 };
-use sqlparser::dialect::SQLiteDialect;
+use sqlparser::dialect::{Dialect, MySqlDialect, PostgreSqlDialect, SQLiteDialect};
 use sqlparser::parser::Parser;
 use nexus_db::Value as DbValue;
 
-/// Result of compiling a SQLite SQL statement into SurrealQL with named bindings.
+/// Supported relational SQL dialects compiled uniformly onto `nexus-db` via `sqlparser` AST.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SqlDialect {
+    Sqlite,
+    Postgres,
+    Mysql,
+}
+
+/// Result of compiling a SQL statement (SQLite / PostgreSQL / MySQL) into SurrealQL with named bindings.
 #[derive(Debug, Clone)]
 pub struct CompiledSql {
     pub surql: String,
@@ -15,8 +23,16 @@ pub struct CompiledSql {
 }
 
 /// Compile SQLite SQL (`ctx.storage.sql.exec(sql, ...args)`) into SurrealQL via `sqlparser` AST.
-/// Never uses regex heuristics.
 pub fn compile_sqlite_to_surql(sql: &str, args: Vec<DbValue>) -> Result<CompiledSql> {
+    compile_sql_to_surql(SqlDialect::Sqlite, sql, args)
+}
+
+/// Unified multi-dialect SQL → SurrealQL compiler (`Sqlite`, `Postgres`, `Mysql`).
+pub fn compile_sql_to_surql(
+    dialect: SqlDialect,
+    sql: &str,
+    args: Vec<DbValue>,
+) -> Result<CompiledSql> {
     let trimmed = sql.trim();
 
     // Handle SQLite PRAGMA table_info(tbl) explicitly
@@ -39,9 +55,13 @@ pub fn compile_sqlite_to_surql(sql: &str, args: Vec<DbValue>) -> Result<Compiled
         });
     }
 
-    let dialect = SQLiteDialect {};
-    let statements = Parser::parse_sql(&dialect, trimmed)
-        .map_err(|e| anyhow!("SQLite parse error: {}", e))?;
+    let dialect_impl: Box<dyn Dialect> = match dialect {
+        SqlDialect::Sqlite => Box::new(SQLiteDialect {}),
+        SqlDialect::Postgres => Box::new(PostgreSqlDialect {}),
+        SqlDialect::Mysql => Box::new(MySqlDialect {}),
+    };
+    let statements = Parser::parse_sql(dialect_impl.as_ref(), trimmed)
+        .map_err(|e| anyhow!("{:?} SQL parse error: {}", dialect, e))?;
 
     let mut out_stmts = Vec::new();
     let mut param_idx = 0usize;

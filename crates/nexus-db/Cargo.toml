@@ -10,7 +10,7 @@ default = ["fts", "vector", "files", "auth"]
 fts = []
 vector = []
 files = []
-auth = ["dep:argon2", "dep:hmac", "dep:sha2", "dep:base64", "dep:subtle", "dep:ed25519-dalek"]
+auth = ["dep:argon2", "dep:hmac", "dep:sha2", "dep:base64", "dep:subtle", "dep:ed25519-dalek", "dep:p256", "dep:rsa"]
 geo = []
 crypto = ["dep:blake3"]
 cbor = []
@@ -18,7 +18,8 @@ graphql = []
 ml = []
 gql = []
 pgwire = []
-full = ["fts", "vector", "files", "auth", "geo", "crypto", "cbor", "graphql", "ml", "gql", "pgwire"]
+sqlite = []
+full = ["fts", "vector", "files", "auth", "geo", "crypto", "cbor", "graphql", "ml", "gql", "pgwire", "sqlite"]
 
 [dependencies]
 anyhow = "1.0"
@@ -28,7 +29,9 @@ blake3 = { version = "1.5", optional = true }
 chrono = { version = "0.4", features = ["serde"] }
 ed25519-dalek = { version = "2", optional = true }
 hmac = { version = "0.12", optional = true }
+p256 = { version = "0.13", optional = true, features = ["ecdsa"] }
 redb = "2.4"
+rsa = { version = "0.9", optional = true, features = ["sha2"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = { version = "0.10", optional = true }

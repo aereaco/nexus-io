@@ -732,6 +732,97 @@ fn cbor_read_len(ai: u8, data: &[u8], pos: &mut usize) -> anyhow::Result<u64> {
     }
 }
 
+/// SurrealDB RFC 8949 CBOR Semantic Tags (SDK wire compatibility):
+/// - Tag 6: NONE
+/// - Tag 7: Table name
+/// - Tag 8: RecordId (`[tb, id]`)
+/// - Tag 12: Datetime (`[secs, nanos]` or ISO-8601 string)
+/// - Tag 14: Duration (`[secs, nanos]` or duration string)
+/// - Tag 37: UUID (16-byte binary or string)
+/// - Tags 88..=94: GeoJSON Geometry
+#[cfg(feature = "cbor")]
+pub const CBOR_TAG_NONE: u64 = 6;
+#[cfg(feature = "cbor")]
+pub const CBOR_TAG_TABLE: u64 = 7;
+#[cfg(feature = "cbor")]
+pub const CBOR_TAG_RECORD_ID: u64 = 8;
+#[cfg(feature = "cbor")]
+pub const CBOR_TAG_DATETIME: u64 = 12;
+#[cfg(feature = "cbor")]
+pub const CBOR_TAG_DURATION: u64 = 14;
+#[cfg(feature = "cbor")]
+pub const CBOR_TAG_UUID: u64 = 37;
+
+/// Encode a `Value` with SurrealDB-compatible RFC 8949 CBOR semantic tags.
+#[cfg(feature = "cbor")]
+pub fn cbor_encode_value(v: &Value, out: &mut Vec<u8>) {
+    match v {
+        Value::None => {
+            cbor_write_head(6, CBOR_TAG_NONE, out);
+            out.push(0xF6);
+        }
+        Value::Null => out.push(0xF6),
+        Value::Bool(false) => out.push(0xF4),
+        Value::Bool(true) => out.push(0xF5),
+        Value::Int(i) => {
+            if *i >= 0 {
+                cbor_write_head(0, *i as u64, out);
+            } else {
+                cbor_write_head(1, (-1 - *i) as u64, out);
+            }
+        }
+        Value::Float(f) => {
+            out.push(0xFB);
+            out.extend_from_slice(&f.to_be_bytes());
+        }
+        Value::String(s) => {
+            cbor_write_head(3, s.len() as u64, out);
+            out.extend_from_slice(s.as_bytes());
+        }
+        Value::DateTime(dt) => {
+            cbor_write_head(6, CBOR_TAG_DATETIME, out);
+            cbor_write_head(3, dt.len() as u64, out);
+            out.extend_from_slice(dt.as_bytes());
+        }
+        Value::Duration(secs) => {
+            cbor_write_head(6, CBOR_TAG_DURATION, out);
+            cbor_write_head(4, 2, out);
+            cbor_write_head(0, (*secs).max(0) as u64, out);
+            cbor_write_head(0, 0, out);
+        }
+        Value::Bytes(b) => {
+            cbor_write_head(2, b.len() as u64, out);
+            out.extend_from_slice(b);
+        }
+        Value::Decimal(d) => {
+            cbor_write_head(3, d.len() as u64, out);
+            out.extend_from_slice(d.as_bytes());
+        }
+        Value::RecordId { tb, id } => {
+            cbor_write_head(6, CBOR_TAG_RECORD_ID, out);
+            cbor_write_head(4, 2, out);
+            cbor_write_head(3, tb.len() as u64, out);
+            out.extend_from_slice(tb.as_bytes());
+            cbor_write_head(3, id.len() as u64, out);
+            out.extend_from_slice(id.as_bytes());
+        }
+        Value::Array(arr) => {
+            cbor_write_head(4, arr.len() as u64, out);
+            for item in arr {
+                cbor_encode_value(item, out);
+            }
+        }
+        Value::Object(map) => {
+            cbor_write_head(5, map.len() as u64, out);
+            for (k, val) in map {
+                cbor_write_head(3, k.len() as u64, out);
+                out.extend_from_slice(k.as_bytes());
+                cbor_encode_value(val, out);
+            }
+        }
+    }
+}
+
 #[cfg(feature = "cbor")]
 pub fn cbor_decode(data: &[u8], pos: &mut usize) -> anyhow::Result<JsonValue> {
     let head = *data.get(*pos).ok_or_else(|| anyhow::anyhow!("CBOR EOF"))?;
@@ -741,6 +832,12 @@ pub fn cbor_decode(data: &[u8], pos: &mut usize) -> anyhow::Result<JsonValue> {
     match major {
         0 => Ok(json!(cbor_read_len(ai, data, pos)?)),
         1 => Ok(json!(-1i64 - (cbor_read_len(ai, data, pos)? as i64))),
+        2 => {
+            let len = cbor_read_len(ai, data, pos)? as usize;
+            let b = data.get(*pos..*pos + len).ok_or_else(|| anyhow::anyhow!("CBOR EOF"))?;
+            *pos += len;
+            Ok(JsonValue::Array(b.iter().map(|&x| json!(x)).collect()))
+        }
         3 => {
             let len = cbor_read_len(ai, data, pos)? as usize;
             let s = data.get(*pos..*pos + len).ok_or_else(|| anyhow::anyhow!("CBOR EOF"))?;
@@ -767,6 +864,42 @@ pub fn cbor_decode(data: &[u8], pos: &mut usize) -> anyhow::Result<JsonValue> {
                 map.insert(k, v);
             }
             Ok(JsonValue::Object(map))
+        }
+        6 => {
+            // SurrealDB RFC 8949 semantic tags (6=NONE, 7=Table, 8=RecordId, 12=Datetime, 14=Duration, 37=UUID, 88..=94=Geo)
+            let tag = cbor_read_len(ai, data, pos)?;
+            let inner = cbor_decode(data, pos)?;
+            match tag {
+                CBOR_TAG_NONE => Ok(JsonValue::Null),
+                CBOR_TAG_TABLE | CBOR_TAG_DATETIME | CBOR_TAG_DURATION => Ok(inner),
+                CBOR_TAG_RECORD_ID => {
+                    if let JsonValue::Array(ref arr) = inner {
+                        if arr.len() == 2 {
+                            let tb = arr[0].as_str().unwrap_or_default();
+                            let id = match &arr[1] {
+                                JsonValue::String(s) => s.clone(),
+                                other => other.to_string(),
+                            };
+                            return Ok(JsonValue::String(format!("{}:{}", tb, id)));
+                        }
+                    }
+                    Ok(inner)
+                }
+                CBOR_TAG_UUID => {
+                    if let JsonValue::Array(ref bytes) = inner {
+                        if bytes.len() == 16 {
+                            let mut raw = [0u8; 16];
+                            for (i, b) in bytes.iter().enumerate() {
+                                raw[i] = b.as_u64().unwrap_or(0) as u8;
+                            }
+                            return Ok(JsonValue::String(uuid::Uuid::from_bytes(raw).to_string()));
+                        }
+                    }
+                    Ok(inner)
+                }
+                88..=94 => Ok(json!({ "type": format!("GeoTag({})", tag), "coordinates": inner })),
+                _ => Ok(inner),
+            }
         }
         7 => match ai {
             20 => Ok(JsonValue::Bool(false)),

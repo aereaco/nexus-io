@@ -28,6 +28,8 @@ pub mod ml;
 pub mod gql;
 #[cfg(feature = "pgwire")]
 pub mod pgwire;
+#[cfg(feature = "sqlite")]
+pub mod sqlite_compat;
 
 use anyhow::Result;
 use std::collections::HashMap;
@@ -140,6 +142,12 @@ impl NexusDb {
     #[cfg(feature = "pgwire")]
     pub fn pgwire_session(&self, ns: &str, db: &str) -> crate::pgwire::PgWireSession {
         crate::pgwire::PgWireSession::new(self.clone(), sanitize_ident(ns), sanitize_ident(db))
+    }
+
+    /// Create a pure-Rust SQLite / LibSQL Hrana session (`feature = "sqlite"`).
+    #[cfg(feature = "sqlite")]
+    pub fn sqlite_session(&self, ns: &str, db: &str) -> crate::sqlite_compat::SqliteSession {
+        crate::sqlite_compat::SqliteSession::new(self.clone(), sanitize_ident(ns), sanitize_ident(db))
     }
 
     /// Execute a GraphQL query against `(ns, db)` (`feature = "graphql"`).
@@ -1394,6 +1402,9 @@ mod tests {
                 alg: Some("EdDSA".into()),
                 kid: Some("k1".into()),
                 x: Some(URL_SAFE_NO_PAD.encode(pk_bytes)),
+                y: None,
+                n: None,
+                e: None,
                 k: None,
             }],
         };
@@ -1495,5 +1506,143 @@ mod tests {
             .query_scoped("rep", "main", "SELECT VALUE v FROM item:1;", vec![])
             .unwrap();
         assert_eq!(replicated, vec![Value::Int(42)]);
+    }
+
+    #[cfg(all(feature = "cbor", feature = "vector", feature = "sqlite", feature = "auth"))]
+    #[test]
+    fn cbor_tags_live_diff_stdlib_hnsw_persist_es256_and_sqlite_hrana() {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine as _;
+
+        let db = NexusDb::open_mem();
+
+        // 1. SurrealDB CBOR Semantic Tags (Tag 8 RecordId, Tag 12 Datetime, Tag 6 NONE)
+        let mut buf = Vec::new();
+        crate::rpc::cbor_encode_value(
+            &Value::RecordId {
+                tb: "person".into(),
+                id: "alice".into(),
+            },
+            &mut buf,
+        );
+        let mut pos = 0;
+        let decoded = crate::rpc::cbor_decode(&buf, &mut pos).unwrap();
+        assert_eq!(decoded, serde_json::json!("person:alice"));
+
+        // 2. Filtered & DIFF LIVE SELECT (RFC 6902 patch on update)
+        let (live_id, rx) = db.live.subscribe_filtered(
+            "wave",
+            "main",
+            "item",
+            true,
+            Some(("env".into(), "prod".into())),
+        );
+        db.query_scoped(
+            "wave",
+            "main",
+            "CREATE item:1 SET env = 'dev', v = 1;
+             CREATE item:2 SET env = 'prod', v = 1;
+             UPDATE item:2 SET v = 2;",
+            vec![],
+        )
+        .unwrap();
+        let ev1 = rx.try_recv().unwrap(); // item:2 create (item:1 filtered out!)
+        assert_eq!(ev1.action, crate::live::LiveAction::Create);
+        let ev2 = rx.try_recv().unwrap(); // item:2 update diff
+        assert_eq!(ev2.action, crate::live::LiveAction::Update);
+        if let Value::Array(ops) = ev2.result {
+            assert!(ops.iter().any(|o| o.to_json()["op"] == "replace" && o.to_json()["path"] == "/v"));
+        } else {
+            panic!("expected RFC 6902 diff array");
+        }
+        db.kill_live(&live_id);
+
+        // 3. Expanded stdlib (`object::*`, `encoding::base64::*`, `parse::*`, `rand::*`)
+        let std_rows = db
+            .query_scoped(
+                "wave",
+                "main",
+                "RETURN [
+                    object::len({ a: 1, b: 2 }),
+                    encoding::base64::decode(encoding::base64::encode('nexus')),
+                    parse::email::host('ada@aerea.co'),
+                    parse::url::host('https://nexus.io:8080/rpc')
+                 ];",
+                vec![],
+            )
+            .unwrap();
+        assert_eq!(
+            std_rows,
+            vec![Value::Array(vec![
+                Value::Int(2),
+                Value::Bytes(b"nexus".to_vec()),
+                Value::String("aerea.co".into()),
+                Value::String("nexus.io".into()),
+            ])]
+        );
+
+        // 4. Persisted HNSW Graph save/load in storage
+        let mut hnsw = crate::vector_hnsw::HnswIndex::new(crate::parser::VectorMetric::Cosine, 8, 32);
+        hnsw.insert("v1".into(), vec![1.0, 0.0]);
+        hnsw.insert("v2".into(), vec![0.0, 1.0]);
+        hnsw.save_to_storage(db.storage.as_ref(), "wave", "main", "emb", "idx_v")
+            .unwrap();
+        let loaded = crate::vector_hnsw::HnswIndex::load_from_storage(
+            db.storage.as_ref(),
+            "wave",
+            "main",
+            "emb",
+            "idx_v",
+        )
+        .unwrap()
+        .unwrap();
+        let knn = loaded.search_knn(&[0.95, 0.05], 1, 16);
+        assert_eq!(knn[0].0, "v1");
+
+        // 5. ES256 (P-256) JWKS verification
+        use p256::ecdsa::{signature::Signer, Signature, SigningKey};
+        let sk = SigningKey::from_bytes(&[9u8; 32].into()).unwrap();
+        let vk = sk.verifying_key();
+        let pt = vk.to_encoded_point(false);
+        let claims = crate::auth::JwtClaims {
+            sub: Some("es256-client".into()),
+            rl: Some(vec!["Viewer".into()]),
+            ..Default::default()
+        };
+        let hdr = URL_SAFE_NO_PAD.encode(br#"{"alg":"ES256","typ":"JWT"}"#);
+        let pay = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap());
+        let input = format!("{}.{}", hdr, pay);
+        let sig: Signature = sk.sign(input.as_bytes());
+        let jwt = format!("{}.{}", input, URL_SAFE_NO_PAD.encode(sig.to_bytes()));
+        let jwks = crate::auth::Jwks {
+            keys: vec![crate::auth::Jwk {
+                kty: "EC".into(),
+                alg: Some("ES256".into()),
+                kid: Some("ec1".into()),
+                x: Some(URL_SAFE_NO_PAD.encode(pt.x().unwrap())),
+                y: Some(URL_SAFE_NO_PAD.encode(pt.y().unwrap())),
+                n: None,
+                e: None,
+                k: None,
+            }],
+        };
+        let verified = crate::auth::verify_jwt_with_jwks(&jwt, &jwks).unwrap();
+        assert_eq!(verified.sub.as_deref(), Some("es256-client"));
+
+        // 6. Pure-Rust SQLite + LibSQL Hrana `/v2/pipeline`
+        let sqlite = db.sqlite_session("wave", "main");
+        let pipe = sqlite.handle_hrana_pipeline(&serde_json::json!({
+            "requests": [
+                { "type": "execute", "stmt": { "sql": "CREATE TABLE notes (title TEXT)" } },
+                { "type": "execute", "stmt": { "sql": "CREATE notes:1 SET title = ?;", "args": [{ "type": "text", "value": "hello-hrana" }] } },
+                { "type": "execute", "stmt": { "sql": "SELECT title FROM notes:1;" } },
+                { "type": "close" }
+            ]
+        }));
+        assert_eq!(pipe["results"][2]["type"], "ok");
+        assert_eq!(
+            pipe["results"][2]["response"]["result"]["rows"][0][0]["value"],
+            "hello-hrana"
+        );
     }
 }

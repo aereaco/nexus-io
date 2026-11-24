@@ -1,8 +1,10 @@
+use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashSet};
 
 use crate::parser::VectorMetric;
 use crate::stdlib::{cosine_similarity, euclidean_distance, manhattan_distance};
+use crate::storage::{encode_key, StorageBackend, PREFIX_VEC_GRAPH};
 
 #[derive(Debug, Clone)]
 struct Candidate {
@@ -31,8 +33,9 @@ impl Ord for Candidate {
     }
 }
 
-/// Pure-Rust Hierarchical Navigable Small World (HNSW) graph index for fast approximate KNN search.
-#[derive(Debug, Clone)]
+/// Pure-Rust Hierarchical Navigable Small World (HNSW) graph index for fast approximate KNN search,
+/// with full serialization/persistence into `redb` (`PREFIX_VEC_GRAPH`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HnswIndex {
     pub metric: VectorMetric,
     pub m: usize,
@@ -42,6 +45,31 @@ pub struct HnswIndex {
 }
 
 impl HnswIndex {
+    pub fn save_to_storage(
+        &self,
+        storage: &dyn StorageBackend,
+        ns: &str,
+        db: &str,
+        table: &str,
+        index_name: &str,
+    ) -> anyhow::Result<()> {
+        let key = encode_key(PREFIX_VEC_GRAPH, &[ns, db, table, index_name]);
+        storage.put(&key, &serde_json::to_vec(self)?)
+    }
+
+    pub fn load_from_storage(
+        storage: &dyn StorageBackend,
+        ns: &str,
+        db: &str,
+        table: &str,
+        index_name: &str,
+    ) -> anyhow::Result<Option<Self>> {
+        let key = encode_key(PREFIX_VEC_GRAPH, &[ns, db, table, index_name]);
+        match storage.get(&key)? {
+            Some(raw) => Ok(Some(serde_json::from_slice(&raw)?)),
+            None => Ok(None),
+        }
+    }
     pub fn new(metric: VectorMetric, m: usize, ef_construction: usize) -> Self {
         Self {
             metric,

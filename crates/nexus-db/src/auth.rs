@@ -431,7 +431,7 @@ pub fn verify_eddsa_jwt(token: &str, public_key_bytes: &[u8; 32]) -> Result<JwtC
     decode_and_validate_claims(parts[1])
 }
 
-/// JSON Web Key (JWK) entry for OIDC / JWKS verification (`EdDSA` OKP + `HS256` oct).
+/// JSON Web Key (JWK) entry for OIDC / JWKS verification (`EdDSA` OKP, `ES256` EC P-256, `RS256` RSA, `HS256` oct).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Jwk {
     pub kty: String,
@@ -439,10 +439,19 @@ pub struct Jwk {
     pub alg: Option<String>,
     #[serde(default)]
     pub kid: Option<String>,
-    /// Base64url-encoded Ed25519 public key (`kty = "OKP"`, `crv = "Ed25519"`)
+    /// Base64url-encoded Ed25519 public key (`OKP`) or EC P-256 X coordinate (`EC`)
     #[serde(default)]
     pub x: Option<String>,
-    /// Base64url-encoded symmetric key (`kty = "oct"`)
+    /// Base64url-encoded EC P-256 Y coordinate (`EC`)
+    #[serde(default)]
+    pub y: Option<String>,
+    /// Base64url-encoded RSA modulus (`RSA`)
+    #[serde(default)]
+    pub n: Option<String>,
+    /// Base64url-encoded RSA exponent (`RSA`)
+    #[serde(default)]
+    pub e: Option<String>,
+    /// Base64url-encoded symmetric key (`oct`)
     #[serde(default)]
     pub k: Option<String>,
 }
@@ -453,7 +462,54 @@ pub struct Jwks {
     pub keys: Vec<Jwk>,
 }
 
-/// Verify a JWT against any matching key in a `Jwks` keyset (`EdDSA` or `HS256`).
+/// Verify an ES256 (ECDSA P-256 + SHA-256) JWT using raw `(x, y)` 32-byte coordinates.
+pub fn verify_es256_jwt(token: &str, x_bytes: &[u8], y_bytes: &[u8]) -> Result<JwtClaims> {
+    use p256::ecdsa::{signature::Verifier, Signature, VerifyingKey};
+    let parts: Vec<&str> = token.split('.').collect();
+    if parts.len() != 3 {
+        return Err(anyhow!("Invalid JWT format"));
+    }
+    let signing_input = format!("{}.{}", parts[0], parts[1]);
+    let sig_bytes = URL_SAFE_NO_PAD
+        .decode(parts[2])
+        .map_err(|_| anyhow!("Invalid ES256 signature encoding"))?;
+    let sig = Signature::from_slice(&sig_bytes).map_err(|_| anyhow!("Invalid ES256 signature"))?;
+    let mut sec1 = Vec::with_capacity(1 + x_bytes.len() + y_bytes.len());
+    sec1.push(0x04); // Uncompressed SEC1 point
+    sec1.extend_from_slice(x_bytes);
+    sec1.extend_from_slice(y_bytes);
+    let vk = VerifyingKey::from_sec1_bytes(&sec1).map_err(|_| anyhow!("Invalid P-256 public key"))?;
+    vk.verify(signing_input.as_bytes(), &sig)
+        .map_err(|_| anyhow!("Invalid ES256 JWT signature"))?;
+    decode_and_validate_claims(parts[1])
+}
+
+/// Verify an RS256 (RSA PKCS#1 v1.5 + SHA-256) JWT using raw big-endian `(n, e)` components.
+pub fn verify_rs256_jwt(token: &str, n_bytes: &[u8], e_bytes: &[u8]) -> Result<JwtClaims> {
+    use rsa::pkcs1v15::{Signature, VerifyingKey};
+    use rsa::signature::Verifier;
+    use rsa::{BigUint, RsaPublicKey};
+    let parts: Vec<&str> = token.split('.').collect();
+    if parts.len() != 3 {
+        return Err(anyhow!("Invalid JWT format"));
+    }
+    let signing_input = format!("{}.{}", parts[0], parts[1]);
+    let sig_bytes = URL_SAFE_NO_PAD
+        .decode(parts[2])
+        .map_err(|_| anyhow!("Invalid RS256 signature encoding"))?;
+    let sig = Signature::try_from(sig_bytes.as_slice()).map_err(|_| anyhow!("Invalid RS256 signature"))?;
+    let pub_key = RsaPublicKey::new(
+        BigUint::from_bytes_be(n_bytes),
+        BigUint::from_bytes_be(e_bytes),
+    )
+    .map_err(|_| anyhow!("Invalid RSA public key"))?;
+    let vk = VerifyingKey::<Sha256>::new(pub_key);
+    vk.verify(signing_input.as_bytes(), &sig)
+        .map_err(|_| anyhow!("Invalid RS256 JWT signature"))?;
+    decode_and_validate_claims(parts[1])
+}
+
+/// Verify a JWT against any matching key in a `Jwks` keyset (`EdDSA`, `ES256`, `RS256`, or `HS256`).
 pub fn verify_jwt_with_jwks(token: &str, jwks: &Jwks) -> Result<JwtClaims> {
     for jwk in &jwks.keys {
         if jwk.kty.eq_ignore_ascii_case("OKP") {
@@ -465,6 +521,22 @@ pub fn verify_jwt_with_jwks(token: &str, jwks: &Jwks) -> Result<JwtClaims> {
                         if let Ok(claims) = verify_eddsa_jwt(token, &pk) {
                             return Ok(claims);
                         }
+                    }
+                }
+            }
+        } else if jwk.kty.eq_ignore_ascii_case("EC") {
+            if let (Some(ref x_b64), Some(ref y_b64)) = (&jwk.x, &jwk.y) {
+                if let (Ok(x), Ok(y)) = (URL_SAFE_NO_PAD.decode(x_b64), URL_SAFE_NO_PAD.decode(y_b64)) {
+                    if let Ok(claims) = verify_es256_jwt(token, &x, &y) {
+                        return Ok(claims);
+                    }
+                }
+            }
+        } else if jwk.kty.eq_ignore_ascii_case("RSA") {
+            if let (Some(ref n_b64), Some(ref e_b64)) = (&jwk.n, &jwk.e) {
+                if let (Ok(n), Ok(e)) = (URL_SAFE_NO_PAD.decode(n_b64), URL_SAFE_NO_PAD.decode(e_b64)) {
+                    if let Ok(claims) = verify_rs256_jwt(token, &n, &e) {
+                        return Ok(claims);
                     }
                 }
             }

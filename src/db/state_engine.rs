@@ -23,6 +23,10 @@ pub trait StateEngine: Send + Sync + 'static {
     async fn kv_list(&self, ns: &str, db: &str, prefix: Option<&str>) -> Result<Vec<(String, DbValue)>>;
     async fn export_snapshot(&self, ns: &str, db: &str) -> Result<Bytes>;
     async fn import_snapshot(&self, ns: &str, db: &str, snapshot: Bytes) -> Result<()>;
+
+    fn as_nexus_db(&self) -> Option<&NexusDb> {
+        None
+    }
 }
 
 #[salvo::prelude::async_trait]
@@ -66,6 +70,10 @@ impl StateEngine for NexusDb {
     async fn import_snapshot(&self, ns: &str, db: &str, snapshot: Bytes) -> Result<()> {
         NexusDb::import_snapshot(self, ns, db, &snapshot)
     }
+
+    fn as_nexus_db(&self) -> Option<&NexusDb> {
+        Some(self)
+    }
 }
 
 #[salvo::prelude::async_trait]
@@ -102,6 +110,10 @@ impl StateEngine for Database {
 
     async fn import_snapshot(&self, ns: &str, db: &str, snapshot: Bytes) -> Result<()> {
         StateEngine::import_snapshot(&self.inner, ns, db, snapshot).await
+    }
+
+    fn as_nexus_db(&self) -> Option<&NexusDb> {
+        Some(&self.inner)
     }
 }
 

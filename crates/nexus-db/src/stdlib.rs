@@ -106,6 +106,21 @@ pub fn eval_stdlib(name: &str, args: &[Value]) -> Result<Value> {
         }
         "type::bool" => Ok(Value::Bool(args.first().map(|v| v.is_truthy()).unwrap_or(false))),
 
+        // --- additional bytes::* & rand::* helpers ---
+        "bytes::len" => {
+            let n = args
+                .first()
+                .map(|v| v.display_compact().len() as i64)
+                .unwrap_or(0);
+            Ok(Value::Int(n))
+        }
+        "rand::ulid" => {
+            let ms = Utc::now().timestamp_millis() as u64;
+            let r = Uuid::new_v4().as_u128();
+            Ok(Value::String(format!("{:010X}{:016X}", ms & 0xFF_FFFF_FFFF, (r as u64))))
+        }
+        "rand::bool" => Ok(Value::Bool((Uuid::new_v4().as_bytes()[0] & 1) == 1)),
+
         // --- time::* ---
         "time::now" => Ok(Value::DateTime(Utc::now().to_rfc3339())),
         "time::unix" => Ok(Value::Int(Utc::now().timestamp())),

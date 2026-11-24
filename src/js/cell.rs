@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use nexus_db::Value as DbValue;
 use tokio::sync::RwLock;
 
-use crate::db::sql_compiler::compile_sqlite_to_surql;
+use crate::db::sql_compiler::{compile_sql_to_surql, SqlDialect};
 use crate::db::StateEngine;
 use crate::storage::BlobBridge;
 
@@ -244,20 +244,29 @@ fn create_cell_context() -> Context {
         c.define_own(&global, key, Property::data(JsValue::Object(f), PropFlags::C_W_E));
     };
 
-    register(&mut ctx, "__cell_sql_exec", 2, cell_sql_exec_cb);
-    register(&mut ctx, "__cell_surreal_query", 1, cell_surreal_query_cb);
+    register(&mut ctx, "__cell_query", 3, cell_unified_query_cb);
     register(&mut ctx, "__cell_kv_get", 1, cell_kv_get_cb);
     register(&mut ctx, "__cell_kv_put", 2, cell_kv_put_cb);
     register(&mut ctx, "__cell_kv_delete", 1, cell_kv_delete_cb);
 
-    // Expose Cloudflare Durable Objects / celld compatible `ctx.storage` + `ctx.storage.surreal`
+    // Unified multi-flavor `ctx.db.query(q, { flavor, params })` ('surql'|'sqlite'|'postgres'|'mysql'|'graphql'|'gql')
+    // plus ergonomic Cloudflare Durable Objects / celld compatible `ctx.storage` aliases.
     let _ = ctx.eval(
         r#"
+        const __query = (query, opts = {}) => {
+            const flavor = typeof opts === 'string' ? opts : (opts.flavor || 'surql');
+            const params = Array.isArray(opts) ? opts : (opts.params || []);
+            return __cell_query(flavor, query, params);
+        };
         globalThis.ctx = {
+            db: {
+                query: __query,
+            },
             storage: {
+                query: __query,
                 sql: {
                     exec(query, ...bindings) {
-                        const rows = __cell_sql_exec(query, bindings);
+                        const rows = __cell_query('sqlite', query, bindings);
                         return {
                             toArray() { return rows; },
                             one() { return rows[0] ?? null; },
@@ -265,9 +274,7 @@ fn create_cell_context() -> Context {
                     }
                 },
                 surreal: {
-                    query(surql) {
-                        return __cell_surreal_query(surql);
-                    }
+                    query(surql) { return __cell_query('surql', surql, []); }
                 },
                 get(key) { return __cell_kv_get(String(key)); },
                 put(key, val) { return __cell_kv_put(String(key), val); },
@@ -306,45 +313,80 @@ fn js_val_to_string(val: &JsValue) -> String {
     }
 }
 
-fn cell_sql_exec_cb(
+fn cell_unified_query_cb(
     ctx: &mut Context,
     _this: &JsValue,
     args: &[JsValue],
     _magic: i32,
 ) -> JsResult<JsValue> {
-    let sql = args.first().map(js_val_to_string).unwrap_or_default();
-    let mut sur_args = Vec::new();
-    if let Some(JsValue::Object(arr_obj)) = args.get(1) {
+    let flavor = args
+        .first()
+        .map(js_val_to_string)
+        .unwrap_or_else(|| "surql".into())
+        .to_ascii_lowercase();
+    let query = args.get(1).map(js_val_to_string).unwrap_or_default();
+    let mut bind_args = Vec::new();
+    if let Some(JsValue::Object(arr_obj)) = args.get(2) {
         let borrowed = arr_obj.borrow();
         if let quickrs_core::object::ObjectData::Array(arr) = &borrowed.data {
             for elem in &arr.elements {
-                sur_args.push(js_to_db(elem));
+                bind_args.push(js_to_db(elem));
             }
         }
     }
 
-    let compiled = match compile_sqlite_to_surql(&sql, sur_args) {
-        Ok(c) => c,
-        Err(e) => {
+    match flavor.as_str() {
+        "surql" | "surreal" | "surrealql" => run_cell_query(ctx, &query, vec![]),
+        "sqlite" | "postgres" | "pg" | "postgresql" | "mysql" => {
+            let dialect = match flavor.as_str() {
+                "postgres" | "pg" | "postgresql" => SqlDialect::Postgres,
+                "mysql" => SqlDialect::Mysql,
+                _ => SqlDialect::Sqlite,
+            };
+            match compile_sql_to_surql(dialect, &query, bind_args) {
+                Ok(c) => run_cell_query(ctx, &c.surql, c.bindings),
+                Err(e) => {
+                    let err_obj = ctx.new_object();
+                    let k = PropKey::from_string(&ctx.intern("error"));
+                    let v = JsValue::Str(ctx.intern(&e.to_string()));
+                    ctx.define_own(&err_obj, k, Property::data(v, PropFlags::C_W_E));
+                    Ok(JsValue::Object(err_obj))
+                }
+            }
+        }
+        "graphql" | "gql" => {
+            let scope = ACTIVE_CELL_SCOPE.with(|s| {
+                s.borrow()
+                    .as_ref()
+                    .map(|sc| (sc.engine.clone(), sc.app.clone(), sc.cell_id.clone()))
+            });
+            let Some((engine, app, cell_id)) = scope else {
+                return Ok(JsValue::Undefined);
+            };
+            let Some(nexus) = engine.as_nexus_db() else {
+                return Ok(JsValue::Undefined);
+            };
+            let res_json = if flavor == "graphql" {
+                nexus
+                    .graphql(&app, &cell_id, &query)
+                    .unwrap_or_else(|e| serde_json::json!({ "error": e.to_string() }))
+            } else {
+                match nexus.gql(&app, &cell_id, &query) {
+                    Ok(rows) => serde_json::Value::Array(rows.iter().map(|v| v.to_json()).collect()),
+                    Err(e) => serde_json::json!({ "error": e.to_string() }),
+                }
+            };
+            let json_str = serde_json::to_string(&res_json).unwrap_or_else(|_| "null".into());
+            ctx.eval(&format!("({})", json_str))
+        }
+        other => {
             let err_obj = ctx.new_object();
             let k = PropKey::from_string(&ctx.intern("error"));
-            let v = JsValue::Str(ctx.intern(&e.to_string()));
+            let v = JsValue::Str(ctx.intern(&format!("Unsupported query flavor '{}'", other)));
             ctx.define_own(&err_obj, k, Property::data(v, PropFlags::C_W_E));
-            return Ok(JsValue::Object(err_obj));
+            Ok(JsValue::Object(err_obj))
         }
-    };
-
-    run_cell_query(ctx, &compiled.surql, compiled.bindings)
-}
-
-fn cell_surreal_query_cb(
-    ctx: &mut Context,
-    _this: &JsValue,
-    args: &[JsValue],
-    _magic: i32,
-) -> JsResult<JsValue> {
-    let surql = args.first().map(js_val_to_string).unwrap_or_default();
-    run_cell_query(ctx, &surql, vec![])
+    }
 }
 
 fn run_cell_query(

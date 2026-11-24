@@ -96,15 +96,6 @@ pub struct SurrealSqlHandler {
 #[async_trait]
 impl Handler for SurrealSqlHandler {
     async fn handle(&self, req: &mut Request, _depot: &mut Depot, res: &mut Response, _ctrl: &mut FlowCtrl) {
-        let client_ip = req.remote_addr().to_string();
-        if !check_auth_rate_limit(&client_ip) {
-            res.status_code(StatusCode::TOO_MANY_REQUESTS);
-            res.render(Json(json!({
-                "code": 429,
-                "details": "Too many authentication attempts; retry after 60 seconds"
-            })));
-            return;
-        }
         let (ns, database) = extract_ns_db(req);
         let auth = match resolve_http_auth(req, &self.db, &ns, &database) {
             Ok(a) => a,
@@ -166,15 +157,6 @@ pub struct SurrealHttpRpcHandler {
 #[async_trait]
 impl Handler for SurrealHttpRpcHandler {
     async fn handle(&self, req: &mut Request, _depot: &mut Depot, res: &mut Response, _ctrl: &mut FlowCtrl) {
-        let client_ip = req.remote_addr().to_string();
-        if !check_auth_rate_limit(&client_ip) {
-            res.status_code(StatusCode::TOO_MANY_REQUESTS);
-            res.render(Json(json!({
-                "code": 429,
-                "details": "Too many authentication attempts; retry after 60 seconds"
-            })));
-            return;
-        }
         let (ns, database) = extract_ns_db(req);
         let mut session = self.db.inner.rpc_session(&ns, &database);
         match resolve_http_auth(req, &self.db, &ns, &database) {
@@ -276,15 +258,6 @@ pub struct SurrealExportImportHandler {
 #[async_trait]
 impl Handler for SurrealExportImportHandler {
     async fn handle(&self, req: &mut Request, _depot: &mut Depot, res: &mut Response, _ctrl: &mut FlowCtrl) {
-        let client_ip = req.remote_addr().to_string();
-        if !check_auth_rate_limit(&client_ip) {
-            res.status_code(StatusCode::TOO_MANY_REQUESTS);
-            res.render(Json(json!({
-                "code": 429,
-                "details": "Too many authentication attempts; retry after 60 seconds"
-            })));
-            return;
-        }
         let (ns, database) = extract_ns_db(req);
         if self.is_import {
             let dump = match req.payload().await {
@@ -323,15 +296,6 @@ pub struct SurrealKeyHandler {
 #[async_trait]
 impl Handler for SurrealKeyHandler {
     async fn handle(&self, req: &mut Request, _depot: &mut Depot, res: &mut Response, _ctrl: &mut FlowCtrl) {
-        let client_ip = req.remote_addr().to_string();
-        if !check_auth_rate_limit(&client_ip) {
-            res.status_code(StatusCode::TOO_MANY_REQUESTS);
-            res.render(Json(json!({
-                "code": 429,
-                "details": "Too many authentication attempts; retry after 60 seconds"
-            })));
-            return;
-        }
         let (ns, database) = extract_ns_db(req);
         let table = req.param::<String>("table").unwrap_or_default();
         let id = req.param::<String>("id");
@@ -446,4 +410,68 @@ pub async fn surreal_ready(res: &mut Response) {
 #[handler]
 pub async fn surreal_version(res: &mut Response) {
     res.render(Text::Plain("nexus-db 0.1.0 (surrealdb-wire-compatible)"));
+}
+
+/// `POST /v2/pipeline` — LibSQL / Turso Hrana HTTP SQLite pipeline endpoint backed by `nexus-db`.
+#[derive(Clone)]
+pub struct SqliteHranaHandler {
+    pub db: Arc<Database>,
+}
+
+#[async_trait]
+impl Handler for SqliteHranaHandler {
+    async fn handle(&self, req: &mut Request, _depot: &mut Depot, res: &mut Response, _ctrl: &mut FlowCtrl) {
+        let (ns, database) = extract_ns_db(req);
+        let body: JsonValue = match req.parse_json().await {
+            Ok(v) => v,
+            Err(e) => {
+                res.status_code(StatusCode::BAD_REQUEST);
+                res.render(Json(json!({ "error": e.to_string() })));
+                return;
+            }
+        };
+        let session = self.db.inner.sqlite_session(&ns, &database);
+        res.render(Json(session.handle_hrana_pipeline(&body)));
+    }
+}
+
+/// Networked multi-node WAL replication endpoints (`GET /_nexus/wal/entries` & `POST /_nexus/wal/apply`).
+static NODE_WAL: Lazy<nexus_db::replication::ReplicationLog> =
+    Lazy::new(|| nexus_db::replication::ReplicationLog::new(1));
+
+#[derive(Clone)]
+pub struct WalReplicationHandler {
+    pub db: Arc<Database>,
+    pub is_apply: bool,
+}
+
+#[async_trait]
+impl Handler for WalReplicationHandler {
+    async fn handle(&self, req: &mut Request, _depot: &mut Depot, res: &mut Response, _ctrl: &mut FlowCtrl) {
+        if self.is_apply {
+            let entries: Vec<nexus_db::replication::WalEntry> = match req.parse_json().await {
+                Ok(v) => v,
+                Err(e) => {
+                    res.status_code(StatusCode::BAD_REQUEST);
+                    res.render(Json(json!({ "error": e.to_string() })));
+                    return;
+                }
+            };
+            match NODE_WAL.apply_to_follower(&self.db.inner, &entries) {
+                Ok(commit_idx) => res.render(Json(json!({ "status": "OK", "commit_index": commit_idx }))),
+                Err(e) => {
+                    res.status_code(StatusCode::CONFLICT);
+                    res.render(Json(json!({ "status": "ERR", "error": e.to_string() })));
+                }
+            }
+        } else {
+            let since = req.query::<u64>("since").unwrap_or(0);
+            let entries = NODE_WAL.entries_since(since);
+            res.render(Json(json!({
+                "term": NODE_WAL.current_term(),
+                "commit_index": NODE_WAL.commit_index(),
+                "entries": entries
+            })));
+        }
+    }
 }

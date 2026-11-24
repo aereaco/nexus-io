@@ -237,6 +237,10 @@ impl UxGateway {
             .push(Router::with_path("/status").get(crate::ux::surreal_http::surreal_status))
             .push(Router::with_path("/ready").get(crate::ux::surreal_http::surreal_ready))
             .push(Router::with_path("/version").get(crate::ux::surreal_http::surreal_version))
+            // LibSQL / Turso Hrana SQLite HTTP pipeline & multi-node WAL replication transport
+            .push(Router::with_path("/v2/pipeline").post(crate::ux::surreal_http::SqliteHranaHandler { db: self.db.clone() }))
+            .push(Router::with_path("/_nexus/wal/entries").get(crate::ux::surreal_http::WalReplicationHandler { db: self.db.clone(), is_apply: false }))
+            .push(Router::with_path("/_nexus/wal/apply").post(crate::ux::surreal_http::WalReplicationHandler { db: self.db.clone(), is_apply: true }))
             
             // S3 Proxy (browser-friendly)
             .push({
