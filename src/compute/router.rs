@@ -42,8 +42,17 @@ impl InferenceRouter {
                 let total_vram_mb: u64 = stats.gpus.iter().map(|g| g.vram_free / 1024 / 1024).sum();
                 if total_vram_mb < req.min_vram_mb { continue; }
 
-                // 2. Score: Simple heuristic (more free RAM = better)
-                let score = stats.memory_free; 
+                // 2. Score: prioritize free VRAM for GPU workloads, free RAM otherwise (+10% green bonus)
+                let base_score = if req.min_vram_mb > 0 {
+                    total_vram_mb * 1024 * 1024
+                } else {
+                    stats.memory_free
+                };
+                let score = if stats.is_green {
+                    base_score.saturating_add(base_score / 10)
+                } else {
+                    base_score
+                }; 
                 
                 if score > best_score {
                     best_score = score;

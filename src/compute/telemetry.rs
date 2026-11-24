@@ -35,8 +35,9 @@ impl NodeResources {
         let memory_total = sys.total_memory();
         let memory_free = sys.free_memory();
         
-        // 2. GPU Telemetry (NVML)
+        // 2. GPU Telemetry (NVML - Desktop/Server only; gated out on Android/iOS)
         let mut gpus = vec![];
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
         if let Ok(nvml) = nvml_wrapper::Nvml::init() {
             if let Ok(count) = nvml.device_count() {
                 for i in 0..count {
@@ -66,5 +67,36 @@ impl NodeResources {
             is_green,
             timestamp: chrono::Utc::now().timestamp(),
         }
+    }
+
+    /// Project live CPU/RAM/GPU telemetry into the `pinned` `nexus::system` `sys::gpu` table for `InferMesh`.
+    pub async fn project_to_state(
+        &self,
+        engine: &dyn crate::db::StateEngine,
+        node_id: &str,
+    ) -> anyhow::Result<()> {
+        let total_vram_free: u64 = self.gpus.iter().map(|g| g.vram_free).sum();
+        let total_vram: u64 = self.gpus.iter().map(|g| g.vram_total).sum();
+        let surql = "DEFINE TABLE IF NOT EXISTS `sys::gpu` SCHEMALESS;
+                     UPSERT type::record('sys::gpu', $id) SET
+                         node_id = $id,
+                         cpu_cores = $cpu,
+                         memory_total = $mem_total,
+                         memory_free = $mem_free,
+                         vram_total = $vram_total,
+                         vram_free = $vram_free,
+                         is_green = $green,
+                         updated_at = time::now();";
+        let bindings = vec![
+            ("id".to_string(), surrealdb::types::Value::String(node_id.to_string())),
+            ("cpu".to_string(), surrealdb::types::Value::Number(surrealdb::types::Number::Int(self.cpu_cores as i64))),
+            ("mem_total".to_string(), surrealdb::types::Value::Number(surrealdb::types::Number::Int(self.memory_total as i64))),
+            ("mem_free".to_string(), surrealdb::types::Value::Number(surrealdb::types::Number::Int(self.memory_free as i64))),
+            ("vram_total".to_string(), surrealdb::types::Value::Number(surrealdb::types::Number::Int(total_vram as i64))),
+            ("vram_free".to_string(), surrealdb::types::Value::Number(surrealdb::types::Number::Int(total_vram_free as i64))),
+            ("green".to_string(), surrealdb::types::Value::Bool(self.is_green)),
+        ];
+        engine.query_scoped("nexus", "system", surql, bindings).await?;
+        Ok(())
     }
 }

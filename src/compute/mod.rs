@@ -4,6 +4,8 @@ pub mod command;
 pub mod route_command;
 pub mod grid_command;
 pub mod run_command;
+pub mod md_runtime;
+pub mod analytics;
 
 pub use telemetry::NodeResources;
 pub use router::{InferenceRouter, ComputeRequirements};

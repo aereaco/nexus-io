@@ -133,7 +133,8 @@ impl BlobBridge {
     pub async fn new_in(db: Arc<Database>, data_dir: impl AsRef<std::path::Path>) -> Result<Self> {
         let node = init_blob_node(data_dir.as_ref()).await?;
 
-        // Ensure storage metadata tables exist and register this node in `sys::node` for HRW placement.
+        // Ensure storage metadata tables exist in `pinned` `nexus::system` and register this node in `sys::node`.
+        db.client.use_ns("nexus").use_db("system").await?;
         let _ = db
             .client
             .query(
@@ -154,6 +155,13 @@ impl BlobBridge {
         &self.node.node_id
     }
 
+    /// Always pin `BlobBridge` metadata operations to the `pinned` `nexus::system` scope
+    /// so concurrent `elastic` cell `(ns, db)` switches never leak into storage metadata.
+    async fn system_db(&self) -> Result<&surrealdb::Surreal<surrealdb::engine::local::Db>> {
+        self.db.client.use_ns("nexus").use_db("system").await?;
+        Ok(&self.db.client)
+    }
+
     /// Background anti-entropy scrub loop: verifies local HRW-assigned blobs and pulls missing replicas via `iroh-blobs`.
     pub fn spawn_repair_loop(&self) {
         let bridge = self.clone();
@@ -170,9 +178,8 @@ impl BlobBridge {
 
     /// Run one pass of HRW anti-entropy verification/repair.
     pub async fn repair_once(&self, replication_factor: usize) -> Result<usize> {
-        let mut peer_resp = self
-            .db
-            .client
+        let client = self.system_db().await?;
+        let mut peer_resp = client
             .query("SELECT pubkey FROM `sys::node` WHERE status = 'active'")
             .await?;
         let peer_rows: Vec<HashMap<String, serde_json::Value>> = peer_resp.take(0)?;
@@ -185,9 +192,7 @@ impl BlobBridge {
             return Ok(0);
         }
 
-        let mut obj_resp = self
-            .db
-            .client
+        let mut obj_resp = client
             .query("SELECT bucket, key, blake3 FROM `sys::object` WHERE deleted != true")
             .await?;
         let objects: Vec<HashMap<String, serde_json::Value>> = obj_resp.take(0)?;
@@ -233,10 +238,9 @@ impl BlobBridge {
 
     /// Create a bucket in SurrealDB metadata (`sys::bucket`).
     pub async fn create_bucket(&self, name: &str) -> Result<()> {
+        let client = self.system_db().await?;
         let query = "UPSERT type::record('sys::bucket', $id) SET name = $name, created_at = time::now()";
-        let response = self
-            .db
-            .client
+        let response = client
             .query(query)
             .bind(("id", name.to_string()))
             .bind(("name", name.to_string()))
@@ -249,10 +253,9 @@ impl BlobBridge {
 
     /// Record a mesh peer in SurrealDB (`sys::node`) for HRW placement and `iroh-blobs` sync.
     pub async fn connect_peer(&self, pubkey: &str, endpoint: &str) -> Result<()> {
+        let client = self.system_db().await?;
         let query = "UPSERT type::record('sys::node', $id) SET pubkey = $pubkey, endpoint = $endpoint, status = 'active', updated_at = time::now()";
-        let response = self
-            .db
-            .client
+        let response = client
             .query(query)
             .bind(("id", pubkey.to_string()))
             .bind(("pubkey", pubkey.to_string()))
@@ -265,7 +268,8 @@ impl BlobBridge {
 
     /// List all buckets from SurrealDB.
     pub async fn list_buckets(&self) -> Result<Vec<String>> {
-        let mut response = self.db.client.query("SELECT name FROM `sys::bucket`").await?;
+        let client = self.system_db().await?;
+        let mut response = client.query("SELECT name FROM `sys::bucket`").await?;
         let rows: Vec<HashMap<String, serde_json::Value>> = response.take(0)?;
 
         let names: Vec<String> = rows
@@ -324,10 +328,9 @@ impl BlobBridge {
         let hash_hex = outcome.hash.to_hex().to_string();
 
         let obj_id = format!("{}/{}", bucket, key);
+        let client = self.system_db().await?;
         let query = "UPSERT type::record('sys::object', $id) SET bucket = $bucket, key = $key, blake3 = $hash, etag = $hash, size = $size, deleted = false, updated_at = time::now()";
-        let response = self
-            .db
-            .client
+        let response = client
             .query(query)
             .bind(("id", obj_id))
             .bind(("bucket", bucket.to_string()))
@@ -343,9 +346,8 @@ impl BlobBridge {
     /// Head object - retrieve metadata (`ETag`, `size`) without reading bytes.
     pub async fn head_object(&self, bucket: &str, key: &str) -> Result<Option<ObjectMeta>> {
         let obj_id = format!("{}/{}", bucket, key);
-        let mut response = self
-            .db
-            .client
+        let client = self.system_db().await?;
+        let mut response = client
             .query("SELECT blake3, size, deleted FROM type::record('sys::object', $id)")
             .bind(("id", obj_id))
             .await?;
@@ -374,9 +376,8 @@ impl BlobBridge {
 
     /// List non-deleted objects in a bucket matching an optional prefix.
     pub async fn list_objects(&self, bucket: &str, prefix: Option<&str>) -> Result<Vec<ObjectMeta>> {
-        let mut response = self
-            .db
-            .client
+        let client = self.system_db().await?;
+        let mut response = client
             .query("SELECT key, blake3, size FROM `sys::object` WHERE bucket = $bucket AND deleted != true")
             .bind(("bucket", bucket.to_string()))
             .await?;
@@ -423,9 +424,8 @@ impl BlobBridge {
     /// Delete object - mark tombstone in SurrealDB metadata.
     pub async fn delete_object(&self, bucket: &str, key: &str) -> Result<()> {
         let obj_id = format!("{}/{}", bucket, key);
-        let response = self
-            .db
-            .client
+        let client = self.system_db().await?;
+        let response = client
             .query("UPDATE type::record('sys::object', $id) SET deleted = true, updated_at = time::now()")
             .bind(("id", obj_id))
             .await?;
