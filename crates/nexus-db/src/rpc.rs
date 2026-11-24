@@ -30,12 +30,15 @@ pub struct RpcError {
     pub message: String,
 }
 
-/// Stateful per-connection RPC session compatible with SurrealDB JS/Rust SDKs & Nexus-UX `$sql()`.
+/// Stateful per-connection RPC session compatible with SurrealDB JS/Rust/Python/Go SDKs & Nexus-UX `$sql()`.
 pub struct RpcSession {
     db: NexusDb,
     pub ns: String,
     pub database: String,
     pub vars: HashMap<String, Value>,
+    #[cfg(feature = "auth")]
+    pub auth: Option<crate::auth::AuthContext>,
+    live_subs: HashMap<String, std::sync::mpsc::Receiver<crate::live::LiveNotification>>,
 }
 
 impl RpcSession {
@@ -45,7 +48,40 @@ impl RpcSession {
             ns: ns.into(),
             database: database.into(),
             vars: HashMap::new(),
+            #[cfg(feature = "auth")]
+            auth: None,
+            live_subs: HashMap::new(),
         }
+    }
+
+    /// Drain pending `LIVE SELECT` notifications into SurrealDB-compatible JSON-RPC push frames.
+    pub fn drain_live_notifications(&mut self) -> Vec<String> {
+        let mut frames = Vec::new();
+        for (live_id, rx) in &self.live_subs {
+            while let Ok(notif) = rx.try_recv() {
+                let frame = json!({
+                    "result": {
+                        "id": live_id,
+                        "action": format!("{:?}", notif.action).to_ascii_uppercase(),
+                        "result": notif.result.to_json(),
+                    }
+                });
+                if let Ok(s) = serde_json::to_string(&frame) {
+                    frames.push(s);
+                }
+            }
+        }
+        frames
+    }
+
+    fn exec_query(&self, sql: &str, bindings: Vec<(String, Value)>) -> anyhow::Result<Vec<Value>> {
+        #[cfg(feature = "auth")]
+        if let Some(ref auth) = self.auth {
+            return self
+                .db
+                .query_scoped_with_auth(&self.ns, &self.database, sql, bindings, auth.clone());
+        }
+        self.db.query_scoped(&self.ns, &self.database, sql, bindings)
     }
 
     pub fn handle_json(&mut self, raw: &str) -> String {
@@ -124,7 +160,7 @@ impl RpcSession {
 
     fn dispatch(&mut self, method: &str, params: &[JsonValue]) -> anyhow::Result<JsonValue> {
         match method {
-            "ping" => Ok(JsonValue::Null),
+            "ping" | "health" => Ok(JsonValue::Null),
             "version" => Ok(json!("nexus-db 0.1.0 (surrealdb-wire-compatible)")),
             "use" => {
                 if let Some(ns) = params.first().and_then(|v| v.as_str()) {
@@ -135,9 +171,176 @@ impl RpcSession {
                 }
                 Ok(JsonValue::Null)
             }
-            "signin" | "signup" | "authenticate" => {
-                // Local embedded session auth hook (delegated to Nexus-IO SecurityKernel at gateway)
+            "signin" => {
+                #[cfg(feature = "auth")]
+                {
+                    let cred = params
+                        .first()
+                        .and_then(|v| v.as_object())
+                        .ok_or_else(|| anyhow::anyhow!("signin requires credentials object"))?;
+                    if let Some(ns) = cred.get("NS").or_else(|| cred.get("ns")).and_then(|v| v.as_str()) {
+                        self.ns = ns.to_string();
+                    }
+                    if let Some(db) = cred.get("DB").or_else(|| cred.get("db")).and_then(|v| v.as_str()) {
+                        self.database = db.to_string();
+                    }
+                    let user = cred
+                        .get("user")
+                        .or_else(|| cred.get("username"))
+                        .and_then(|v| v.as_str());
+                    let pass = cred
+                        .get("pass")
+                        .or_else(|| cred.get("password"))
+                        .and_then(|v| v.as_str());
+                    if let (Some(u), Some(p)) = (user, pass) {
+                        let (token, ctx) = self.db.signin_user(&self.ns, &self.database, u, p)?;
+                        self.auth = Some(ctx);
+                        return Ok(json!(token));
+                    }
+                    // Record access (`AC` / `ac`) signin flow
+                    if let Some(ac) = cred.get("AC").or_else(|| cred.get("ac")).and_then(|v| v.as_str()) {
+                        let access = crate::auth::load_access(
+                            self.db.storage.as_ref(),
+                            &self.ns,
+                            &self.database,
+                            ac,
+                        )?
+                        .ok_or_else(|| anyhow::anyhow!("Access '{}' not found", ac))?;
+                        let sql = access
+                            .signin_sql
+                            .ok_or_else(|| anyhow::anyhow!("Access '{}' has no SIGNIN clause", ac))?;
+                        let bindings: Vec<(String, Value)> = cred
+                            .iter()
+                            .map(|(k, v)| (k.clone(), Value::from_json(v)))
+                            .collect();
+                        let rows = self.db.query_scoped(&self.ns, &self.database, &sql, bindings)?;
+                        let rec = rows
+                            .first()
+                            .ok_or_else(|| anyhow::anyhow!("Record signin returned no matching record"))?;
+                        let rec_id = match rec {
+                            Value::Object(m) => m
+                                .get("id")
+                                .map(|v| v.display_compact())
+                                .unwrap_or_else(|| "record:unknown".into()),
+                            other => other.display_compact(),
+                        };
+                        let now = chrono::Utc::now().timestamp();
+                        let claims = crate::auth::JwtClaims {
+                            iss: Some("nexus-db".into()),
+                            iat: Some(now),
+                            exp: Some(now + 3600),
+                            ns: Some(self.ns.clone()),
+                            db: Some(self.database.clone()),
+                            ac: Some(ac.to_string()),
+                            id: Some(rec_id),
+                            ..Default::default()
+                        };
+                        let secret = access
+                            .jwt_key
+                            .as_deref()
+                            .unwrap_or(crate::auth::DEFAULT_JWT_SECRET);
+                        let token = crate::auth::issue_jwt(&claims, secret)?;
+                        self.auth = Some(crate::auth::AuthContext::from_jwt_claims(&claims));
+                        return Ok(json!(token));
+                    }
+                    Err(anyhow::anyhow!("signin requires user/pass or AC credentials"))
+                }
+                #[cfg(not(feature = "auth"))]
                 Ok(json!("nexus-session-ok"))
+            }
+            "signup" => {
+                #[cfg(feature = "auth")]
+                {
+                    let cred = params
+                        .first()
+                        .and_then(|v| v.as_object())
+                        .ok_or_else(|| anyhow::anyhow!("signup requires credentials object"))?;
+                    if let Some(ns) = cred.get("NS").or_else(|| cred.get("ns")).and_then(|v| v.as_str()) {
+                        self.ns = ns.to_string();
+                    }
+                    if let Some(db) = cred.get("DB").or_else(|| cred.get("db")).and_then(|v| v.as_str()) {
+                        self.database = db.to_string();
+                    }
+                    let ac = cred
+                        .get("AC")
+                        .or_else(|| cred.get("ac"))
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| anyhow::anyhow!("signup requires AC (access name)"))?;
+                    let access = crate::auth::load_access(
+                        self.db.storage.as_ref(),
+                        &self.ns,
+                        &self.database,
+                        ac,
+                    )?
+                    .ok_or_else(|| anyhow::anyhow!("Access '{}' not found", ac))?;
+                    let sql = access
+                        .signup_sql
+                        .ok_or_else(|| anyhow::anyhow!("Access '{}' has no SIGNUP clause", ac))?;
+                    let bindings: Vec<(String, Value)> = cred
+                        .iter()
+                        .map(|(k, v)| (k.clone(), Value::from_json(v)))
+                        .collect();
+                    let rows = self.db.query_scoped(&self.ns, &self.database, &sql, bindings)?;
+                    let rec = rows
+                        .first()
+                        .ok_or_else(|| anyhow::anyhow!("Record signup returned no record"))?;
+                    let rec_id = match rec {
+                        Value::Object(m) => m
+                            .get("id")
+                            .map(|v| v.display_compact())
+                            .unwrap_or_else(|| "record:unknown".into()),
+                        other => other.display_compact(),
+                    };
+                    let now = chrono::Utc::now().timestamp();
+                    let claims = crate::auth::JwtClaims {
+                        iss: Some("nexus-db".into()),
+                        iat: Some(now),
+                        exp: Some(now + 3600),
+                        ns: Some(self.ns.clone()),
+                        db: Some(self.database.clone()),
+                        ac: Some(ac.to_string()),
+                        id: Some(rec_id),
+                        ..Default::default()
+                    };
+                    let secret = access
+                        .jwt_key
+                        .as_deref()
+                        .unwrap_or(crate::auth::DEFAULT_JWT_SECRET);
+                    let token = crate::auth::issue_jwt(&claims, secret)?;
+                    self.auth = Some(crate::auth::AuthContext::from_jwt_claims(&claims));
+                    Ok(json!(token))
+                }
+                #[cfg(not(feature = "auth"))]
+                Ok(json!("nexus-session-ok"))
+            }
+            "authenticate" => {
+                #[cfg(feature = "auth")]
+                {
+                    let token = params
+                        .first()
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| anyhow::anyhow!("authenticate requires token string"))?;
+                    let ctx = self.db.authenticate_token(&self.ns, &self.database, token)?;
+                    self.auth = Some(ctx);
+                    Ok(JsonValue::Null)
+                }
+                #[cfg(not(feature = "auth"))]
+                Ok(JsonValue::Null)
+            }
+            "invalidate" => {
+                #[cfg(feature = "auth")]
+                {
+                    self.auth = Some(crate::auth::AuthContext::anonymous());
+                }
+                Ok(JsonValue::Null)
+            }
+            "info" => {
+                #[cfg(feature = "auth")]
+                {
+                    return Ok(serde_json::to_value(&self.auth).unwrap_or(JsonValue::Null));
+                }
+                #[cfg(not(feature = "auth"))]
+                Ok(json!({ "ns": self.ns, "db": self.database }))
             }
             "let" => {
                 let key = params
@@ -172,9 +375,7 @@ impl RpcSession {
                         bindings.push((k.clone(), Value::from_json(v)));
                     }
                 }
-                let rows = self
-                    .db
-                    .query_scoped(&self.ns, &self.database, sql, bindings)?;
+                let rows = self.exec_query(sql, bindings)?;
                 let json_rows: Vec<JsonValue> = rows.iter().map(Value::to_json).collect();
                 Ok(json!([{ "status": "OK", "result": json_rows }]))
             }
@@ -183,12 +384,7 @@ impl RpcSession {
                     .first()
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| anyhow::anyhow!("select requires table or record id"))?;
-                let rows = self.db.query_scoped(
-                    &self.ns,
-                    &self.database,
-                    &format!("SELECT * FROM {};", thing),
-                    vec![],
-                )?;
+                let rows = self.exec_query(&format!("SELECT * FROM {};", thing), vec![])?;
                 Ok(JsonValue::Array(rows.iter().map(Value::to_json).collect()))
             }
             "create" => {
@@ -197,12 +393,75 @@ impl RpcSession {
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| anyhow::anyhow!("create requires table or record id"))?;
                 let data = params.get(1).cloned().unwrap_or_else(|| json!({}));
-                let rows = self.db.query_scoped(
-                    &self.ns,
-                    &self.database,
+                let rows = self.exec_query(
                     &format!("CREATE {} CONTENT $data;", thing),
                     vec![("data".into(), Value::from_json(&data))],
                 )?;
+                Ok(rows.first().map(Value::to_json).unwrap_or(JsonValue::Null))
+            }
+            "insert" => {
+                let thing = params
+                    .first()
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow::anyhow!("insert requires table name"))?;
+                let data = params.get(1).cloned().unwrap_or_else(|| json!([]));
+                let items = match data {
+                    JsonValue::Array(arr) => arr,
+                    other => vec![other],
+                };
+                let mut inserted = Vec::new();
+                for item in items {
+                    let rows = self.exec_query(
+                        &format!("CREATE {} CONTENT $data;", thing),
+                        vec![("data".into(), Value::from_json(&item))],
+                    )?;
+                    inserted.extend(rows.iter().map(Value::to_json));
+                }
+                Ok(JsonValue::Array(inserted))
+            }
+            "insert_relation" => {
+                let table = params
+                    .first()
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow::anyhow!("insert_relation requires edge table"))?;
+                let data = params.get(1).cloned().unwrap_or_else(|| json!({}));
+                let from = data
+                    .get("in")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow::anyhow!("insert_relation requires 'in' record id"))?;
+                let to = data
+                    .get("out")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow::anyhow!("insert_relation requires 'out' record id"))?;
+                let rows = self.exec_query(
+                    &format!("RELATE {}->{}->{} CONTENT $data;", from, table, to),
+                    vec![("data".into(), Value::from_json(&data))],
+                )?;
+                Ok(JsonValue::Array(rows.iter().map(Value::to_json).collect()))
+            }
+            "relate" => {
+                let from = params
+                    .first()
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow::anyhow!("relate requires 'in' record id"))?;
+                let edge = params
+                    .get(1)
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow::anyhow!("relate requires edge table"))?;
+                let to = params
+                    .get(2)
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow::anyhow!("relate requires 'out' record id"))?;
+                let sql = if let Some(data) = params.get(3) {
+                    let rows = self.exec_query(
+                        &format!("RELATE {}->{}->{} CONTENT $data;", from, edge, to),
+                        vec![("data".into(), Value::from_json(data))],
+                    )?;
+                    return Ok(rows.first().map(Value::to_json).unwrap_or(JsonValue::Null));
+                } else {
+                    format!("RELATE {}->{}->{};", from, edge, to)
+                };
+                let rows = self.exec_query(&sql, vec![])?;
                 Ok(rows.first().map(Value::to_json).unwrap_or(JsonValue::Null))
             }
             "update" | "upsert" => {
@@ -212,9 +471,7 @@ impl RpcSession {
                     .ok_or_else(|| anyhow::anyhow!("{} requires table or record id", method))?;
                 let data = params.get(1).cloned().unwrap_or_else(|| json!({}));
                 let kw = method.to_ascii_uppercase();
-                let rows = self.db.query_scoped(
-                    &self.ns,
-                    &self.database,
+                let rows = self.exec_query(
                     &format!("{} {} CONTENT $data;", kw, thing),
                     vec![("data".into(), Value::from_json(&data))],
                 )?;
@@ -226,33 +483,124 @@ impl RpcSession {
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| anyhow::anyhow!("merge requires table or record id"))?;
                 let data = params.get(1).cloned().unwrap_or_else(|| json!({}));
-                let rows = self.db.query_scoped(
-                    &self.ns,
-                    &self.database,
+                let rows = self.exec_query(
                     &format!("UPDATE {} MERGE $data;", thing),
                     vec![("data".into(), Value::from_json(&data))],
                 )?;
                 Ok(JsonValue::Array(rows.iter().map(Value::to_json).collect()))
+            }
+            "patch" => {
+                let thing = params
+                    .first()
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow::anyhow!("patch requires table or record id"))?;
+                let ops = params
+                    .get(1)
+                    .and_then(|v| v.as_array())
+                    .ok_or_else(|| anyhow::anyhow!("patch requires JSON Patch array"))?;
+                let mut set_clauses = Vec::new();
+                let mut unset_fields = Vec::new();
+                let mut bindings = Vec::new();
+                for (i, op) in ops.iter().enumerate() {
+                    let kind = op.get("op").and_then(|v| v.as_str()).unwrap_or("");
+                    let path = op
+                        .get("path")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .trim_start_matches('/')
+                        .replace('/', ".");
+                    if path.is_empty() {
+                        continue;
+                    }
+                    match kind {
+                        "add" | "replace" => {
+                            let val = op.get("value").cloned().unwrap_or(JsonValue::Null);
+                            let pname = format!("p{}", i);
+                            set_clauses.push(format!("{} = ${}", path, pname));
+                            bindings.push((pname, Value::from_json(&val)));
+                        }
+                        "remove" => unset_fields.push(path),
+                        _ => {}
+                    }
+                }
+                let mut last = Vec::new();
+                if !set_clauses.is_empty() {
+                    last = self.exec_query(
+                        &format!("UPDATE {} SET {};", thing, set_clauses.join(", ")),
+                        bindings,
+                    )?;
+                }
+                if !unset_fields.is_empty() {
+                    last = self.exec_query(
+                        &format!("UPDATE {} UNSET {};", thing, unset_fields.join(", ")),
+                        vec![],
+                    )?;
+                }
+                Ok(JsonValue::Array(last.iter().map(Value::to_json).collect()))
             }
             "delete" => {
                 let thing = params
                     .first()
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| anyhow::anyhow!("delete requires table or record id"))?;
-                let _ = self.db.query_scoped(
-                    &self.ns,
-                    &self.database,
-                    &format!("DELETE {};", thing),
-                    vec![],
-                )?;
+                let _ = self.exec_query(&format!("DELETE {};", thing), vec![])?;
                 Ok(JsonValue::Null)
+            }
+            "run" => {
+                let fn_name = params
+                    .first()
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow::anyhow!("run requires function name (e.g. fn::foo)"))?;
+                let args = params
+                    .get(2)
+                    .or_else(|| params.get(1))
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                let mut arg_names = Vec::new();
+                let mut bindings = Vec::new();
+                for (i, a) in args.iter().enumerate() {
+                    let pname = format!("a{}", i);
+                    arg_names.push(format!("${}", pname));
+                    bindings.push((pname, Value::from_json(a)));
+                }
+                let rows = self.exec_query(
+                    &format!("RETURN {}({});", fn_name, arg_names.join(", ")),
+                    bindings,
+                )?;
+                Ok(rows.first().map(Value::to_json).unwrap_or(JsonValue::Null))
+            }
+            "graphql" => {
+                #[cfg(feature = "graphql")]
+                {
+                    let q = params
+                        .first()
+                        .and_then(|v| v.get("query").and_then(|s| s.as_str()).or_else(|| v.as_str()))
+                        .ok_or_else(|| anyhow::anyhow!("graphql requires query string"))?;
+                    return self.db.graphql(&self.ns, &self.database, q);
+                }
+                #[cfg(not(feature = "graphql"))]
+                Err(anyhow::anyhow!("Enable feature 'graphql' to use RPC graphql"))
+            }
+            "export" => {
+                let dump = self.db.export_surql(&self.ns, &self.database)?;
+                Ok(json!(dump))
+            }
+            "import" => {
+                let dump = params
+                    .first()
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow::anyhow!("import requires SurrealQL string"))?;
+                let count = self.db.import_surql(&self.ns, &self.database, dump)?;
+                Ok(json!({ "imported_statements": count }))
             }
             "live" => {
                 let table = params
                     .first()
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| anyhow::anyhow!("live requires table name"))?;
-                let (live_id, _rx) = self.db.subscribe_live(&self.ns, &self.database, table);
+                let (live_id, rx) = self.db.subscribe_live(&self.ns, &self.database, table);
+                self.live_subs.insert(live_id.clone(), rx);
                 Ok(json!(live_id))
             }
             "kill" => {
@@ -260,6 +608,7 @@ impl RpcSession {
                     .first()
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| anyhow::anyhow!("kill requires live query uuid"))?;
+                self.live_subs.remove(live_id);
                 self.db.kill_live(live_id);
                 Ok(JsonValue::Null)
             }

@@ -108,7 +108,13 @@ pub enum Statement {
     },
     DefineAccess {
         name: String,
+        level: String,
         access_type: String,
+        jwt_alg: Option<String>,
+        jwt_key: Option<String>,
+        signup_sql: Option<String>,
+        signin_sql: Option<String>,
+        duration_session: Option<String>,
     },
     DefineAnalyzer {
         name: String,
@@ -1178,17 +1184,116 @@ impl Parser {
         if self.eat_kw("ACCESS") {
             let _ = self.eat_if_not_exists();
             let name = self.expect_ident()?;
+            let mut level = "DATABASE".to_string();
             let mut access_type = "RECORD".to_string();
+            let mut jwt_alg = None;
+            let mut jwt_key = None;
+            let mut signup_sql = None;
+            let mut signin_sql = None;
+            let mut duration_session = None;
             while !matches!(self.peek(), Token::Semicolon | Token::Eof) {
-                if self.eat_kw("TYPE") {
+                if self.eat_kw("ON") {
+                    if let Ok(lv) = self.expect_ident() {
+                        level = lv.to_ascii_uppercase();
+                    }
+                } else if self.eat_kw("TYPE") {
                     if let Ok(t) = self.expect_ident() {
                         access_type = t.to_ascii_uppercase();
+                    }
+                } else if self.eat_kw("ALGORITHM") {
+                    if let Ok(alg) = self.expect_ident() {
+                        jwt_alg = Some(alg.to_ascii_uppercase());
+                    }
+                } else if self.eat_kw("KEY") {
+                    if let Token::Str(s) | Token::Ident(s) = self.next() {
+                        jwt_key = Some(s);
+                    }
+                } else if self.eat_kw("SIGNUP") {
+                    if matches!(self.peek(), Token::LParen) {
+                        self.next();
+                        let mut depth = 1usize;
+                        let mut parts = Vec::new();
+                        while depth > 0 && !matches!(self.peek(), Token::Eof) {
+                            match self.next() {
+                                Token::LParen => {
+                                    depth += 1;
+                                    parts.push("(".into());
+                                }
+                                Token::RParen => {
+                                    depth -= 1;
+                                    if depth > 0 {
+                                        parts.push(")".into());
+                                    }
+                                }
+                                Token::Str(s) => parts.push(format!("'{}'", s)),
+                                Token::Ident(s) => parts.push(s),
+                                Token::Param(p) => parts.push(format!("${}", p)),
+                                Token::Int(i) => parts.push(i.to_string()),
+                                Token::Float(f) => parts.push(f.to_string()),
+                                Token::Colon => parts.push(":".into()),
+                                Token::DoubleColon => parts.push("::".into()),
+                                Token::Eq => parts.push("=".into()),
+                                Token::Comma => parts.push(",".into()),
+                                Token::LBrace => parts.push("{".into()),
+                                Token::RBrace => parts.push("}".into()),
+                                _ => {}
+                            }
+                        }
+                        signup_sql = Some(parts.join(" "));
+                    }
+                } else if self.eat_kw("SIGNIN") {
+                    if matches!(self.peek(), Token::LParen) {
+                        self.next();
+                        let mut depth = 1usize;
+                        let mut parts = Vec::new();
+                        while depth > 0 && !matches!(self.peek(), Token::Eof) {
+                            match self.next() {
+                                Token::LParen => {
+                                    depth += 1;
+                                    parts.push("(".into());
+                                }
+                                Token::RParen => {
+                                    depth -= 1;
+                                    if depth > 0 {
+                                        parts.push(")".into());
+                                    }
+                                }
+                                Token::Str(s) => parts.push(format!("'{}'", s)),
+                                Token::Ident(s) => parts.push(s),
+                                Token::Param(p) => parts.push(format!("${}", p)),
+                                Token::Int(i) => parts.push(i.to_string()),
+                                Token::Float(f) => parts.push(f.to_string()),
+                                Token::Colon => parts.push(":".into()),
+                                Token::DoubleColon => parts.push("::".into()),
+                                Token::Eq => parts.push("=".into()),
+                                Token::Comma => parts.push(",".into()),
+                                Token::LBrace => parts.push("{".into()),
+                                Token::RBrace => parts.push("}".into()),
+                                _ => {}
+                            }
+                        }
+                        signin_sql = Some(parts.join(" "));
+                    }
+                } else if self.eat_kw("DURATION") {
+                    let _ = self.eat_kw("FOR");
+                    let _ = self.eat_kw("SESSION");
+                    if let Token::Ident(s) | Token::Str(s) = self.next() {
+                        duration_session = Some(s);
                     }
                 } else {
                     self.next();
                 }
             }
-            return Ok(Statement::DefineAccess { name, access_type });
+            return Ok(Statement::DefineAccess {
+                name,
+                level,
+                access_type,
+                jwt_alg,
+                jwt_key,
+                signup_sql,
+                signin_sql,
+                duration_session,
+            });
         }
 
         if self.eat_kw("ANALYZER") {

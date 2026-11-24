@@ -157,6 +157,8 @@ pub struct ExecContext<'a> {
     pub ns: String,
     pub db: String,
     pub params: HashMap<String, Value>,
+    #[cfg(feature = "auth")]
+    pub auth: Option<crate::auth::AuthContext>,
     pub step_budget: usize,
     tx_overlay: Option<BTreeMap<Vec<u8>, Option<Vec<u8>>>>,
     in_event: bool,
@@ -180,6 +182,8 @@ impl<'a> ExecContext<'a> {
             ns,
             db,
             params,
+            #[cfg(feature = "auth")]
+            auth: None,
             step_budget: 250_000,
             tx_overlay: None,
             in_event: false,
@@ -252,10 +256,111 @@ impl<'a> ExecContext<'a> {
         Ok(())
     }
 
+    #[cfg(feature = "auth")]
+    fn check_rbac(&self, stmt: &Statement) -> Result<()> {
+        let Some(ref auth) = self.auth else {
+            return Ok(()); // Trusted embedded system execution
+        };
+        if auth.is_system() {
+            return Ok(());
+        }
+        match stmt {
+            // Read-only statements
+            Statement::Select { .. }
+            | Statement::InfoForDb
+            | Statement::InfoForTable(_)
+            | Statement::Return(_)
+            | Statement::ShowChanges { .. }
+            | Statement::LiveSelect { .. }
+            | Statement::Kill { .. }
+            | Statement::Begin
+            | Statement::Commit
+            | Statement::Cancel
+            | Statement::Sleep(_)
+            | Statement::Let { .. }
+            | Statement::Use { .. } => {
+                if !auth.can_read(&self.ns, &self.db) {
+                    return Err(anyhow!(
+                        "IAM Violation: insufficient permissions to read in {}/{}",
+                        self.ns,
+                        self.db
+                    ));
+                }
+            }
+            // Data mutations (Owner, Editor, or Record subject to table PERMISSIONS)
+            Statement::Create { .. }
+            | Statement::Insert { .. }
+            | Statement::Update { .. }
+            | Statement::Upsert { .. }
+            | Statement::Delete { .. }
+            | Statement::Relate { .. }
+            | Statement::If { .. }
+            | Statement::For { .. }
+            | Statement::Throw(_) => {
+                if !auth.can_write_data(&self.ns, &self.db) {
+                    return Err(anyhow!(
+                        "IAM Violation: VIEWER/anonymous cannot mutate data in {}/{}",
+                        self.ns,
+                        self.db
+                    ));
+                }
+            }
+            // IAM Admin DDL (OWNER only)
+            Statement::DefineUser { .. } | Statement::DefineAccess { .. } => {
+                if !auth.can_admin_iam(&self.ns, &self.db) {
+                    return Err(anyhow!(
+                        "IAM Violation: OWNER role required for user/access administration"
+                    ));
+                }
+            }
+            Statement::Remove { kind, .. }
+                if matches!(kind.to_ascii_uppercase().as_str(), "USER" | "ACCESS") =>
+            {
+                if !auth.can_admin_iam(&self.ns, &self.db) {
+                    return Err(anyhow!(
+                        "IAM Violation: OWNER role required to remove {}",
+                        kind
+                    ));
+                }
+            }
+            // Schema DDL (OWNER or EDITOR)
+            _ => {
+                if !auth.can_define_schema(&self.ns, &self.db) {
+                    return Err(anyhow!(
+                        "IAM Violation: OWNER or EDITOR role required for schema DDL in {}/{}",
+                        self.ns,
+                        self.db
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn execute_all(&mut self, stmts: &[Statement]) -> Result<Vec<Value>> {
         let _ = self.load_persistent_params();
+        #[cfg(feature = "auth")]
+        if let Some(ref auth) = self.auth {
+            if let Some(ref actor) = auth.actor {
+                self.params
+                    .entry("auth".into())
+                    .or_insert_with(|| Value::String(actor.clone()));
+            }
+            if let Some(ref claims) = auth.token_claims {
+                self.params
+                    .entry("token".into())
+                    .or_insert_with(|| Value::from_json(claims));
+            }
+            if let Some(ref ac) = auth.access_name {
+                self.params
+                    .entry("access".into())
+                    .or_insert_with(|| Value::String(ac.clone()));
+            }
+        }
         let mut last = Vec::new();
         for stmt in stmts {
+            #[cfg(feature = "auth")]
+            self.check_rbac(stmt)?;
             match self.execute_one(stmt) {
                 Ok(res) => last = res,
                 Err(e) => {
@@ -1338,22 +1443,47 @@ impl<'a> ExecContext<'a> {
                     Err(anyhow!("Enable feature 'auth' to use DEFINE USER"))
                 }
             }
-            Statement::DefineAccess { name, access_type } => {
+            Statement::DefineAccess {
+                name,
+                level,
+                access_type,
+                jwt_alg,
+                jwt_key,
+                signup_sql,
+                signin_sql,
+                duration_session,
+            } => {
                 #[cfg(feature = "auth")]
                 {
                     crate::auth::save_access(
                         self.storage,
                         &self.ns,
                         &self.db,
-                        name,
-                        access_type,
-                        None,
+                        crate::auth::AccessMeta {
+                            name: name.clone(),
+                            level: level.clone(),
+                            access_type: access_type.clone(),
+                            jwt_alg: jwt_alg.clone(),
+                            jwt_key: jwt_key.clone(),
+                            signup_sql: signup_sql.clone(),
+                            signin_sql: signin_sql.clone(),
+                            duration_session: duration_session.clone(),
+                        },
                     )?;
                     Ok(Vec::new())
                 }
                 #[cfg(not(feature = "auth"))]
                 {
-                    let _ = (name, access_type);
+                    let _ = (
+                        name,
+                        level,
+                        access_type,
+                        jwt_alg,
+                        jwt_key,
+                        signup_sql,
+                        signin_sql,
+                        duration_session,
+                    );
                     Err(anyhow!("Enable feature 'auth' to use DEFINE ACCESS"))
                 }
             }

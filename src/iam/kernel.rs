@@ -1,8 +1,13 @@
+use nexus_db::auth::{AuthContext, AuthLevel, Role};
+use nexus_db::parser::{parse_surql, Statement};
+use nexus_db::Value as DbValue;
 use nu_protocol::{ShellError, Span};
 use std::sync::Arc;
-use crate::db::Database;
-use nexus_db::Value as DbValue;
 
+use crate::db::Database;
+
+/// AST- & RBAC-backed SecurityKernel enforcing SurrealDB-compatible `OWNER` / `EDITOR` / `VIEWER`
+/// policies across shell commands, SQL execution, and JS workloads.
 pub struct SecurityKernel {
     db: Arc<Database>,
 }
@@ -12,71 +17,109 @@ impl SecurityKernel {
         Self { db }
     }
 
-    /// Check if a command execution is allowed based on user, command, and arguments.
-    /// This is the "Deep Granularity" interceptor.
+    /// Resolve a user's `AuthContext` from `nexus-db` (`user.active_role`).
+    pub async fn resolve_auth_context(&self, username: &str, ns: &str, db_name: &str) -> AuthContext {
+        let role_id = if let Ok(response) = self
+            .db
+            .client
+            .query("SELECT VALUE active_role FROM user WHERE username = $user")
+            .bind(("user", username.to_string()))
+            .await
+        {
+            match response.take_values().into_iter().next() {
+                Some(DbValue::RecordId { tb, id }) => format!("{}:{}", tb, id),
+                Some(v) => v.display_compact(),
+                None => "role:viewer".to_string(),
+            }
+        } else {
+            "role:viewer".to_string()
+        };
+
+        let clean = role_id.replace('"', "").replace(' ', "").to_ascii_lowercase();
+        let role = if clean.contains("owner") || clean.contains("admin") {
+            Role::Owner
+        } else if clean.contains("editor") {
+            Role::Editor
+        } else {
+            Role::Viewer
+        };
+
+        AuthContext {
+            level: AuthLevel::Database(ns.to_string(), db_name.to_string()),
+            roles: vec![role],
+            actor: Some(username.to_string()),
+            access_name: None,
+            token_claims: None,
+        }
+    }
+
+    /// AST-based policy check for CLI/gateway command invocations.
     pub async fn check_policy(
         &self,
         username: String,
         command_name: &str,
         args: Vec<String>,
-        _span: Span,
+        span: Span,
     ) -> Result<(), ShellError> {
-        // 1. Fetch User and Role from DB
-        let response = self.db.client.query("SELECT VALUE active_role FROM user WHERE username = $user")
-            .bind(("user", username))
-            .await
-            .map_err(|e| crate::shell_err(
-                "IAM Kernel Error",
-                format!("Failed to fetch user policy: {}", e),
-                Some(_span),
-                None,
-            ))?;
+        let auth = self.resolve_auth_context(&username, "nexus", "system").await;
 
-        let role_val: Option<DbValue> = response.take_values().into_iter().next();
-
-        // Convert role_val to string for comparison (e.g. "role:admin")
-        let role_id = match role_val {
-            Some(DbValue::RecordId { tb, id }) => format!("{}:{}", tb, id),
-            Some(v) => v.display_compact(),
-            None => "role:guest".to_string(),
-        };
-
-        // Normalize string for comparison (remove quotes and variants if any)
-        // RecordId formatter might return Table("role"):String("admin") or similar in debug
-        // We want a clean "role:admin" or "role:guest"
-        let role_id = role_id.replace("\"", "").replace(" ", "");
-
-        // 2. Mock Policy Logic for Prototype
-        
-        // Example: Content-Based Blocking for SQL
         if command_name == "sql" {
             for arg in &args {
-                let upper = arg.to_uppercase();
-                // Check if it's admin. We handle various debug formats (e.g. role:String(admin) vs role:admin)
-                let is_admin = role_id.contains("role:admin") || role_id.contains("admin");
-
-                if (upper.contains("DROP") || upper.contains("DELETE")) && !is_admin {
-                    return Err(crate::shell_err(
-                        "Security Violation",
-                        format!("Destructive SQL operations are restricted to Administrators. (Role Found: {})", role_id),
-                        Some(_span),
-                        Some("Contact your system administrator for elevation.".into()),
-                    ));
+                if let Ok(stmts) = parse_surql(arg) {
+                    for stmt in &stmts {
+                        match stmt {
+                            Statement::Delete { .. }
+                            | Statement::Remove { .. }
+                            | Statement::DefineUser { .. }
+                            | Statement::DefineAccess { .. } => {
+                                if !auth.can_admin_iam("nexus", "system") {
+                                    return Err(crate::shell_err(
+                                        "Security Violation (RBAC)",
+                                        format!(
+                                            "Destructive/IAM SQL statement requires OWNER role (actor: {}, roles: {:?}).",
+                                            username, auth.roles
+                                        ),
+                                        Some(span),
+                                        Some("Authenticate with an OWNER account or JWT `rl: [\"Owner\"]`.".into()),
+                                    ));
+                                }
+                            }
+                            Statement::Create { .. }
+                            | Statement::Insert { .. }
+                            | Statement::Update { .. }
+                            | Statement::Upsert { .. }
+                            | Statement::Relate { .. } => {
+                                if !auth.can_write_data("nexus", "system") {
+                                    return Err(crate::shell_err(
+                                        "Security Violation (RBAC)",
+                                        format!(
+                                            "Data mutation requires EDITOR or OWNER role (actor: {}, roles: {:?}).",
+                                            username, auth.roles
+                                        ),
+                                        Some(span),
+                                        None,
+                                    ));
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
                 }
             }
         }
 
-        // Example: Attribute-Based Blocking for JS (Resource isolation)
-        if command_name == "js" {
+        if command_name == "js" && !auth.can_write_data("nexus", "system") {
             for arg in &args {
-                let is_guest = role_id.contains("role:guest") || role_id.contains("guest");
-                let lower_arg = arg.to_lowercase();
-                if (lower_arg.contains("require") && lower_arg.contains("fs")) && is_guest {
+                let lower = arg.to_ascii_lowercase();
+                if lower.contains("require") && lower.contains("fs") {
                     return Err(crate::shell_err(
-                        "Security Violation",
-                        format!("Filesystem access from JS is restricted for Guest users. (Detected in: {}, Role: {})", arg, role_id),
-                        Some(_span),
-                        Some("Use --harden to run in an isolated scratchpad.".into()),
+                        "Security Violation (RBAC)",
+                        format!(
+                            "Filesystem access from JS requires EDITOR/OWNER role (actor: {}, roles: {:?}).",
+                            username, auth.roles
+                        ),
+                        Some(span),
+                        Some("Use --harden to run in an isolated Wasmtime Crystal cell.".into()),
                     ));
                 }
             }

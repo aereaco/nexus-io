@@ -170,6 +170,134 @@ impl NexusDb {
         )
     }
 
+    /// Sign in a user defined via `DEFINE USER` and issue a real HS256 JWT (`feature = "auth"`).
+    #[cfg(feature = "auth")]
+    pub fn signin_user(
+        &self,
+        ns: &str,
+        db: &str,
+        username: &str,
+        password: &str,
+    ) -> Result<(String, crate::auth::AuthContext)> {
+        let ns_clean = sanitize_ident(ns);
+        let db_clean = sanitize_ident(db);
+        let meta = crate::auth::authenticate_user(
+            self.storage.as_ref(),
+            &ns_clean,
+            &db_clean,
+            username,
+            password,
+        )?
+        .ok_or_else(|| anyhow::anyhow!("Invalid credentials for user '{}'", username))?;
+
+        let now = chrono::Utc::now().timestamp();
+        let claims = crate::auth::JwtClaims {
+            iss: Some("nexus-db".to_string()),
+            sub: Some(meta.name.clone()),
+            iat: Some(now),
+            exp: Some(now + 3600),
+            ns: if meta.level == "ROOT" {
+                None
+            } else {
+                Some(ns_clean.clone())
+            },
+            db: if meta.level == "DATABASE" {
+                Some(db_clean.clone())
+            } else {
+                None
+            },
+            rl: Some(meta.roles.clone()),
+            ..Default::default()
+        };
+        let token = crate::auth::issue_jwt(&claims, crate::auth::DEFAULT_JWT_SECRET)?;
+        let ctx = crate::auth::AuthContext::from_user(&meta, &ns_clean, &db_clean);
+        Ok((token, ctx))
+    }
+
+    /// Authenticate a JWT or revocable Bearer token (`feature = "auth"`).
+    #[cfg(feature = "auth")]
+    pub fn authenticate_token(
+        &self,
+        ns: &str,
+        db: &str,
+        token: &str,
+    ) -> Result<crate::auth::AuthContext> {
+        crate::auth::authenticate_token(
+            self.storage.as_ref(),
+            &sanitize_ident(ns),
+            &sanitize_ident(db),
+            token,
+        )
+    }
+
+    /// Issue a revocable `TYPE BEARER` grant (`feature = "auth"`).
+    #[cfg(feature = "auth")]
+    pub fn grant_bearer(
+        &self,
+        ns: &str,
+        db: &str,
+        access_name: &str,
+        subject: &str,
+        roles: Vec<String>,
+        ttl_secs: Option<i64>,
+    ) -> Result<(String, String)> {
+        crate::auth::grant_bearer(
+            self.storage.as_ref(),
+            &sanitize_ident(ns),
+            &sanitize_ident(db),
+            access_name,
+            subject,
+            roles,
+            ttl_secs,
+        )
+    }
+
+    /// Revoke a `TYPE BEARER` grant (`feature = "auth"`).
+    #[cfg(feature = "auth")]
+    pub fn revoke_bearer(
+        &self,
+        ns: &str,
+        db: &str,
+        access_name: &str,
+        grant_id: &str,
+    ) -> Result<bool> {
+        crate::auth::revoke_bearer(
+            self.storage.as_ref(),
+            &sanitize_ident(ns),
+            &sanitize_ident(db),
+            access_name,
+            grant_id,
+        )
+    }
+
+    /// Export all records in `(ns, db)` as replayable SurrealQL statements (`POST /export`).
+    pub fn export_surql(&self, ns: &str, db: &str) -> Result<String> {
+        let ns_clean = sanitize_ident(ns);
+        let db_clean = sanitize_ident(db);
+        let prefix = encode_key(crate::storage::PREFIX_RECORD, &[&ns_clean, &db_clean]);
+        let mut out = String::new();
+        out.push_str(&format!("USE NS {} DB {};\n", ns_clean, db_clean));
+        for (_, raw) in self.storage.scan_prefix(&prefix)? {
+            if let Ok(val) = crate::codec::decode_value(&raw) {
+                if let Value::Object(ref map) = val {
+                    if let Some(Value::RecordId { tb, id }) = map.get("id") {
+                        let json_str = serde_json::to_string(&val.to_json())?;
+                        out.push_str(&format!("UPSERT {}:`{}` CONTENT {};\n", tb, id, json_str));
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Import a SurrealQL dump into `(ns, db)` (`POST /import`).
+    pub fn import_surql(&self, ns: &str, db: &str, dump: &str) -> Result<usize> {
+        let stmts = parse_surql(dump)?;
+        let count = stmts.len();
+        let _ = self.query_scoped(ns, db, dump, vec![])?;
+        Ok(count)
+    }
+
     /// Subscribe to real-time `LIVE SELECT` notifications on `(ns, db, table)`.
     pub fn subscribe_live(
         &self,
@@ -208,6 +336,36 @@ impl NexusDb {
             sanitize_ident(db),
             params,
         );
+        #[cfg(feature = "ml")]
+        {
+            ctx.ml = Some(self.ml.as_ref());
+        }
+        if let Some(ref inv) = self.module_invoker {
+            ctx.module_invoker = Some(inv.as_ref());
+        }
+        ctx.execute_all(&stmts)
+    }
+
+    /// Execute SurrealQL statements with explicit RBAC / `$auth` enforcement (`feature = "auth"`).
+    #[cfg(feature = "auth")]
+    pub fn query_scoped_with_auth(
+        &self,
+        ns: &str,
+        db: &str,
+        surql: &str,
+        bindings: Vec<(String, Value)>,
+        auth: crate::auth::AuthContext,
+    ) -> Result<Vec<Value>> {
+        let stmts = parse_surql(surql)?;
+        let params: HashMap<String, Value> = bindings.into_iter().collect();
+        let mut ctx = ExecContext::new(
+            self.storage.as_ref(),
+            self.live.as_ref(),
+            sanitize_ident(ns),
+            sanitize_ident(db),
+            params,
+        );
+        ctx.auth = Some(auth);
         #[cfg(feature = "ml")]
         {
             ctx.ml = Some(self.ml.as_ref());
@@ -999,5 +1157,155 @@ mod tests {
         assert_eq!(resp[0], b'T'); // RowDescription
         assert!(resp.windows(5).any(|w| w == b"Alice"));
         assert_eq!(resp[resp.len() - 6], b'Z'); // ReadyForQuery
+    }
+
+    #[cfg(feature = "auth")]
+    #[test]
+    fn security_rbac_jwt_bearer_and_full_rpc_api_parity() {
+        let db = NexusDb::open_mem();
+
+        // 1. Real Argon2id password hashing
+        let hash = crate::auth::hash_password("s3cr3t!");
+        assert!(hash.starts_with("$argon2id$"), "expected Argon2id PHC hash, got {}", hash);
+        assert!(crate::auth::verify_password(&hash, "s3cr3t!"));
+        assert!(!crate::auth::verify_password(&hash, "wrong"));
+
+        // 2. Define OWNER, EDITOR, VIEWER users + JWT & RECORD access
+        db.query_scoped(
+            "sec",
+            "prod",
+            "DEFINE USER root_admin ON DATABASE PASSWORD 'ownerpass' ROLES OWNER;
+             DEFINE USER app_editor ON DATABASE PASSWORD 'editorpass' ROLES EDITOR;
+             DEFINE USER readonly_user ON DATABASE PASSWORD 'viewerpass' ROLES VIEWER;
+             DEFINE ACCESS ext_jwt ON DATABASE TYPE JWT ALGORITHM HS256 KEY 'super-secret-jwt-key';
+             DEFINE ACCESS account ON DATABASE TYPE RECORD
+               SIGNUP ( CREATE acct SET email = $email )
+               SIGNIN ( SELECT * FROM acct WHERE email = $email );
+             DEFINE FUNCTION fn::triple($x: int) { RETURN $x * 3; };",
+            vec![],
+        )
+        .unwrap();
+
+        // 3. Signin issues real HS256 JWT; tampered JWT is rejected
+        let (owner_jwt, owner_ctx) = db.signin_user("sec", "prod", "root_admin", "ownerpass").unwrap();
+        let (editor_jwt, editor_ctx) = db.signin_user("sec", "prod", "app_editor", "editorpass").unwrap();
+        let (viewer_jwt, viewer_ctx) = db.signin_user("sec", "prod", "readonly_user", "viewerpass").unwrap();
+
+        assert!(db.authenticate_token("sec", "prod", &owner_jwt).is_ok());
+        assert!(db.authenticate_token("sec", "prod", &format!("{}x", owner_jwt)).is_err());
+
+        // 4. RBAC enforcement:
+        // OWNER can write & create users
+        db.query_scoped_with_auth(
+            "sec",
+            "prod",
+            "CREATE doc:1 SET title = 'classified';",
+            vec![],
+            owner_ctx.clone(),
+        )
+        .unwrap();
+        // VIEWER can read, but CANNOT mutate or define users
+        let read_rows = db
+            .query_scoped_with_auth("sec", "prod", "SELECT VALUE title FROM doc:1;", vec![], viewer_ctx.clone())
+            .unwrap();
+        assert_eq!(read_rows, vec![Value::String("classified".into())]);
+        assert!(db
+            .query_scoped_with_auth("sec", "prod", "CREATE doc:2 SET title = 'nope';", vec![], viewer_ctx)
+            .is_err());
+        // EDITOR can mutate data & schema, but CANNOT DEFINE USER (OWNER-only IAM)
+        db.query_scoped_with_auth("sec", "prod", "UPDATE doc:1 SET title = 'edited';", vec![], editor_ctx.clone())
+            .unwrap();
+        assert!(db
+            .query_scoped_with_auth(
+                "sec",
+                "prod",
+                "DEFINE USER rogue ON DATABASE PASSWORD 'x' ROLES OWNER;",
+                vec![],
+                editor_ctx,
+            )
+            .is_err());
+
+        // 5. External JWT with custom `rl` claim (defaults to Viewer if omitted)
+        let custom_jwt = crate::auth::issue_jwt(
+            &crate::auth::JwtClaims {
+                sub: Some("svc-bot".into()),
+                ns: Some("sec".into()),
+                db: Some("prod".into()),
+                rl: None, // Omitted `rl` MUST default strictly to Viewer
+                ..Default::default()
+            },
+            "super-secret-jwt-key",
+        )
+        .unwrap();
+        let custom_ctx = db.authenticate_token("sec", "prod", &custom_jwt).unwrap();
+        assert_eq!(custom_ctx.roles, vec![crate::auth::Role::Viewer]);
+
+        // 6. Revocable TYPE BEARER grant lifecycle
+        let (grant_id, bearer_tok) = db
+            .grant_bearer("sec", "prod", "m2m", "worker-1", vec!["EDITOR".into()], Some(3600))
+            .unwrap();
+        let bearer_ctx = db.authenticate_token("sec", "prod", &bearer_tok).unwrap();
+        assert!(bearer_ctx.can_write_data("sec", "prod"));
+        assert!(db.revoke_bearer("sec", "prod", "m2m", &grant_id).unwrap());
+        assert!(db.authenticate_token("sec", "prod", &bearer_tok).is_err());
+
+        // 7. Full SurrealDB RPC protocol parity (signin, authenticate, invalidate, insert, relate, patch, run, live, export/import)
+        let mut rpc = db.rpc_session("sec", "prod");
+        let auth_resp: serde_json::Value = serde_json::from_str(&rpc.handle_json(
+            &serde_json::json!({"id": 1, "method": "authenticate", "params": [editor_jwt]}).to_string(),
+        ))
+        .unwrap();
+        assert!(auth_resp["error"].is_null());
+
+        // insert + relate + patch + run
+        let ins: serde_json::Value = serde_json::from_str(&rpc.handle_json(
+            r#"{"id":2,"method":"insert","params":["node",[{"id":"node:a","v":1},{"id":"node:b","v":2}]]}"#,
+        ))
+        .unwrap();
+        assert_eq!(ins["result"].as_array().unwrap().len(), 2);
+
+        let rel: serde_json::Value = serde_json::from_str(&rpc.handle_json(
+            r#"{"id":3,"method":"relate","params":["node:a","links","node:b",{"w":5}]}"#,
+        ))
+        .unwrap();
+        assert!(rel["error"].is_null());
+
+        let patched: serde_json::Value = serde_json::from_str(&rpc.handle_json(
+            r#"{"id":4,"method":"patch","params":["doc:1",[{"op":"replace","path":"/title","value":"patched"}]]}"#,
+        ))
+        .unwrap();
+        assert_eq!(patched["result"][0]["title"], "patched");
+
+        let ran: serde_json::Value = serde_json::from_str(&rpc.handle_json(
+            r#"{"id":5,"method":"run","params":["fn::triple",[7]]}"#,
+        ))
+        .unwrap();
+        assert_eq!(ran["result"], 21);
+
+        // live + drain_live_notifications
+        let live_r: serde_json::Value = serde_json::from_str(&rpc.handle_json(
+            r#"{"id":6,"method":"live","params":["doc"]}"#,
+        ))
+        .unwrap();
+        let live_id = live_r["result"].as_str().unwrap().to_string();
+        let _ = rpc.handle_json(r#"{"id":7,"method":"create","params":["doc:live1",{"title":"hi"}]}"#);
+        let frames = rpc.drain_live_notifications();
+        assert!(!frames.is_empty());
+        let _ = rpc.handle_json(&serde_json::json!({"id":8,"method":"kill","params":[live_id]}).to_string());
+
+        // export & import
+        let dump = db.export_surql("sec", "prod").unwrap();
+        assert!(dump.contains("UPSERT doc:`1` CONTENT"));
+        let db2 = NexusDb::open_mem();
+        assert!(db2.import_surql("sec", "prod", &dump).unwrap() >= 2);
+
+        // invalidate blocks further reads/writes
+        let _ = rpc.handle_json(r#"{"id":9,"method":"invalidate","params":[]}"#);
+        let blocked: serde_json::Value = serde_json::from_str(&rpc.handle_json(
+            r#"{"id":10,"method":"select","params":["doc"]}"#,
+        ))
+        .unwrap();
+        assert!(blocked["error"].is_object());
+        let _ = viewer_jwt;
     }
 }

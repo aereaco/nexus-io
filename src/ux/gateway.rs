@@ -201,15 +201,42 @@ impl UxGateway {
             // Static PWA files
             .push(Router::with_path("/").get(serve_static))
             
-            // WebSocket Signal Hub (SurrealDB LIVE queries)
+            // WebSocket & HTTP JSON-RPC / CBOR Signal Hub (SurrealDB SDK wire protocol)
             .push({
                 let db = self.db.clone();
                 let ws_handler = WebSocketHandler { db: db.clone() };
+                let http_rpc = crate::ux::surreal_http::SurrealHttpRpcHandler { db: db.clone() };
                 let iam = crate::ux::iam::IamMiddleware { db };
                 Router::with_path("/rpc")
                     .hoop(iam)
                     .get(ws_handler)
+                    .post(http_rpc)
             })
+            // SurrealDB-compatible HTTP REST API (/sql, /signin, /signup, /export, /import, /key, /api)
+            .push(Router::with_path("/sql").post(crate::ux::surreal_http::SurrealSqlHandler { db: self.db.clone() }))
+            .push(Router::with_path("/signin").post(crate::ux::surreal_http::SurrealAuthHandler { db: self.db.clone(), is_signup: false }))
+            .push(Router::with_path("/signup").post(crate::ux::surreal_http::SurrealAuthHandler { db: self.db.clone(), is_signup: true }))
+            .push(Router::with_path("/export")
+                .get(crate::ux::surreal_http::SurrealExportImportHandler { db: self.db.clone(), is_import: false })
+                .post(crate::ux::surreal_http::SurrealExportImportHandler { db: self.db.clone(), is_import: false }))
+            .push(Router::with_path("/import").post(crate::ux::surreal_http::SurrealExportImportHandler { db: self.db.clone(), is_import: true }))
+            .push(Router::with_path("/key/<table:str>")
+                .get(crate::ux::surreal_http::SurrealKeyHandler { db: self.db.clone() })
+                .post(crate::ux::surreal_http::SurrealKeyHandler { db: self.db.clone() })
+                .delete(crate::ux::surreal_http::SurrealKeyHandler { db: self.db.clone() }))
+            .push(Router::with_path("/key/<table:str>/<id:str>")
+                .get(crate::ux::surreal_http::SurrealKeyHandler { db: self.db.clone() })
+                .put(crate::ux::surreal_http::SurrealKeyHandler { db: self.db.clone() })
+                .patch(crate::ux::surreal_http::SurrealKeyHandler { db: self.db.clone() })
+                .delete(crate::ux::surreal_http::SurrealKeyHandler { db: self.db.clone() }))
+            .push(Router::with_path("/api/<ns:str>/<db:str>/<**path>")
+                .get(crate::ux::surreal_http::SurrealCustomApiHandler { db: self.db.clone() })
+                .post(crate::ux::surreal_http::SurrealCustomApiHandler { db: self.db.clone() })
+                .put(crate::ux::surreal_http::SurrealCustomApiHandler { db: self.db.clone() })
+                .delete(crate::ux::surreal_http::SurrealCustomApiHandler { db: self.db.clone() }))
+            .push(Router::with_path("/status").get(crate::ux::surreal_http::surreal_status))
+            .push(Router::with_path("/ready").get(crate::ux::surreal_http::surreal_ready))
+            .push(Router::with_path("/version").get(crate::ux::surreal_http::surreal_version))
             
             // S3 Proxy (browser-friendly)
             .push({

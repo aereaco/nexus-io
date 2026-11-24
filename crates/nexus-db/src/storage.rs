@@ -30,6 +30,7 @@ pub const PREFIX_PARAM_META: u8 = 0x14;
 pub const PREFIX_SEQUENCE_META: u8 = 0x15;
 pub const PREFIX_API_META: u8 = 0x16;
 pub const PREFIX_MODULE_META: u8 = 0x17;
+pub const PREFIX_BEARER_GRANT: u8 = 0x18;
 
 /// Build a `\x00`-delimited ordered binary key for prefix scans.
 pub fn encode_key(prefix: u8, parts: &[&str]) -> Vec<u8> {

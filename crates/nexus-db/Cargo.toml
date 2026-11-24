@@ -10,7 +10,7 @@ default = ["fts", "vector", "files", "auth"]
 fts = []
 vector = []
 files = []
-auth = []
+auth = ["dep:argon2", "dep:hmac", "dep:sha2", "dep:base64", "dep:subtle"]
 geo = []
 crypto = ["dep:blake3"]
 cbor = []
@@ -22,9 +22,14 @@ full = ["fts", "vector", "files", "auth", "geo", "crypto", "cbor", "graphql", "m
 
 [dependencies]
 anyhow = "1.0"
+argon2 = { version = "0.5", optional = true }
+base64 = { version = "0.22", optional = true }
 blake3 = { version = "1.5", optional = true }
 chrono = { version = "0.4", features = ["serde"] }
+hmac = { version = "0.12", optional = true }
 redb = "2.4"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+sha2 = { version = "0.10", optional = true }
+subtle = { version = "2.6", optional = true }
 uuid = { version = "1.6", features = ["v4"] }

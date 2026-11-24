@@ -1,5 +1,6 @@
 pub mod gateway;
 pub mod surreal_ws;
+pub mod surreal_http;
 pub mod s3_proxy;
 pub mod cell_router;
 pub mod iam;

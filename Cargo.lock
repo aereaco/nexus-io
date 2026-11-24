@@ -6500,11 +6500,16 @@ name = "nexus-db"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "argon2",
+ "base64 0.22.1",
  "blake3",
  "chrono",
+ "hmac 0.12.1",
  "redb 2.6.4",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
+ "subtle",
  "uuid",
 ]
 
