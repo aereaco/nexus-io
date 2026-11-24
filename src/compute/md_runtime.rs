@@ -1,9 +1,14 @@
 use anyhow::Result;
+use nu_engine::CallExt;
+use nu_protocol::engine::{Call, Command, EngineState, Stack};
+use nu_protocol::{Category, PipelineData, ShellError, Signature, SyntaxShape, Value};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::db::sql_compiler::compile_sqlite_to_surql;
-use crate::db::StateEngine;
+use crate::db::{Database, StateEngine};
 use crate::js::cell::{CellManager, CellPolicy};
+use crate::storage::BlobBridge;
 
 /// Declarative backend `SystemNode` parsed from a Markdown (`.md`) service file.
 #[derive(Debug, Clone)]
@@ -187,6 +192,73 @@ pub async fn deploy_markdown(
     }
 
     Ok(nodes)
+}
+
+/// Nushell/CLI command: `cell deploy <path.md>` — deploys a declarative Markdown service file
+/// onto `CellManager` and `StateEngine`.
+#[derive(Clone)]
+pub struct CellDeployCommand {
+    pub db: Arc<Database>,
+    pub bridge: Arc<BlobBridge>,
+}
+
+impl Command for CellDeployCommand {
+    fn name(&self) -> &str {
+        "cell deploy"
+    }
+
+    fn description(&self) -> &str {
+        "Deploy a declarative Markdown (.md) service file into Nexus-IO cells"
+    }
+
+    fn signature(&self) -> Signature {
+        Signature::build("cell deploy")
+            .required("path", SyntaxShape::String, "Path to the .md service file")
+            .category(Category::Custom("nexus".into()))
+    }
+
+    fn run(
+        &self,
+        engine_state: &EngineState,
+        stack: &mut Stack,
+        call: &Call,
+        _input: PipelineData,
+    ) -> Result<PipelineData, ShellError> {
+        let span = call.head;
+        let path: String = call.req(engine_state, stack, 0)?;
+        let md_source = std::fs::read_to_string(&path).map_err(|e| {
+            crate::shell_err(
+                "Cell Deploy IO Error",
+                format!("Failed to read '{}': {}", path, e),
+                Some(span),
+                None,
+            )
+        })?;
+
+        let db = self.db.clone();
+        let bridge = self.bridge.clone();
+        let nodes = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async move {
+                let manager = CellManager::new(db.clone(), bridge);
+                deploy_markdown(&manager, db.as_ref(), &md_source).await
+            })
+        })
+        .map_err(|e| {
+            crate::shell_err(
+                "Cell Deploy Error",
+                e.to_string(),
+                Some(span),
+                None,
+            )
+        })?;
+
+        let summary: Vec<String> = nodes
+            .iter()
+            .map(|n| format!("{}/{} ({})", n.app, n.cell_id, n.name))
+            .collect();
+        let msg = format!("✅ Deployed {} cell(s): {}", nodes.len(), summary.join(", "));
+        Ok(PipelineData::Value(Value::string(msg, span), None))
+    }
 }
 
 #[cfg(test)]

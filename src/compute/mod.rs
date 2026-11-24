@@ -6,6 +6,7 @@ pub mod grid_command;
 pub mod run_command;
 pub mod md_runtime;
 pub mod analytics;
+pub mod crystal;
 
 pub use telemetry::NodeResources;
 pub use router::{InferenceRouter, ComputeRequirements};

@@ -225,10 +225,11 @@ impl UxGateway {
                     .head(s3_handler)
             })
             
-            // Unified Cell Ingress (/cells/<app>/<cell_id> - HTTP & WebSocket)
+            // Unified Cell Ingress (/cells/<app>/<cell_id> & POST /cells/deploy-md)
             .push({
                 let db = self.db.clone();
                 let cell_handler = CellGatewayHandler {
+                    db: db.clone(),
                     cells: self.cells.clone(),
                 };
                 let iam = crate::ux::iam::IamMiddleware { db };

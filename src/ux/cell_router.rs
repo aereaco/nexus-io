@@ -4,13 +4,16 @@ use salvo::prelude::*;
 use salvo::websocket::{Message, WebSocketUpgrade};
 use std::sync::Arc;
 
+use crate::compute::md_runtime::deploy_markdown;
+use crate::db::Database;
 use crate::js::cell::{CellManager, CellPolicy};
 
-/// HTTP & WebSocket ingress handler for `/cells/<**path>` (`/cells/<app>/<cell_id>`).
+/// HTTP & WebSocket ingress handler for `/cells/<**path>` (`/cells/<app>/<cell_id>` and `POST /cells/deploy-md`).
 /// Supports deploying/waking `pinned` or `elastic` (`celld`) cells, evaluating requests,
-/// WebSocket message routing, and explicit hibernation.
+/// WebSocket message routing, declarative `.md` deployment, and explicit hibernation.
 #[derive(Clone)]
 pub struct CellGatewayHandler {
+    pub db: Arc<Database>,
     pub cells: Arc<CellManager>,
 }
 
@@ -49,6 +52,33 @@ impl Handler for CellGatewayHandler {
         res: &mut Response,
         _ctrl: &mut FlowCtrl,
     ) {
+        // POST /cells/deploy-md -> deploy declarative Markdown (.md) service nodes directly
+        if req.method() == &Method::POST && req.uri().path().trim_end_matches('/') == "/cells/deploy-md" {
+            let md = match req.payload().await {
+                Ok(bytes) => String::from_utf8_lossy(bytes).to_string(),
+                Err(e) => {
+                    res.status_code(StatusCode::BAD_REQUEST);
+                    res.render(Text::Plain(format!("Failed to read markdown body: {}", e)));
+                    return;
+                }
+            };
+            match deploy_markdown(&self.cells, self.db.as_ref(), &md).await {
+                Ok(nodes) => {
+                    let deployed: Vec<serde_json::Value> = nodes
+                        .into_iter()
+                        .map(|n| serde_json::json!({ "app": n.app, "cell_id": n.cell_id, "name": n.name }))
+                        .collect();
+                    res.status_code(StatusCode::OK);
+                    res.render(Json(serde_json::json!({ "deployed": deployed })));
+                }
+                Err(e) => {
+                    res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+                    res.render(Text::Plain(format!("Markdown deploy error: {}", e)));
+                }
+            }
+            return;
+        }
+
         let Some((app, cell_id)) = parse_cell_path(req.uri().path()) else {
             res.status_code(StatusCode::BAD_REQUEST);
             res.render(Text::Plain("Invalid cell path. Use: /cells/<app>/<cell_id>"));

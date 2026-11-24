@@ -21,9 +21,11 @@ nu-command = { version = "0.117.0", features = ["os", "network", "rand", "sqlite
 nu-parser = "0.117.0"
 nu-cmd-lang = "0.117.0"
 
-# 3. The Trampoline (Pure-Rust JS + Native TS via OXC)
+# 3. The Trampoline (Pure-Rust JS + Native TS via OXC + Wasmtime Crystal Cells)
 # Tier A: Pure-Rust Universal JS Baseline (Windows, Linux, macOS, Android, iOS W^X compliant)
 quickrs-core = "0.16.2"
+# Tier B: Crystal Cells (Wasmtime AOT runtime on all platforms; Cranelift JIT/AOT compiler on non-iOS)
+wasmtime = { version = "51.0.0", default-features = false, features = ["runtime"] }
 
 # Tier S: Native TypeScript (OXC)
 oxc_allocator = { version = "0.144.0", features = ["serialize"] }
@@ -71,6 +73,9 @@ uuid = { version = "1.6", features = ["v4"] }
 toml = "0.8"
 rusqlite = { version = "0.41.1", features = ["bundled"] }
 get_if_addrs = "0.5.3"
+
+[target.'cfg(not(target_os = "ios"))'.dependencies]
+wasmtime = { version = "51.0.0", default-features = false, features = ["cranelift", "runtime", "wat"] }
 
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 nu-cli = "0.117.0"
