@@ -7,6 +7,7 @@ name = "nexus"
 version = "0.1.0"
 description = "Nexus-IO Sovereign Binary"
 edition = "2021"
+license = "MIT"
 
 [lib]
 name = "nexus_io"
