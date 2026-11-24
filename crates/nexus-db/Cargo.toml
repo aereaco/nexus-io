@@ -2,11 +2,21 @@
 name = "nexus-db"
 version = "0.1.0"
 edition = "2021"
-description = "Clean-room, ultra-low-footprint SurrealQL-compatible embedded multi-model database (Synchronous Volcano Engine on redb)"
+description = "Clean-room, MIT-licensed, ultra-low-footprint SurrealQL-compatible embedded multi-model database (Synchronous Volcano Engine on redb)"
 license = "MIT"
+
+[features]
+default = ["fts", "vector"]
+fts = []
+vector = []
+geo = []
+crypto = ["dep:blake3"]
+cbor = []
+full = ["fts", "vector", "geo", "crypto", "cbor"]
 
 [dependencies]
 anyhow = "1.0"
+blake3 = { version = "1.5", optional = true }
 chrono = { version = "0.4", features = ["serde"] }
 redb = "2.4"
 serde = { version = "1.0", features = ["derive"] }

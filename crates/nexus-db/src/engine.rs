@@ -5,17 +5,18 @@ use uuid::Uuid;
 
 use crate::live::{LiveAction, LiveBroker};
 use crate::parser::{
-    BinaryOp, Expr, GraphDir, GraphHop, IndexKind, MutationData, Projection, Statement, Target,
-    UnaryOp, VectorMetric,
+    BinaryOp, Expr, GraphDir, GraphHop, IndexKind, MutationData, Projection, ReturnMode, Statement,
+    Target, UnaryOp,
 };
-use crate::stdlib::{
-    cosine_similarity, euclidean_distance, eval_stdlib, manhattan_distance, tokenize_fts,
-    value_to_vec,
-};
+#[cfg(not(feature = "vector"))]
+use crate::parser::VectorMetric;
+use crate::stdlib::{eval_stdlib, tokenize_fts, value_to_vec};
+#[cfg(not(feature = "vector"))]
+use crate::stdlib::{cosine_similarity, euclidean_distance, manhattan_distance};
 use crate::storage::{
     encode_key, BatchOp, StorageBackend, PREFIX_EDGE_IN, PREFIX_EDGE_OUT, PREFIX_EVENT_META,
-    PREFIX_FIELD_META, PREFIX_FTS, PREFIX_INDEX, PREFIX_INDEX_META, PREFIX_RECORD,
-    PREFIX_TABLE_META, PREFIX_VEC,
+    PREFIX_FIELD_META, PREFIX_FTS, PREFIX_FUNCTION_META, PREFIX_INDEX, PREFIX_INDEX_META,
+    PREFIX_RECORD, PREFIX_TABLE_META, PREFIX_VEC,
 };
 use crate::value::Value;
 
@@ -31,7 +32,8 @@ struct TableMeta {
 struct FieldMeta {
     name: String,
     field_type: Option<String>,
-    assert_sql: Option<String>,
+    assert_expr: Option<Expr>,
+    default_expr: Option<Expr>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -44,8 +46,15 @@ struct IndexMeta {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct EventMeta {
     name: String,
-    when_sql: String,
-    then_sql: String,
+    when_expr: Expr,
+    then_stmt: Statement,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FunctionMeta {
+    name: String,
+    params: Vec<String>,
+    body: Expr,
 }
 
 /// Volcano-style synchronous iterator yielding document rows.
@@ -103,6 +112,8 @@ pub struct ExecContext<'a> {
     pub params: HashMap<String, Value>,
     pub step_budget: usize,
     tx_buffer: Option<Vec<BatchOp>>,
+    in_event: bool,
+    last_fts_score: f64,
 }
 
 impl<'a> ExecContext<'a> {
@@ -121,6 +132,8 @@ impl<'a> ExecContext<'a> {
             params,
             step_budget: 250_000,
             tx_buffer: None,
+            in_event: false,
+            last_fts_score: 0.0,
         }
     }
 
@@ -210,8 +223,37 @@ impl<'a> ExecContext<'a> {
         Ok(out)
     }
 
-    fn validate_schema(&self, tb: &str, obj: &BTreeMap<String, Value>) -> Result<()> {
+    fn load_events(&self, tb: &str) -> Result<Vec<EventMeta>> {
+        let pfx = encode_key(PREFIX_EVENT_META, &[&self.ns, &self.db, tb]);
+        let mut out = Vec::new();
+        for (_, raw) in self.storage.scan_prefix(&pfx)? {
+            out.push(serde_json::from_slice(&raw)?);
+        }
+        Ok(out)
+    }
+
+    fn load_function(&self, name: &str) -> Result<Option<FunctionMeta>> {
+        let key = encode_key(PREFIX_FUNCTION_META, &[&self.ns, &self.db, name]);
+        if let Some(raw) = self.storage.get(&key)? {
+            return Ok(Some(serde_json::from_slice(&raw)?));
+        }
+        Ok(None)
+    }
+
+    fn apply_defaults_and_validate(&self, tb: &str, obj: &mut BTreeMap<String, Value>) -> Result<()> {
         let fields = self.load_fields(tb)?;
+
+        // 1. Apply DEFAULT expressions for missing fields
+        for f in &fields {
+            if !obj.contains_key(&f.name) {
+                if let Some(ref def_expr) = f.default_expr {
+                    let val = self.eval_expr(def_expr, None, 0)?;
+                    obj.insert(f.name.clone(), val);
+                }
+            }
+        }
+
+        // 2. SCHEMAFULL check
         if let Some(meta) = self.load_table_meta(tb)? {
             if meta.schemafull {
                 let allowed: Vec<&str> = fields.iter().map(|f| f.name.as_str()).collect();
@@ -226,18 +268,91 @@ impl<'a> ExecContext<'a> {
                 }
             }
         }
+
+        // 3. TYPE and ASSERT checks (binding `$value`)
         for f in &fields {
-            if let (Some(expected_ty), Some(val)) = (&f.field_type, obj.get(&f.name)) {
-                if !matches_field_type(val, expected_ty) {
-                    return Err(anyhow!(
-                        "Field '{}' on table '{}' expected type '{}', got {:?}",
-                        f.name,
-                        tb,
-                        expected_ty,
-                        val
-                    ));
+            if let Some(val) = obj.get(&f.name) {
+                if let Some(ref expected_ty) = f.field_type {
+                    if !matches_field_type(val, expected_ty) {
+                        return Err(anyhow!(
+                            "Field '{}' on table '{}' expected type '{}', got {:?}",
+                            f.name,
+                            tb,
+                            expected_ty,
+                            val
+                        ));
+                    }
+                }
+                if let Some(ref assert_expr) = f.assert_expr {
+                    let mut assert_params = self.params.clone();
+                    assert_params.insert("value".to_string(), val.clone());
+                    let sub_ctx = ExecContext::new(
+                        self.storage,
+                        self.live,
+                        self.ns.clone(),
+                        self.db.clone(),
+                        assert_params,
+                    );
+                    let ok = sub_ctx.eval_expr(assert_expr, None, 0)?.is_truthy();
+                    if !ok {
+                        return Err(anyhow!(
+                            "ASSERT constraint failed for field '{}' on table '{}'",
+                            f.name,
+                            tb
+                        ));
+                    }
                 }
             }
+        }
+        Ok(())
+    }
+
+    fn fire_events(
+        &mut self,
+        tb: &str,
+        event_kind: &str,
+        before: Option<Value>,
+        after: Option<Value>,
+    ) -> Result<()> {
+        if self.in_event {
+            return Ok(());
+        }
+        let events = self.load_events(tb)?;
+        if events.is_empty() {
+            return Ok(());
+        }
+        self.in_event = true;
+        let saved_params = self.params.clone();
+        let value_for_event = after.clone().or_else(|| before.clone()).unwrap_or(Value::None);
+        self.params
+            .insert("event".to_string(), Value::String(event_kind.to_string()));
+        self.params
+            .insert("before".to_string(), before.unwrap_or(Value::None));
+        self.params
+            .insert("after".to_string(), after.unwrap_or(Value::None));
+        self.params.insert("value".to_string(), value_for_event);
+
+        let mut err = None;
+        for ev in events {
+            match self.eval_expr(&ev.when_expr, None, 0) {
+                Ok(v) if v.is_truthy() => {
+                    if let Err(e) = self.execute_one(&ev.then_stmt) {
+                        err = Some(e);
+                        break;
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    err = Some(e);
+                    break;
+                }
+            }
+        }
+
+        self.params = saved_params;
+        self.in_event = false;
+        if let Some(e) = err {
+            return Err(e);
         }
         Ok(())
     }
@@ -251,7 +366,6 @@ impl<'a> ExecContext<'a> {
     ) -> Result<()> {
         let indexes = self.load_indexes(tb)?;
         for idx in indexes {
-            // Remove old index entries if updating
             if let Some(old) = old_row {
                 self.remove_index_entries(tb, rec_id, &idx, old)?;
             }
@@ -374,9 +488,10 @@ impl<'a> ExecContext<'a> {
         id: &str,
         mut obj: BTreeMap<String, Value>,
         action: LiveAction,
-    ) -> Result<Value> {
-        let old_map = match self.get_record(tb, id)? {
-            Some(Value::Object(m)) => Some(m),
+    ) -> Result<(Option<Value>, Value)> {
+        let old_val = self.get_record(tb, id)?;
+        let old_map = match &old_val {
+            Some(Value::Object(m)) => Some(m.clone()),
             _ => None,
         };
         obj.insert(
@@ -386,7 +501,7 @@ impl<'a> ExecContext<'a> {
                 id: id.to_string(),
             },
         );
-        self.validate_schema(tb, &obj)?;
+        self.apply_defaults_and_validate(tb, &mut obj)?;
         self.maintain_indexes_on_write(tb, id, old_map.as_ref(), &obj)?;
 
         let val = Value::Object(obj);
@@ -394,7 +509,14 @@ impl<'a> ExecContext<'a> {
         let bytes = serde_json::to_vec(&val)?;
         self.put_raw(key, bytes)?;
         self.live.publish(&self.ns, &self.db, tb, action, &val);
-        Ok(val)
+
+        let ev_name = match action {
+            LiveAction::Create => "CREATE",
+            LiveAction::Update => "UPDATE",
+            LiveAction::Delete => "DELETE",
+        };
+        self.fire_events(tb, ev_name, old_val.clone(), Some(val.clone()))?;
+        Ok((old_val, val))
     }
 
     fn apply_mutation_data(
@@ -431,6 +553,76 @@ impl<'a> ExecContext<'a> {
                     other => Err(anyhow!("MERGE expects an object, got {:?}", other)),
                 }
             }
+            MutationData::Patch(expr) => {
+                let patch_val = self.eval_expr(expr, current_row, 0)?;
+                let ops = match patch_val {
+                    Value::Array(arr) => arr,
+                    other => return Err(anyhow!("PATCH expects an array of ops, got {:?}", other)),
+                };
+                for op_val in ops {
+                    if let Value::Object(op_map) = op_val {
+                        let op = op_map
+                            .get("op")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_ascii_lowercase();
+                        let path = op_map
+                            .get("path")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .trim_start_matches('/');
+                        if path.is_empty() {
+                            continue;
+                        }
+                        match op.as_str() {
+                            "add" | "replace" => {
+                                if let Some(val) = op_map.get("value") {
+                                    base.insert(path.to_string(), val.clone());
+                                }
+                            }
+                            "remove" => {
+                                base.remove(path);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                Ok(base)
+            }
+        }
+    }
+
+    fn format_return(mode: ReturnMode, before: Option<Value>, after: Option<Value>) -> Option<Value> {
+        match mode {
+            ReturnMode::None => None,
+            ReturnMode::Before => before,
+            ReturnMode::After => after,
+            ReturnMode::Diff => {
+                let mut diffs = Vec::new();
+                if let (Some(Value::Object(b)), Some(Value::Object(a))) = (&before, &after) {
+                    for (k, v) in a {
+                        if b.get(k) != Some(v) {
+                            let mut op = BTreeMap::new();
+                            op.insert(
+                                "op".into(),
+                                Value::String(if b.contains_key(k) { "replace" } else { "add" }.into()),
+                            );
+                            op.insert("path".into(), Value::String(format!("/{}", k)));
+                            op.insert("value".into(), v.clone());
+                            diffs.push(Value::Object(op));
+                        }
+                    }
+                    for k in b.keys() {
+                        if !a.contains_key(k) {
+                            let mut op = BTreeMap::new();
+                            op.insert("op".into(), Value::String("remove".into()));
+                            op.insert("path".into(), Value::String(format!("/{}", k)));
+                            diffs.push(Value::Object(op));
+                        }
+                    }
+                }
+                Some(Value::Array(diffs))
+            }
         }
     }
 
@@ -449,6 +641,56 @@ impl<'a> ExecContext<'a> {
                 let val = self.eval_expr(expr, None, 0)?;
                 self.params.insert(name.clone(), val);
                 Ok(Vec::new())
+            }
+            Statement::Return(expr) => Ok(vec![self.eval_expr(expr, None, 0)?]),
+            Statement::InfoForDb => {
+                let tb_pfx = encode_key(PREFIX_TABLE_META, &[&self.ns, &self.db]);
+                let mut tables = BTreeMap::new();
+                for (_, raw) in self.storage.scan_prefix(&tb_pfx)? {
+                    if let Ok(m) = serde_json::from_slice::<TableMeta>(&raw) {
+                        tables.insert(
+                            m.name.clone(),
+                            Value::String(format!(
+                                "DEFINE TABLE {} {}",
+                                m.name,
+                                if m.schemafull { "SCHEMAFULL" } else { "SCHEMALESS" }
+                            )),
+                        );
+                    }
+                }
+                let fn_pfx = encode_key(PREFIX_FUNCTION_META, &[&self.ns, &self.db]);
+                let mut functions = BTreeMap::new();
+                for (_, raw) in self.storage.scan_prefix(&fn_pfx)? {
+                    if let Ok(f) = serde_json::from_slice::<FunctionMeta>(&raw) {
+                        functions.insert(f.name.clone(), Value::String(format!("DEFINE FUNCTION {}", f.name)));
+                    }
+                }
+                let mut info = BTreeMap::new();
+                info.insert("tables".into(), Value::Object(tables));
+                info.insert("functions".into(), Value::Object(functions));
+                Ok(vec![Value::Object(info)])
+            }
+            Statement::InfoForTable(tb) => {
+                let mut fields = BTreeMap::new();
+                for f in self.load_fields(tb)? {
+                    fields.insert(
+                        f.name.clone(),
+                        Value::String(f.field_type.unwrap_or_else(|| "any".into())),
+                    );
+                }
+                let mut indexes = BTreeMap::new();
+                for idx in self.load_indexes(tb)? {
+                    indexes.insert(idx.name.clone(), Value::String(format!("{:?}", idx.kind)));
+                }
+                let mut events = BTreeMap::new();
+                for ev in self.load_events(tb)? {
+                    events.insert(ev.name.clone(), Value::String(ev.name));
+                }
+                let mut info = BTreeMap::new();
+                info.insert("fields".into(), Value::Object(fields));
+                info.insert("indexes".into(), Value::Object(indexes));
+                info.insert("events".into(), Value::Object(events));
+                Ok(vec![Value::Object(info)])
             }
             Statement::Begin => {
                 self.tx_buffer = Some(Vec::new());
@@ -481,13 +723,16 @@ impl<'a> ExecContext<'a> {
                 name,
                 table,
                 field_type,
+                assert_expr,
+                default_expr,
                 ..
             } => {
                 let key = encode_key(PREFIX_FIELD_META, &[&self.ns, &self.db, table, name]);
                 let meta = FieldMeta {
                     name: name.clone(),
                     field_type: field_type.clone(),
-                    assert_sql: None,
+                    assert_expr: assert_expr.clone(),
+                    default_expr: default_expr.clone(),
                 };
                 self.put_raw(key, serde_json::to_vec(&meta)?)?;
                 Ok(Vec::new())
@@ -508,12 +753,28 @@ impl<'a> ExecContext<'a> {
                 self.put_raw(key, serde_json::to_vec(&meta)?)?;
                 Ok(Vec::new())
             }
-            Statement::DefineEvent { name, table, .. } => {
+            Statement::DefineEvent {
+                name,
+                table,
+                when_expr,
+                then_stmt,
+                ..
+            } => {
                 let key = encode_key(PREFIX_EVENT_META, &[&self.ns, &self.db, table, name]);
                 let meta = EventMeta {
                     name: name.clone(),
-                    when_sql: String::new(),
-                    then_sql: String::new(),
+                    when_expr: when_expr.clone(),
+                    then_stmt: (**then_stmt).clone(),
+                };
+                self.put_raw(key, serde_json::to_vec(&meta)?)?;
+                Ok(Vec::new())
+            }
+            Statement::DefineFunction { name, params, body } => {
+                let key = encode_key(PREFIX_FUNCTION_META, &[&self.ns, &self.db, name]);
+                let meta = FunctionMeta {
+                    name: name.clone(),
+                    params: params.clone(),
+                    body: body.clone(),
                 };
                 self.put_raw(key, serde_json::to_vec(&meta)?)?;
                 Ok(Vec::new())
@@ -559,9 +820,8 @@ impl<'a> ExecContext<'a> {
                 obj.insert("in".to_string(), from_val);
                 obj.insert("out".to_string(), to_val);
 
-                let saved = self.save_record(edge, &edge_id, obj, LiveAction::Create)?;
+                let (_, saved) = self.save_record(edge, &edge_id, obj, LiveAction::Create)?;
 
-                // Write outbound & inbound graph adjacency entries
                 let from_ref = format!("{}:{}", from_tb, from_id);
                 let to_ref = format!("{}:{}", to_tb, to_id);
                 let out_key =
@@ -573,7 +833,7 @@ impl<'a> ExecContext<'a> {
 
                 Ok(vec![saved])
             }
-            Statement::Create { target, data } => {
+            Statement::Create { target, data, ret } => {
                 let (tb, id_opt) = self.resolve_target(target)?;
                 let id = id_opt.unwrap_or_else(|| Uuid::new_v4().simple().to_string());
                 let key = encode_key(PREFIX_RECORD, &[&self.ns, &self.db, &tb, &id]);
@@ -581,8 +841,10 @@ impl<'a> ExecContext<'a> {
                     return Err(anyhow!("Record {}:{} already exists", tb, id));
                 }
                 let obj = self.apply_mutation_data(BTreeMap::new(), data, None)?;
-                let saved = self.save_record(&tb, &id, obj, LiveAction::Create)?;
-                Ok(vec![saved])
+                let (before, saved) = self.save_record(&tb, &id, obj, LiveAction::Create)?;
+                Ok(Self::format_return(*ret, before, Some(saved))
+                    .into_iter()
+                    .collect())
             }
             Statement::Insert {
                 table,
@@ -605,7 +867,8 @@ impl<'a> ExecContext<'a> {
                                 other => other.display_compact(),
                             })
                             .unwrap_or_else(|| Uuid::new_v4().simple().to_string());
-                        inserted.push(self.save_record(table, &id, obj, LiveAction::Create)?);
+                        let (_, saved) = self.save_record(table, &id, obj, LiveAction::Create)?;
+                        inserted.push(saved);
                     }
                 } else {
                     for expr in objects {
@@ -623,12 +886,9 @@ impl<'a> ExecContext<'a> {
                                         other => other.display_compact(),
                                     })
                                     .unwrap_or_else(|| Uuid::new_v4().simple().to_string());
-                                inserted.push(self.save_record(
-                                    table,
-                                    &id,
-                                    obj,
-                                    LiveAction::Create,
-                                )?);
+                                let (_, saved) =
+                                    self.save_record(table, &id, obj, LiveAction::Create)?;
+                                inserted.push(saved);
                             }
                         }
                     }
@@ -639,6 +899,7 @@ impl<'a> ExecContext<'a> {
                 target,
                 data,
                 where_clause,
+                ret,
             } => {
                 let (tb, id_opt) = self.resolve_target(target)?;
                 let existing = self.scan_target(&tb, id_opt.as_deref())?;
@@ -655,12 +916,11 @@ impl<'a> ExecContext<'a> {
                             _ => continue,
                         };
                         let next_map = self.apply_mutation_data(map.clone(), data, Some(&row))?;
-                        updated.push(self.save_record(
-                            &tb,
-                            &rec_id,
-                            next_map,
-                            LiveAction::Update,
-                        )?);
+                        let (before, after) =
+                            self.save_record(&tb, &rec_id, next_map, LiveAction::Update)?;
+                        if let Some(v) = Self::format_return(*ret, before, Some(after)) {
+                            updated.push(v);
+                        }
                     }
                 }
                 Ok(updated)
@@ -669,18 +929,18 @@ impl<'a> ExecContext<'a> {
                 target,
                 data,
                 where_clause,
+                ret,
             } => {
                 let (tb, id_opt) = self.resolve_target(target)?;
                 let existing = self.scan_target(&tb, id_opt.as_deref())?;
                 if existing.is_empty() {
                     let rec_id = id_opt.unwrap_or_else(|| Uuid::new_v4().simple().to_string());
                     let next_map = self.apply_mutation_data(BTreeMap::new(), data, None)?;
-                    return Ok(vec![self.save_record(
-                        &tb,
-                        &rec_id,
-                        next_map,
-                        LiveAction::Create,
-                    )?]);
+                    let (before, after) =
+                        self.save_record(&tb, &rec_id, next_map, LiveAction::Create)?;
+                    return Ok(Self::format_return(*ret, before, Some(after))
+                        .into_iter()
+                        .collect());
                 }
                 let mut updated = Vec::new();
                 for row in existing {
@@ -695,12 +955,11 @@ impl<'a> ExecContext<'a> {
                             _ => continue,
                         };
                         let next_map = self.apply_mutation_data(map.clone(), data, Some(&row))?;
-                        updated.push(self.save_record(
-                            &tb,
-                            &rec_id,
-                            next_map,
-                            LiveAction::Update,
-                        )?);
+                        let (before, after) =
+                            self.save_record(&tb, &rec_id, next_map, LiveAction::Update)?;
+                        if let Some(v) = Self::format_return(*ret, before, Some(after)) {
+                            updated.push(v);
+                        }
                     }
                 }
                 Ok(updated)
@@ -708,10 +967,12 @@ impl<'a> ExecContext<'a> {
             Statement::Delete {
                 target,
                 where_clause,
+                ret,
             } => {
                 let (tb, id_opt) = self.resolve_target(target)?;
                 let existing = self.scan_target(&tb, id_opt.as_deref())?;
                 let indexes = self.load_indexes(&tb)?;
+                let mut returned = Vec::new();
                 for row in existing {
                     if let Some(pred) = where_clause {
                         if !self.eval_expr(pred, Some(&row), 0)?.is_truthy() {
@@ -727,16 +988,22 @@ impl<'a> ExecContext<'a> {
                             self.delete_raw(key)?;
                             self.live
                                 .publish(&self.ns, &self.db, &tb, LiveAction::Delete, &row);
+                            self.fire_events(&tb, "DELETE", Some(row.clone()), None)?;
+                            if *ret == ReturnMode::Before {
+                                returned.push(row);
+                            }
                         }
                     }
                 }
-                Ok(Vec::new())
+                Ok(returned)
             }
             Statement::Select {
                 value_only,
                 projections,
+                omit,
                 target,
                 where_clause,
+                split,
                 group_by,
                 order_by,
                 limit,
@@ -746,7 +1013,7 @@ impl<'a> ExecContext<'a> {
                 let (tb, id_opt) = self.resolve_target(target)?;
                 let raw_rows = self.scan_target(&tb, id_opt.as_deref())?;
 
-                // Special-case Vector KNN `<|K,METRIC|>` in WHERE clause for top-K ranking
+                // 1. WHERE filter (with HNSW Vector KNN and BM25 FTS scoring support)
                 let mut filtered: Vec<Value> = if let Some(Expr::Binary {
                     left,
                     op: BinaryOp::VecKnn { k, metric },
@@ -758,21 +1025,86 @@ impl<'a> ExecContext<'a> {
                         .ok()
                         .and_then(|v| value_to_vec(&v))
                         .unwrap_or_default();
-                    let mut scored: Vec<(f64, Value)> = Vec::new();
-                    for row in raw_rows {
-                        if let Ok(v) = self.eval_expr(left, Some(&row), 0) {
-                            if let Some(rv) = value_to_vec(&v) {
-                                let dist = match metric {
-                                    VectorMetric::Cosine => 1.0 - cosine_similarity(&rv, &query_vec),
-                                    VectorMetric::Euclidean => euclidean_distance(&rv, &query_vec),
-                                    VectorMetric::Manhattan => manhattan_distance(&rv, &query_vec),
-                                };
-                                scored.push((dist, row));
+
+                    #[cfg(feature = "vector")]
+                    {
+                        let mut hnsw = crate::vector_hnsw::HnswIndex::new(*metric, 16, 64);
+                        let mut by_id: HashMap<String, Value> = HashMap::new();
+                        for (idx_i, row) in raw_rows.into_iter().enumerate() {
+                            if let Ok(v) = self.eval_expr(left, Some(&row), 0) {
+                                if let Some(rv) = value_to_vec(&v) {
+                                    let rid = idx_i.to_string();
+                                    hnsw.insert(rid.clone(), rv);
+                                    by_id.insert(rid, row);
+                                }
                             }
                         }
+                        hnsw.search_knn(&query_vec, *k, (*k * 4).max(32))
+                            .into_iter()
+                            .filter_map(|(rid, _)| by_id.remove(&rid))
+                            .collect()
                     }
-                    scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-                    scored.into_iter().take(*k).map(|(_, r)| r).collect()
+                    #[cfg(not(feature = "vector"))]
+                    {
+                        let mut scored: Vec<(f64, Value)> = Vec::new();
+                        for row in raw_rows {
+                            if let Ok(v) = self.eval_expr(left, Some(&row), 0) {
+                                if let Some(rv) = value_to_vec(&v) {
+                                    let dist = match metric {
+                                        VectorMetric::Cosine => 1.0 - cosine_similarity(&rv, &query_vec),
+                                        VectorMetric::Euclidean => euclidean_distance(&rv, &query_vec),
+                                        VectorMetric::Manhattan => manhattan_distance(&rv, &query_vec),
+                                    };
+                                    scored.push((dist, row));
+                                }
+                            }
+                        }
+                        scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+                        scored.into_iter().take(*k).map(|(_, r)| r).collect()
+                    }
+                } else if let Some(Expr::Binary {
+                    left: _fts_left,
+                    op: BinaryOp::FtsMatch,
+                    right: _fts_right,
+                }) = where_clause
+                {
+                    #[cfg(feature = "fts")]
+                    {
+                        let query_str = self.eval_expr(_fts_right, None, 0)?.display_compact();
+                        let texts: Vec<String> = raw_rows
+                            .iter()
+                            .map(|r| {
+                                self.eval_expr(_fts_left, Some(r), 0)
+                                    .map(|v| v.display_compact())
+                                    .unwrap_or_default()
+                            })
+                            .collect();
+                        let scorer = crate::search::Bm25Scorer::from_corpus(
+                            texts.iter().map(|s| s.as_str()),
+                        );
+                        let mut scored = Vec::new();
+                        for (row, text) in raw_rows.into_iter().zip(texts.iter()) {
+                            let sc = scorer.score(text, &query_str);
+                            if sc > 0.0 {
+                                scored.push((sc, row));
+                            }
+                        }
+                        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+                        if let Some((top_sc, _)) = scored.first() {
+                            self.last_fts_score = *top_sc;
+                        }
+                        scored.into_iter().map(|(_, r)| r).collect()
+                    }
+                    #[cfg(not(feature = "fts"))]
+                    {
+                        let mut acc = Vec::new();
+                        for row in raw_rows {
+                            if self.eval_expr(where_clause.as_ref().unwrap(), Some(&row), 0)?.is_truthy() {
+                                acc.push(row);
+                            }
+                        }
+                        acc
+                    }
                 } else if let Some(pred) = where_clause {
                     let mut acc = Vec::new();
                     let mut steps = 0usize;
@@ -793,7 +1125,26 @@ impl<'a> ExecContext<'a> {
                     raw_rows
                 };
 
-                // Optional GROUP BY aggregation
+                // 2. Optional SPLIT ON <array_field>
+                if let Some(split_field) = split {
+                    let mut expanded = Vec::new();
+                    for row in filtered {
+                        if let Value::Object(ref map) = row {
+                            if let Some(Value::Array(items)) = map.get(split_field) {
+                                for item in items {
+                                    let mut cloned = map.clone();
+                                    cloned.insert(split_field.clone(), item.clone());
+                                    expanded.push(Value::Object(cloned));
+                                }
+                                continue;
+                            }
+                        }
+                        expanded.push(row);
+                    }
+                    filtered = expanded;
+                }
+
+                // 3. Optional GROUP BY aggregation
                 if !group_by.is_empty() {
                     let mut groups: BTreeMap<String, Vec<Value>> = BTreeMap::new();
                     for row in filtered {
@@ -855,7 +1206,6 @@ impl<'a> ExecContext<'a> {
 
                 let mut projected = Vec::new();
                 while let Some(mut row) = paged_iter.next_row()? {
-                    // Optional FETCH link dereferencing
                     if !fetch.is_empty() {
                         if let Value::Object(ref mut map) = row {
                             for field_name in fetch {
@@ -867,16 +1217,16 @@ impl<'a> ExecContext<'a> {
                         }
                     }
 
-                    if !group_by.is_empty() {
-                        projected.push(row);
+                    let mut out_val = if !group_by.is_empty() {
+                        row
                     } else if *value_only {
                         if let Some(Projection::Expr { expr, .. }) = projections.first() {
-                            projected.push(self.eval_expr(expr, Some(&row), 0)?);
+                            self.eval_expr(expr, Some(&row), 0)?
                         } else {
-                            projected.push(row);
+                            row
                         }
                     } else if projections.len() == 1 && matches!(projections[0], Projection::All) {
-                        projected.push(row);
+                        row
                     } else {
                         let mut out = BTreeMap::new();
                         for proj in projections {
@@ -896,8 +1246,19 @@ impl<'a> ExecContext<'a> {
                                 }
                             }
                         }
-                        projected.push(Value::Object(out));
+                        Value::Object(out)
+                    };
+
+                    // Optional OMIT <fields...>
+                    if !omit.is_empty() {
+                        if let Value::Object(ref mut map) = out_val {
+                            for f in omit {
+                                map.remove(f);
+                            }
+                        }
                     }
+
+                    projected.push(out_val);
                 }
 
                 Ok(projected)
@@ -1015,6 +1376,15 @@ impl<'a> ExecContext<'a> {
             Expr::Param(name) => Ok(self.params.get(name).cloned().unwrap_or(Value::None)),
             Expr::Ident(name) => Ok(row.map(|r| extract_field(r, name)).unwrap_or(Value::None)),
             Expr::FieldPath(parts) => {
+                if let Some(first) = parts.first() {
+                    if let Some(pname) = first.strip_prefix('$') {
+                        let mut cur = self.params.get(pname).cloned().unwrap_or(Value::None);
+                        for p in &parts[1..] {
+                            cur = extract_field(&cur, p);
+                        }
+                        return Ok(cur);
+                    }
+                }
                 let mut cur = match row {
                     Some(r) => r.clone(),
                     None => return Ok(Value::None),
@@ -1026,6 +1396,17 @@ impl<'a> ExecContext<'a> {
             }
             Expr::GraphTraverse { hops, tail_field } => {
                 self.eval_graph_traverse(hops, tail_field.as_deref(), row)
+            }
+            Expr::Subquery(sub_stmt) => {
+                let mut sub_ctx = ExecContext::new(
+                    self.storage,
+                    self.live,
+                    self.ns.clone(),
+                    self.db.clone(),
+                    self.params.clone(),
+                );
+                let rows = sub_ctx.execute_one(sub_stmt)?;
+                Ok(Value::Array(rows))
             }
             Expr::Array(items) => {
                 let mut out = Vec::with_capacity(items.len());
@@ -1137,6 +1518,25 @@ impl<'a> ExecContext<'a> {
                 for a in args {
                     eval_args.push(self.eval_expr(a, row, depth + 1)?);
                 }
+                if name.eq_ignore_ascii_case("search::score") {
+                    return Ok(Value::Float(self.last_fts_score));
+                }
+                if name.starts_with("fn::") {
+                    if let Some(fmeta) = self.load_function(name)? {
+                        let mut fn_params = self.params.clone();
+                        for (pname, pval) in fmeta.params.iter().zip(eval_args.into_iter()) {
+                            fn_params.insert(pname.clone(), pval);
+                        }
+                        let sub_ctx = ExecContext::new(
+                            self.storage,
+                            self.live,
+                            self.ns.clone(),
+                            self.db.clone(),
+                            fn_params,
+                        );
+                        return sub_ctx.eval_expr(&fmeta.body, None, depth + 1);
+                    }
+                }
                 eval_stdlib(name, &eval_args)
             }
         }
@@ -1144,7 +1544,11 @@ impl<'a> ExecContext<'a> {
 }
 
 fn matches_field_type(val: &Value, expected: &str) -> bool {
-    let base = expected.split('<').next().unwrap_or(expected).to_ascii_lowercase();
+    let base = expected
+        .split('<')
+        .next()
+        .unwrap_or(expected)
+        .to_ascii_lowercase();
     match base.as_str() {
         "any" | "option" => true,
         "string" => matches!(val, Value::String(_)),

@@ -6,6 +6,15 @@ pub mod stdlib;
 pub mod storage;
 pub mod value;
 
+#[cfg(feature = "fts")]
+pub mod search;
+#[cfg(feature = "vector")]
+pub mod vector_hnsw;
+#[cfg(feature = "geo")]
+pub mod geo;
+#[cfg(feature = "crypto")]
+pub mod crypto_ext;
+
 use anyhow::Result;
 use std::collections::HashMap;
 use std::path::Path;
@@ -338,5 +347,156 @@ mod tests {
         let resp: serde_json::Value = serde_json::from_str(&resp_str).unwrap();
         assert_eq!(resp["result"][0]["status"], "OK");
         assert_eq!(resp["result"][0]["result"][0], "ALICE");
+    }
+
+    #[test]
+    fn full_parity_events_assert_default_functions_patch_return_split_omit_info_subqueries() {
+        let db = NexusDb::open_mem();
+
+        // 1. DEFAULT + ASSERT + DEFINE EVENT + DEFINE FUNCTION
+        db.query_scoped(
+            "shop",
+            "main",
+            "DEFINE TABLE product SCHEMALESS;
+             DEFINE FIELD status ON product TYPE string DEFAULT 'active';
+             DEFINE FIELD price ON product TYPE int ASSERT $value > 0;
+             DEFINE EVENT on_product ON product WHEN $event == 'CREATE' THEN {
+                 CREATE audit SET msg = $after.name
+             };
+             DEFINE FUNCTION fn::discount($p, $pct) {
+                 RETURN $p - ($p * $pct / 100)
+             };",
+            vec![],
+        )
+        .unwrap();
+
+        // Negative price must fail ASSERT
+        let bad = db.query_scoped(
+            "shop",
+            "main",
+            "CREATE product:bad SET name = 'Broken', price = -5;",
+            vec![],
+        );
+        assert!(bad.is_err(), "ASSERT $value > 0 must reject negative price");
+
+        // Valid create applies DEFAULT status='active' AND triggers EVENT creating audit row
+        let created = db
+            .query_scoped(
+                "shop",
+                "main",
+                "CREATE product:p1 SET name = 'Widget', price = 100, secret = 'hide', tags = ['a', 'b'];",
+                vec![],
+            )
+            .unwrap();
+        assert_eq!(created[0].to_json()["status"], "active");
+
+        let audits = db
+            .query_scoped("shop", "main", "SELECT VALUE msg FROM audit;", vec![])
+            .unwrap();
+        assert_eq!(audits, vec![Value::String("Widget".into())]);
+
+        // Custom fn::discount call
+        let disc = db
+            .query_scoped("shop", "main", "RETURN fn::discount(200, 15);", vec![])
+            .unwrap();
+        assert_eq!(disc, vec![Value::Float(170.0)]);
+
+        // PATCH + RETURN DIFF
+        let diff = db
+            .query_scoped(
+                "shop",
+                "main",
+                "UPDATE product:p1 PATCH [{ op: 'replace', path: '/price', value: 120 }] RETURN DIFF;",
+                vec![],
+            )
+            .unwrap();
+        assert!(diff[0].to_json().to_string().contains("/price"));
+
+        // OMIT + SPLIT ON
+        let split_rows = db
+            .query_scoped(
+                "shop",
+                "main",
+                "SELECT * OMIT secret FROM product:p1 SPLIT ON tags;",
+                vec![],
+            )
+            .unwrap();
+        assert_eq!(split_rows.len(), 2);
+        assert!(split_rows[0].to_json().get("secret").is_none());
+
+        // Subquery inside LET + INFO FOR DB / TABLE
+        let sub = db
+            .query_scoped(
+                "shop",
+                "main",
+                "LET $ids = (SELECT VALUE name FROM product); RETURN count($ids);",
+                vec![],
+            )
+            .unwrap();
+        assert_eq!(sub, vec![Value::Int(1)]);
+
+        let info_db = db
+            .query_scoped("shop", "main", "INFO FOR DB;", vec![])
+            .unwrap();
+        assert!(info_db[0].to_json()["tables"]["product"].is_string());
+        assert!(info_db[0].to_json()["functions"]["fn::discount"].is_string());
+    }
+
+    #[cfg(feature = "full")]
+    #[test]
+    fn full_feature_flags_geo_crypto_cbor_fts_highlight() {
+        let db = NexusDb::open_mem();
+
+        // Geo: NYC -> LA distance + Geohash + point-in-polygon
+        let dist = db
+            .query_scoped(
+                "ext",
+                "main",
+                "RETURN geo::distance([-74.006, 40.7128], [-118.2437, 34.0522]);",
+                vec![],
+            )
+            .unwrap();
+        let meters = dist[0].as_f64().unwrap();
+        assert!(meters > 3_900_000.0 && meters < 4_000_000.0);
+
+        let gh = db
+            .query_scoped("ext", "main", "RETURN geo::hash::encode([-74.006, 40.7128], 5);", vec![])
+            .unwrap();
+        assert_eq!(gh, vec![Value::String("dr5re".into())]);
+
+        // Crypto: pure-Rust SHA-256 + BLAKE3
+        let sha = db
+            .query_scoped("ext", "main", "RETURN crypto::sha256('abc');", vec![])
+            .unwrap();
+        assert_eq!(
+            sha,
+            vec![Value::String(
+                "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".into()
+            )]
+        );
+
+        // FTS highlight
+        let hl = db
+            .query_scoped(
+                "ext",
+                "main",
+                "RETURN search::highlight('<b>', '</b>', 'fast rust database', 'rust');",
+                vec![],
+            )
+            .unwrap();
+        assert_eq!(hl, vec![Value::String("fast <b>rust</b> database".into())]);
+
+        // CBOR wire framing round-trip
+        let mut rpc = db.rpc_session("ext", "main");
+        let mut req_cbor = Vec::new();
+        crate::rpc::cbor_encode(
+            &serde_json::json!({"id": 7, "method": "version", "params": []}),
+            &mut req_cbor,
+        );
+        let resp_cbor = rpc.handle_cbor(&req_cbor);
+        let mut pos = 0usize;
+        let decoded = crate::rpc::cbor_decode(&resp_cbor, &mut pos).unwrap();
+        assert_eq!(decoded["id"], 7);
+        assert!(decoded["result"].as_str().unwrap().contains("nexus-db"));
     }
 }

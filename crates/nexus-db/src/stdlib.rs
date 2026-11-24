@@ -348,6 +348,26 @@ pub fn eval_stdlib(name: &str, args: &[Value]) -> Result<Value> {
             Ok(Value::Float(dot))
         }
 
+        // --- search::* (feature = "fts") ---
+        #[cfg(feature = "fts")]
+        "search::highlight" => {
+            let prefix = args.first().and_then(|v| v.as_str()).unwrap_or("<b>");
+            let suffix = args.get(1).and_then(|v| v.as_str()).unwrap_or("</b>");
+            let text = args.get(2).and_then(|v| v.as_str()).unwrap_or("");
+            let query = args.get(3).and_then(|v| v.as_str()).unwrap_or("");
+            Ok(Value::String(crate::search::highlight_terms(
+                text, query, prefix, suffix,
+            )))
+        }
+
+        // --- geo::* (feature = "geo") ---
+        #[cfg(feature = "geo")]
+        n if n.starts_with("geo::") => crate::geo::eval_geo(n, args),
+
+        // --- crypto::* (feature = "crypto") ---
+        #[cfg(feature = "crypto")]
+        n if n.starts_with("crypto::") => crate::crypto_ext::eval_crypto(n, args),
+
         other => Err(anyhow!("Unknown SurrealQL function '{}'", other)),
     }
 }

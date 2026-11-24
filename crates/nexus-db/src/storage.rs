@@ -18,6 +18,7 @@ pub const PREFIX_CELL_KV: u8 = 0x08;
 pub const PREFIX_FIELD_META: u8 = 0x09;
 pub const PREFIX_INDEX_META: u8 = 0x0A;
 pub const PREFIX_EVENT_META: u8 = 0x0B;
+pub const PREFIX_FUNCTION_META: u8 = 0x0C;
 
 /// Build a `\x00`-delimited ordered binary key for prefix scans.
 pub fn encode_key(prefix: u8, parts: &[&str]) -> Vec<u8> {

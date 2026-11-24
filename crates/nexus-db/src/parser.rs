@@ -32,8 +32,17 @@ pub enum VectorMetric {
     Manhattan,
 }
 
-/// SurrealQL AST Statements (Phases 1–3: CRUD, Graph, Schema, Indexes, Events, Live Queries, Let).
-#[derive(Debug, Clone)]
+/// Return mode for mutation statements (`RETURN NONE | BEFORE | AFTER | DIFF`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReturnMode {
+    After,
+    Before,
+    None,
+    Diff,
+}
+
+/// SurrealQL AST Statements (Full Parity: CRUD, Graph, Schema, Indexes, Events, Functions, Live Queries, Info, Subqueries).
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Statement {
     Use {
         ns: Option<String>,
@@ -43,6 +52,9 @@ pub enum Statement {
         name: String,
         expr: Expr,
     },
+    Return(Expr),
+    InfoForDb,
+    InfoForTable(String),
     Begin,
     Commit,
     Cancel,
@@ -73,11 +85,18 @@ pub enum Statement {
         when_expr: Expr,
         then_stmt: Box<Statement>,
     },
+    DefineFunction {
+        name: String,
+        params: Vec<String>,
+        body: Expr,
+    },
     Select {
         value_only: bool,
         projections: Vec<Projection>,
+        omit: Vec<String>,
         target: Target,
         where_clause: Option<Expr>,
+        split: Option<String>,
         group_by: Vec<String>,
         order_by: Option<(String, bool)>,
         limit: Option<usize>,
@@ -87,6 +106,7 @@ pub enum Statement {
     Create {
         target: Target,
         data: MutationData,
+        ret: ReturnMode,
     },
     Insert {
         table: String,
@@ -98,15 +118,18 @@ pub enum Statement {
         target: Target,
         data: MutationData,
         where_clause: Option<Expr>,
+        ret: ReturnMode,
     },
     Upsert {
         target: Target,
         data: MutationData,
         where_clause: Option<Expr>,
+        ret: ReturnMode,
     },
     Delete {
         target: Target,
         where_clause: Option<Expr>,
+        ret: ReturnMode,
     },
     Relate {
         from: Expr,
@@ -122,28 +145,29 @@ pub enum Statement {
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Projection {
     All,
     Expr { expr: Expr, alias: Option<String> },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Target {
     Table(String),
     Record { tb: String, id: String },
     RecordFn { tb_expr: Expr, id_expr: Expr },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum MutationData {
     None,
     Set(Vec<(String, Expr)>),
     Content(Expr),
     Merge(Expr),
+    Patch(Expr),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Expr {
     None,
     Null,
@@ -162,17 +186,18 @@ pub enum Expr {
         hops: Vec<GraphHop>,
         tail_field: Option<String>,
     },
+    Subquery(Box<Statement>),
     Unary { op: UnaryOp, expr: Box<Expr> },
     Binary { left: Box<Expr>, op: BinaryOp, right: Box<Expr> },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum UnaryOp {
     Not,
     Neg,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BinaryOp {
     Eq,
     Ne,
@@ -596,6 +621,19 @@ impl Parser {
             let expr = self.parse_expr()?;
             return Ok(Statement::Let { name, expr });
         }
+        if self.eat_kw("RETURN") {
+            return Ok(Statement::Return(self.parse_expr()?));
+        }
+        if self.eat_kw("INFO") {
+            let _ = self.eat_kw("FOR");
+            if self.eat_kw("DB") || self.eat_kw("DATABASE") {
+                return Ok(Statement::InfoForDb);
+            }
+            if self.eat_kw("TABLE") {
+                return Ok(Statement::InfoForTable(self.expect_ident()?));
+            }
+            return Err(anyhow!("Expected DB or TABLE after INFO FOR"));
+        }
         if self.eat_kw("BEGIN") {
             let _ = self.eat_kw("TRANSACTION");
             return Ok(Statement::Begin);
@@ -650,7 +688,8 @@ impl Parser {
         if self.eat_kw("CREATE") {
             let target = self.parse_target()?;
             let data = self.parse_mutation_data()?;
-            return Ok(Statement::Create { target, data });
+            let ret = self.parse_return_mode();
+            return Ok(Statement::Create { target, data, ret });
         }
         if self.eat_kw("INSERT") {
             let _ = self.eat_kw("INTO");
@@ -715,10 +754,12 @@ impl Parser {
             } else {
                 None
             };
+            let ret = self.parse_return_mode();
             return Ok(Statement::Update {
                 target,
                 data,
                 where_clause,
+                ret,
             });
         }
         if self.eat_kw("UPSERT") {
@@ -729,10 +770,12 @@ impl Parser {
             } else {
                 None
             };
+            let ret = self.parse_return_mode();
             return Ok(Statement::Upsert {
                 target,
                 data,
                 where_clause,
+                ret,
             });
         }
         if self.eat_kw("DELETE") {
@@ -742,9 +785,11 @@ impl Parser {
             } else {
                 None
             };
+            let ret = self.parse_return_mode();
             return Ok(Statement::Delete {
                 target,
                 where_clause,
+                ret,
             });
         }
 
@@ -890,7 +935,69 @@ impl Parser {
             });
         }
 
+        if self.eat_kw("FUNCTION") {
+            let _ = self.eat_if_not_exists();
+            let mut full_name = self.expect_ident()?;
+            while matches!(self.peek(), Token::DoubleColon) {
+                self.next();
+                full_name.push_str("::");
+                full_name.push_str(&self.expect_ident()?);
+            }
+            let mut params = Vec::new();
+            if matches!(self.peek(), Token::LParen) {
+                self.next();
+                while !matches!(self.peek(), Token::RParen | Token::Eof) {
+                    if let Token::Param(p) | Token::Ident(p) = self.next() {
+                        params.push(p);
+                    }
+                    // Optional `: type` annotation on param
+                    if matches!(self.peek(), Token::Colon) {
+                        self.next();
+                        let _ = self.expect_ident();
+                    }
+                    if matches!(self.peek(), Token::Comma) {
+                        self.next();
+                    }
+                }
+                if matches!(self.peek(), Token::RParen) {
+                    self.next();
+                }
+            }
+            if matches!(self.peek(), Token::LBrace) {
+                self.next();
+            }
+            let _ = self.eat_kw("RETURN");
+            let body = self.parse_expr()?;
+            if matches!(self.peek(), Token::Semicolon) {
+                self.next();
+            }
+            if matches!(self.peek(), Token::RBrace) {
+                self.next();
+            }
+            return Ok(Statement::DefineFunction {
+                name: full_name,
+                params,
+                body,
+            });
+        }
+
         Err(anyhow!("Unsupported DEFINE target"))
+    }
+
+    fn parse_return_mode(&mut self) -> ReturnMode {
+        if self.eat_kw("RETURN") {
+            if self.eat_kw("NONE") {
+                return ReturnMode::None;
+            }
+            if self.eat_kw("BEFORE") {
+                return ReturnMode::Before;
+            }
+            if self.eat_kw("DIFF") {
+                return ReturnMode::Diff;
+            }
+            let _ = self.eat_kw("AFTER");
+        }
+        ReturnMode::After
     }
 
     fn parse_select(&mut self) -> Result<Statement> {
@@ -916,12 +1023,30 @@ impl Parser {
             }
         }
 
+        let mut omit = Vec::new();
+        if self.eat_kw("OMIT") {
+            loop {
+                omit.push(self.expect_ident()?);
+                if matches!(self.peek(), Token::Comma) {
+                    self.next();
+                } else {
+                    break;
+                }
+            }
+        }
+
         if !self.eat_kw("FROM") {
             return Err(anyhow!("Expected FROM in SELECT"));
         }
         let target = self.parse_target()?;
         let where_clause = if self.eat_kw("WHERE") {
             Some(self.parse_expr()?)
+        } else {
+            None
+        };
+        let split = if self.eat_kw("SPLIT") {
+            let _ = self.eat_kw("ON");
+            Some(self.expect_ident()?)
         } else {
             None
         };
@@ -984,8 +1109,10 @@ impl Parser {
         Ok(Statement::Select {
             value_only,
             projections,
+            omit,
             target,
             where_clause,
+            split,
             group_by,
             order_by,
             limit,
@@ -1052,6 +1179,9 @@ impl Parser {
         }
         if self.eat_kw("MERGE") {
             return Ok(MutationData::Merge(self.parse_expr()?));
+        }
+        if self.eat_kw("PATCH") {
+            return Ok(MutationData::Patch(self.parse_expr()?));
         }
         Ok(MutationData::None)
     }
@@ -1255,8 +1385,27 @@ impl Parser {
             Token::Int(n) => Ok(Expr::Int(n)),
             Token::Float(f) => Ok(Expr::Float(f)),
             Token::Str(s) => Ok(Expr::String(s)),
-            Token::Param(p) => Ok(Expr::Param(p)),
+            Token::Param(p) => {
+                if matches!(self.peek(), Token::Dot) {
+                    let mut path = vec![format!("${}", p)];
+                    while matches!(self.peek(), Token::Dot) {
+                        self.next();
+                        path.push(self.expect_ident()?);
+                    }
+                    Ok(Expr::FieldPath(path))
+                } else {
+                    Ok(Expr::Param(p))
+                }
+            }
             Token::LParen => {
+                if self.is_kw("SELECT") {
+                    self.next();
+                    let sub = self.parse_select()?;
+                    if matches!(self.peek(), Token::RParen) {
+                        self.next();
+                    }
+                    return Ok(Expr::Subquery(Box::new(sub)));
+                }
                 let inner = self.parse_expr()?;
                 if matches!(self.peek(), Token::RParen) {
                     self.next();
