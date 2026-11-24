@@ -11,6 +11,7 @@ path = "src/lib.rs"
 [dependencies]
 # 1. The Mind (State)
 surrealdb = { version = "4.0.1", default-features = false, features = ["kv-mem", "kv-surrealkv"] } # SQL included, Scripting (Internal QuickJS) disabled
+sqlparser = "0.64.0"
 tokio = { version = "1.0", features = ["full"] }
 
 # 2. The Nerves (Logic/Shell)

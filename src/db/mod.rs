@@ -3,6 +3,10 @@ use surrealdb::Surreal;
 use chrono::{DateTime, Utc};
 
 pub mod command;
+pub mod sql_compiler;
+pub mod state_engine;
+
+pub use state_engine::StateEngine;
 
 pub struct Database {
     pub client: Surreal<surrealdb::engine::local::Db>,

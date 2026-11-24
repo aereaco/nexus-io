@@ -11,6 +11,7 @@ use std::thread;
 
 use crate::db::Database;
 
+pub mod cell;
 pub mod command;
 pub mod transformer;
 
