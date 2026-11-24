@@ -54,6 +54,9 @@ impl CapabilityRegistry {
         };
 
         reg("database", true);
+        reg("pgwire", true);
+        reg("sqlite-hrana", true);
+        reg("unified-multi-flavor-query", true);
         reg("gateway", true);
         reg("js-runtime", true);
         reg("cells", true);

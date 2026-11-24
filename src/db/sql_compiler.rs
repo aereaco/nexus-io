@@ -346,9 +346,152 @@ fn compile_expr(
     }
 }
 
+/// Unified multi-flavor query executor shared identically by internal `CellManager` (`ctx.db.query`)
+/// and external `UxGateway` (`POST /query`, `POST /cells/:app/:id/query`, `POST /graphql`).
+///
+/// Supported flavors: `"surql"` | `"sqlite"` | `"postgres"` | `"mysql"` | `"graphql"` | `"gql"`.
+pub fn execute_unified_query(
+    db: &nexus_db::NexusDb,
+    ns: &str,
+    db_name: &str,
+    flavor: &str,
+    query: &str,
+    params: Vec<DbValue>,
+    auth: Option<nexus_db::auth::AuthContext>,
+) -> Result<serde_json::Value> {
+    match flavor.trim().to_ascii_lowercase().as_str() {
+        "" | "surql" | "surreal" | "surrealql" => {
+            let rows = match auth {
+                Some(ctx) => db.query_scoped_with_auth(ns, db_name, query, vec![], ctx)?,
+                None => db.query_scoped(ns, db_name, query, vec![])?,
+            };
+            Ok(serde_json::Value::Array(
+                rows.iter().map(DbValue::to_json).collect(),
+            ))
+        }
+        "sqlite" | "postgres" | "pg" | "postgresql" | "mysql" => {
+            let dialect = match flavor.trim().to_ascii_lowercase().as_str() {
+                "postgres" | "pg" | "postgresql" => SqlDialect::Postgres,
+                "mysql" => SqlDialect::Mysql,
+                _ => SqlDialect::Sqlite,
+            };
+            let compiled = compile_sql_to_surql(dialect, query, params)?;
+            let rows = match auth {
+                Some(ctx) => {
+                    db.query_scoped_with_auth(ns, db_name, &compiled.surql, compiled.bindings, ctx)?
+                }
+                None => db.query_scoped(ns, db_name, &compiled.surql, compiled.bindings)?,
+            };
+            Ok(serde_json::Value::Array(
+                rows.iter().map(DbValue::to_json).collect(),
+            ))
+        }
+        "graphql" => db.graphql(ns, db_name, query),
+        "gql" => {
+            let rows = db.gql(ns, db_name, query)?;
+            Ok(serde_json::Value::Array(
+                rows.iter().map(DbValue::to_json).collect(),
+            ))
+        }
+        other => Err(anyhow!(
+            "Unsupported query flavor '{}' (expected: surql, sqlite, postgres, mysql, graphql, gql)",
+            other
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unified_query_executes_all_six_flavors_against_same_cell_db() {
+        let db = nexus_db::NexusDb::open_mem();
+
+        // 1. SQLite DDL + INSERT
+        execute_unified_query(&db, "app1", "cell1", "sqlite", "CREATE TABLE users (name TEXT, role TEXT)", vec![], None).unwrap();
+        execute_unified_query(
+            &db,
+            "app1",
+            "cell1",
+            "sqlite",
+            "INSERT INTO users (name, role) VALUES (?, ?)",
+            vec![DbValue::String("Alice".into()), DbValue::String("admin".into())],
+            None,
+        )
+        .unwrap();
+
+        // 2. PostgreSQL INSERT + SELECT
+        execute_unified_query(
+            &db,
+            "app1",
+            "cell1",
+            "postgres",
+            "INSERT INTO users (name, role) VALUES ($1, $2)",
+            vec![DbValue::String("Bob".into()), DbValue::String("dev".into())],
+            None,
+        )
+        .unwrap();
+        let pg_rows = execute_unified_query(
+            &db,
+            "app1",
+            "cell1",
+            "postgres",
+            "SELECT name FROM users WHERE role = $1",
+            vec![DbValue::String("dev".into())],
+            None,
+        )
+        .unwrap();
+        assert_eq!(pg_rows[0]["name"], "Bob");
+
+        // 3. MySQL SELECT with backticks
+        let my_rows = execute_unified_query(
+            &db,
+            "app1",
+            "cell1",
+            "mysql",
+            "SELECT `name` FROM `users` WHERE `role` = ?",
+            vec![DbValue::String("admin".into())],
+            None,
+        )
+        .unwrap();
+        assert_eq!(my_rows[0]["name"], "Alice");
+
+        // 4. SurrealQL RELATE + GraphQL + ISO GQL on the exact same cell DB
+        execute_unified_query(
+            &db,
+            "app1",
+            "cell1",
+            "surql",
+            "CREATE person:a SET name = 'Ada'; CREATE person:b SET name = 'Grace'; RELATE person:a->mentors->person:b;",
+            vec![],
+            None,
+        )
+        .unwrap();
+        let gql = execute_unified_query(
+            &db,
+            "app1",
+            "cell1",
+            "gql",
+            "MATCH (x:person)-[:mentors]->(y:person) WHERE x.name = 'Ada' RETURN y.name",
+            vec![],
+            None,
+        )
+        .unwrap();
+        assert_eq!(gql[0], "Grace");
+
+        let graphql = execute_unified_query(
+            &db,
+            "app1",
+            "cell1",
+            "graphql",
+            "{ person { name } }",
+            vec![],
+            None,
+        )
+        .unwrap();
+        assert!(graphql["data"]["person"].is_array());
+    }
 
     #[test]
     fn compiles_sqlite_crud_with_placeholders() {

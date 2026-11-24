@@ -412,6 +412,93 @@ pub async fn surreal_version(res: &mut Response) {
     res.render(Text::Plain("nexus-db 0.1.0 (surrealdb-wire-compatible)"));
 }
 
+/// Unified External Multi-Flavor Query Handler (`POST /query`, `POST /cells/<app>/<cell_id>/query`, `POST /graphql`).
+/// Shares the exact same `execute_unified_query` path as internal `CellManager` (`ctx.db.query`)
+/// and wakes hibernated cells automatically before querying.
+#[derive(Clone)]
+pub struct UnifiedQueryHandler {
+    pub db: Arc<Database>,
+    pub cells: Arc<crate::js::cell::CellManager>,
+    pub default_flavor: &'static str,
+}
+
+#[async_trait]
+impl Handler for UnifiedQueryHandler {
+    async fn handle(&self, req: &mut Request, _depot: &mut Depot, res: &mut Response, _ctrl: &mut FlowCtrl) {
+        let (ns, database) = match (req.param::<String>("app"), req.param::<String>("cell_id")) {
+            (Some(app), Some(cell_id)) => {
+                let _ = self.cells.ensure_awake(&app, &cell_id).await;
+                (app, cell_id)
+            }
+            _ => extract_ns_db(req),
+        };
+
+        let auth = match resolve_http_auth(req, &self.db, &ns, &database) {
+            Ok(a) => a,
+            Err(msg) => {
+                res.status_code(StatusCode::UNAUTHORIZED);
+                res.render(Json(json!({ "code": 401, "details": msg })));
+                return;
+            }
+        };
+
+        let body: JsonValue = match req.parse_json().await {
+            Ok(v) => v,
+            Err(e) => {
+                res.status_code(StatusCode::BAD_REQUEST);
+                res.render(Json(json!({ "code": 400, "details": e.to_string() })));
+                return;
+            }
+        };
+
+        let flavor = body
+            .get("flavor")
+            .and_then(|v| v.as_str())
+            .unwrap_or(self.default_flavor);
+        let query = body
+            .get("query")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let params: Vec<DbValue> = body
+            .get("params")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().map(DbValue::from_json).collect())
+            .unwrap_or_default();
+
+        match crate::db::sql_compiler::execute_unified_query(
+            &self.db.inner,
+            &ns,
+            &database,
+            flavor,
+            query,
+            params,
+            auth,
+        ) {
+            Ok(result) => {
+                if flavor.eq_ignore_ascii_case("graphql") {
+                    res.render(Json(result));
+                } else {
+                    res.render(Json(json!({
+                        "status": "OK",
+                        "flavor": flavor,
+                        "ns": ns,
+                        "db": database,
+                        "result": result
+                    })));
+                }
+            }
+            Err(e) => {
+                res.status_code(StatusCode::BAD_REQUEST);
+                res.render(Json(json!({
+                    "status": "ERR",
+                    "flavor": flavor,
+                    "error": e.to_string()
+                })));
+            }
+        }
+    }
+}
+
 /// `POST /v2/pipeline` — LibSQL / Turso Hrana HTTP SQLite pipeline endpoint backed by `nexus-db`.
 #[derive(Clone)]
 pub struct SqliteHranaHandler {

@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use nexus_db::Value as DbValue;
 use tokio::sync::RwLock;
 
-use crate::db::sql_compiler::{compile_sql_to_surql, SqlDialect};
+use crate::db::sql_compiler::{compile_sql_to_surql, execute_unified_query, SqlDialect};
 use crate::db::StateEngine;
 use crate::storage::BlobBridge;
 
@@ -128,6 +128,25 @@ impl CellManager {
                 last_active: Instant::now(),
             },
         );
+        Ok(())
+    }
+
+    /// Ensure a cell is awake (hydrating any hibernated snapshot from blob storage if needed)
+    /// before executing an external multi-flavor query against `(app, cell_id)`.
+    pub async fn ensure_awake(&self, app: &str, cell_id: &str) -> Result<()> {
+        let key = CellKey {
+            app: app.to_string(),
+            cell_id: cell_id.to_string(),
+        };
+        if let Some(existing) = self.active.write().await.get_mut(&key) {
+            existing.last_active = Instant::now();
+            return Ok(());
+        }
+        // Best-effort hydration from default `cells` snapshot bucket if previously hibernated
+        let snap_key = format!("snapshots/{}/{}.json", app, cell_id);
+        if let Ok(Some(snap)) = self.blobs.get_object("cells", &snap_key).await {
+            let _ = self.engine.import_snapshot(app, cell_id, snap).await;
+        }
         Ok(())
     }
 
@@ -335,6 +354,31 @@ fn cell_unified_query_cb(
         }
     }
 
+    // Fast unified path when backed directly by `NexusDb` (shares exact logic with external HTTP `/query`)
+    let scope = ACTIVE_CELL_SCOPE.with(|s| {
+        s.borrow()
+            .as_ref()
+            .map(|sc| (sc.engine.clone(), sc.app.clone(), sc.cell_id.clone()))
+    });
+    if let Some((ref engine, ref app, ref cell_id)) = scope {
+        if let Some(nexus) = engine.as_nexus_db() {
+            let res_json = match execute_unified_query(
+                nexus,
+                app,
+                cell_id,
+                &flavor,
+                &query,
+                bind_args,
+                None,
+            ) {
+                Ok(v) => v,
+                Err(e) => serde_json::json!({ "error": e.to_string() }),
+            };
+            let json_str = serde_json::to_string(&res_json).unwrap_or_else(|_| "null".into());
+            return ctx.eval(&format!("({})", json_str));
+        }
+    }
+
     match flavor.as_str() {
         "surql" | "surreal" | "surrealql" => run_cell_query(ctx, &query, vec![]),
         "sqlite" | "postgres" | "pg" | "postgresql" | "mysql" => {
@@ -353,31 +397,6 @@ fn cell_unified_query_cb(
                     Ok(JsValue::Object(err_obj))
                 }
             }
-        }
-        "graphql" | "gql" => {
-            let scope = ACTIVE_CELL_SCOPE.with(|s| {
-                s.borrow()
-                    .as_ref()
-                    .map(|sc| (sc.engine.clone(), sc.app.clone(), sc.cell_id.clone()))
-            });
-            let Some((engine, app, cell_id)) = scope else {
-                return Ok(JsValue::Undefined);
-            };
-            let Some(nexus) = engine.as_nexus_db() else {
-                return Ok(JsValue::Undefined);
-            };
-            let res_json = if flavor == "graphql" {
-                nexus
-                    .graphql(&app, &cell_id, &query)
-                    .unwrap_or_else(|e| serde_json::json!({ "error": e.to_string() }))
-            } else {
-                match nexus.gql(&app, &cell_id, &query) {
-                    Ok(rows) => serde_json::Value::Array(rows.iter().map(|v| v.to_json()).collect()),
-                    Err(e) => serde_json::json!({ "error": e.to_string() }),
-                }
-            };
-            let json_str = serde_json::to_string(&res_json).unwrap_or_else(|_| "null".into());
-            ctx.eval(&format!("({})", json_str))
         }
         other => {
             let err_obj = ctx.new_object();

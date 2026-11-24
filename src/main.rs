@@ -170,11 +170,7 @@ async fn async_main(args: Vec<String>, is_test: bool) -> Result<(), Box<dyn std:
     let gateway_config = ux::GatewayConfig {
         enable_https: false, // Port 443 (Requires domain/cert)
         enable_http: true,   // Port 8080 (Dev redirect)
-        enable_surreal_direct: false,
-        enable_s3_direct: false,
-        enable_metrics: false,
-        acme_domain: None,
-        acme_email: None,
+        ..Default::default()
     };
     
     let gateway = ux::UxGateway::new(db.clone(), bridge.clone(), gateway_config);

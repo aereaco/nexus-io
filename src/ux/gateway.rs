@@ -17,6 +17,8 @@ pub struct GatewayConfig {
     pub enable_https: bool,          // Port 443 (primary gateway)
     pub enable_http: bool,           // Port 80 (ACME + redirects)
     pub enable_surreal_direct: bool, // Port 8000 (direct DB access)
+    pub enable_pgwire: bool,         // Port 5432 (PostgreSQL v3 wire protocol)
+    pub pgwire_port: u16,            // Default 5432
     pub enable_s3_direct: bool,      // Port 3900 (S3 API)
     pub enable_metrics: bool,        // Port 9090 (Prometheus)
     pub acme_domain: Option<String>, // Domain for ACME certs
@@ -29,6 +31,11 @@ impl Default for GatewayConfig {
             enable_https: true,
             enable_http: true,
             enable_surreal_direct: false,
+            enable_pgwire: std::env::var("NEXUS_ENABLE_PGWIRE").as_deref() == Ok("1"),
+            pgwire_port: std::env::var("NEXUS_PGWIRE_PORT")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(5432),
             enable_s3_direct: false,
             enable_metrics: false,
             acme_domain: None,
@@ -69,6 +76,16 @@ impl UxGateway {
             handles.push(tokio::spawn(async move {
                 if let Err(e) = gateway.serve_https().await {
                     eprintln!("❌ HTTPS gateway error: {}", e);
+                }
+            }));
+        }
+
+        // Port 5432: PostgreSQL v3 Wire Protocol (`PgWireSession`)
+        if self.config.enable_pgwire {
+            let gateway = self.clone();
+            handles.push(tokio::spawn(async move {
+                if let Err(e) = gateway.serve_pgwire().await {
+                    eprintln!("❌ PgWire listener error: {}", e);
                 }
             }));
         }
@@ -150,6 +167,48 @@ impl UxGateway {
         Server::new(acceptor).serve(router).await;
 
         Ok(())
+    }
+
+    /// Port 5432 (configurable): PostgreSQL v3 Wire Protocol TCP listener (`psql`, `pg`, Prisma, Drizzle).
+    async fn serve_pgwire(&self) -> Result<(), Box<dyn std::error::Error>> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let addr = format!("0.0.0.0:{}", self.config.pgwire_port);
+        let listener = tokio::net::TcpListener::bind(&addr).await?;
+        println!("🐘 PostgreSQL v3 Wire Protocol (PgWire) listening on {}", addr);
+
+        loop {
+            let (mut socket, _) = listener.accept().await?;
+            let db = self.db.clone();
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 65_536];
+                // Read startup packet
+                let Ok(n) = socket.read(&mut buf).await else { return; };
+                if n == 0 {
+                    return;
+                }
+                let mut pg = db.inner.pgwire_session("nexus", "system");
+                if socket.write_all(&pg.startup_response()).await.is_err() {
+                    return;
+                }
+                loop {
+                    let Ok(read_n) = socket.read(&mut buf).await else { break; };
+                    if read_n == 0 {
+                        break;
+                    }
+                    match pg.handle_frame(&buf[..read_n]) {
+                        Ok(reply) => {
+                            if !reply.is_empty() && socket.write_all(&reply).await.is_err() {
+                                break;
+                            }
+                            if buf[0] == b'X' {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+        }
     }
 
     /// Port 8000: Direct SurrealDB access (optional)
@@ -237,6 +296,24 @@ impl UxGateway {
             .push(Router::with_path("/status").get(crate::ux::surreal_http::surreal_status))
             .push(Router::with_path("/ready").get(crate::ux::surreal_http::surreal_ready))
             .push(Router::with_path("/version").get(crate::ux::surreal_http::surreal_version))
+            // Unified External Multi-Flavor Query API (`POST /query`, `POST /graphql`, `POST /cells/:app/:cell_id/query`)
+            .push(Router::with_path("/query").post(crate::ux::surreal_http::UnifiedQueryHandler {
+                db: self.db.clone(),
+                cells: self.cells.clone(),
+                default_flavor: "surql",
+            }))
+            .push(Router::with_path("/graphql").post(crate::ux::surreal_http::UnifiedQueryHandler {
+                db: self.db.clone(),
+                cells: self.cells.clone(),
+                default_flavor: "graphql",
+            }))
+            .push(Router::with_path("/cells/<app:str>/<cell_id:str>/query").post(
+                crate::ux::surreal_http::UnifiedQueryHandler {
+                    db: self.db.clone(),
+                    cells: self.cells.clone(),
+                    default_flavor: "surql",
+                },
+            ))
             // LibSQL / Turso Hrana SQLite HTTP pipeline & multi-node WAL replication transport
             .push(Router::with_path("/v2/pipeline").post(crate::ux::surreal_http::SqliteHranaHandler { db: self.db.clone() }))
             .push(Router::with_path("/_nexus/wal/entries").get(crate::ux::surreal_http::WalReplicationHandler { db: self.db.clone(), is_apply: false }))
