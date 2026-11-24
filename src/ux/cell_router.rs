@@ -255,11 +255,16 @@ impl Handler for CellGatewayHandler {
                 }
             },
 
-            // GET /cells/<app>/<cell_id> -> invoke default fetch() or return status
+            // GET /cells/<app>/<cell_id> -> invoke WinterCG fetch(request) or return status
             &Method::GET => {
+                let req_url = format!("http://localhost{}", req.uri());
+                let eval_expr = format!(
+                    "typeof fetch === 'function' ? (() => {{ const r = fetch(new Request({:?}, {{ method: 'GET' }})); return r && typeof r === 'object' && '_body' in r ? r._body : String(r); }})() : 'ok'",
+                    req_url
+                );
                 match self
                     .cells
-                    .eval_in_cell(&app, &cell_id, "typeof fetch === 'function' ? fetch() : 'ok'")
+                    .eval_in_cell(&app, &cell_id, &eval_expr)
                     .await
                 {
                     Ok(out) => {

@@ -277,6 +277,9 @@ fn create_cell_context() -> Context {
         "#,
     );
 
+    // Install WinterCG Web Standard globals (`Request`, `Response`, `Headers`, `URL`, `crypto`, `TextEncoder`/`TextDecoder`, `Deno.openKv`)
+    super::wintercg::install_wintercg_globals(&mut ctx);
+
     ctx
 }
 

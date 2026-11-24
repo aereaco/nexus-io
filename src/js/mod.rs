@@ -14,6 +14,7 @@ use crate::db::Database;
 pub mod cell;
 pub mod command;
 pub mod transformer;
+pub mod wintercg;
 
 #[derive(Clone)]
 pub struct JsClient {
