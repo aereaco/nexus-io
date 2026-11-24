@@ -5,7 +5,9 @@ use salvo::prelude::*;
 use std::sync::Arc;
 
 use crate::db::Database;
+use crate::js::cell::CellManager;
 use crate::storage::BlobBridge;
+use crate::ux::cell_router::CellGatewayHandler;
 use crate::ux::surreal_ws::WebSocketHandler;
 use crate::ux::s3_proxy::S3ProxyHandler;
 
@@ -40,12 +42,14 @@ impl Default for GatewayConfig {
 pub struct UxGateway {
     db: Arc<Database>,
     garage: Arc<BlobBridge>,
+    cells: Arc<CellManager>,
     config: GatewayConfig,
 }
 
 impl UxGateway {
     pub fn new(db: Arc<Database>, garage: Arc<BlobBridge>, config: GatewayConfig) -> Self {
-        Self { db, garage, config }
+        let cells = Arc::new(CellManager::new(db.clone(), garage.clone()));
+        Self { db, garage, cells, config }
     }
 
     /// Start all configured gateway listeners
@@ -219,6 +223,21 @@ impl UxGateway {
                     .put(s3_handler.clone())
                     .delete(s3_handler.clone())
                     .head(s3_handler)
+            })
+            
+            // Unified Cell Ingress (/cells/<app>/<cell_id> - HTTP & WebSocket)
+            .push({
+                let db = self.db.clone();
+                let cell_handler = CellGatewayHandler {
+                    cells: self.cells.clone(),
+                };
+                let iam = crate::ux::iam::IamMiddleware { db };
+                Router::with_path("/cells/<**path>")
+                    .hoop(iam)
+                    .get(cell_handler.clone())
+                    .post(cell_handler.clone())
+                    .put(cell_handler.clone())
+                    .delete(cell_handler)
             })
             
             // Health check
