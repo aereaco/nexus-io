@@ -14,9 +14,9 @@ use crate::stdlib::{eval_stdlib, tokenize_fts, value_to_vec};
 #[cfg(not(feature = "vector"))]
 use crate::stdlib::{cosine_similarity, euclidean_distance, manhattan_distance};
 use crate::storage::{
-    encode_key, BatchOp, StorageBackend, PREFIX_EDGE_IN, PREFIX_EDGE_OUT, PREFIX_EVENT_META,
-    PREFIX_FIELD_META, PREFIX_FTS, PREFIX_FUNCTION_META, PREFIX_INDEX, PREFIX_INDEX_META,
-    PREFIX_RECORD, PREFIX_TABLE_META, PREFIX_VEC,
+    encode_key, BatchOp, StorageBackend, PREFIX_ANALYZER_META, PREFIX_CHANGEFEED, PREFIX_EDGE_IN,
+    PREFIX_EDGE_OUT, PREFIX_EVENT_META, PREFIX_FIELD_META, PREFIX_FTS, PREFIX_FUNCTION_META,
+    PREFIX_INDEX, PREFIX_INDEX_META, PREFIX_RECORD, PREFIX_TABLE_META, PREFIX_VEC, PREFIX_VERSION,
 };
 use crate::value::Value;
 
@@ -26,6 +26,12 @@ const MAX_EXPR_DEPTH: u16 = 64;
 struct TableMeta {
     name: String,
     schemafull: bool,
+    #[serde(default)]
+    changefeed: Option<String>,
+    #[serde(default)]
+    as_view: Option<Statement>,
+    #[serde(default)]
+    permissions_where: Option<Expr>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -107,6 +113,8 @@ impl<'a, I: RowIter<'a>> RowIter<'a> for LimitOffsetIter<I> {
 pub struct ExecContext<'a> {
     pub storage: &'a dyn StorageBackend,
     pub live: &'a LiveBroker,
+    #[cfg(feature = "ml")]
+    pub ml: Option<&'a crate::ml::MlRegistry>,
     pub ns: String,
     pub db: String,
     pub params: HashMap<String, Value>,
@@ -127,6 +135,8 @@ impl<'a> ExecContext<'a> {
         Self {
             storage,
             live,
+            #[cfg(feature = "ml")]
+            ml: None,
             ns,
             db,
             params,
@@ -166,7 +176,7 @@ impl<'a> ExecContext<'a> {
 
     fn resolve_target(&self, target: &Target) -> Result<(String, Option<String>)> {
         match target {
-            Target::Table(tb) => Ok((tb.clone(), None)),
+            Target::Table(tb) | Target::RecordRange { tb, .. } => Ok((tb.clone(), None)),
             Target::Record { tb, id } => Ok((tb.clone(), Some(id.clone()))),
             Target::RecordFn { tb_expr, id_expr } => {
                 let tb = self.eval_expr(tb_expr, None, 0)?.display_compact();
@@ -174,6 +184,75 @@ impl<'a> ExecContext<'a> {
                 Ok((tb, Some(id)))
             }
         }
+    }
+
+    fn scan_target_with_range(
+        &self,
+        target: &Target,
+        version: Option<u64>,
+    ) -> Result<Vec<Value>> {
+        if let Target::RecordRange { tb, start, end } = target {
+            let prefix = encode_key(PREFIX_RECORD, &[&self.ns, &self.db, tb]);
+            let entries = self.storage.scan_prefix(&prefix)?;
+            let mut rows = Vec::new();
+            for (k_bytes, raw) in entries {
+                let rec_id = extract_last_key_part(&k_bytes);
+                if rec_id.as_str() >= start.as_str() && rec_id.as_str() <= end.as_str() {
+                    rows.push(serde_json::from_slice(&raw)?);
+                }
+            }
+            return Ok(rows);
+        }
+
+        let (tb, id_opt) = self.resolve_target(target)?;
+
+        // MVCC historical version lookup (`SELECT ... VERSION <seq>`)
+        if let Some(ver) = version {
+            let ver_pfx = encode_key(PREFIX_VERSION, &[&self.ns, &self.db, &tb]);
+            let mut by_id: BTreeMap<String, Value> = BTreeMap::new();
+            for (k_bytes, raw) in self.storage.scan_prefix(&ver_pfx)? {
+                let tail = &k_bytes[ver_pfx.len()..];
+                let parts: Vec<String> = tail
+                    .split(|&b| b == 0x00)
+                    .filter(|p| !p.is_empty())
+                    .map(|p| String::from_utf8_lossy(p).to_string())
+                    .collect();
+                if parts.len() >= 2 {
+                    let rec_id = &parts[0];
+                    if let Some(ref want_id) = id_opt {
+                        if want_id != rec_id {
+                            continue;
+                        }
+                    }
+                    if let Ok(seq) = parts[1].parse::<u64>() {
+                        if seq <= ver {
+                            if let Ok(v) = serde_json::from_slice::<Value>(&raw) {
+                                by_id.insert(rec_id.clone(), v);
+                            }
+                        }
+                    }
+                }
+            }
+            return Ok(by_id.into_values().collect());
+        }
+
+        // Materialized view (`DEFINE TABLE <view> AS SELECT ...`)
+        if id_opt.is_none() {
+            if let Some(meta) = self.load_table_meta(&tb)? {
+                if let Some(view_stmt) = meta.as_view {
+                    let mut sub = ExecContext::new(
+                        self.storage,
+                        self.live,
+                        self.ns.clone(),
+                        self.db.clone(),
+                        self.params.clone(),
+                    );
+                    return sub.execute_one(&view_stmt);
+                }
+            }
+        }
+
+        self.scan_target(&tb, id_opt.as_deref())
     }
 
     fn get_record(&self, tb: &str, id: &str) -> Result<Option<Value>> {
@@ -507,7 +586,35 @@ impl<'a> ExecContext<'a> {
         let val = Value::Object(obj);
         let key = encode_key(PREFIX_RECORD, &[&self.ns, &self.db, tb, id]);
         let bytes = serde_json::to_vec(&val)?;
-        self.put_raw(key, bytes)?;
+        self.put_raw(key, bytes.clone())?;
+
+        // Append MVCC version entry (for `SELECT ... VERSION <seq>`)
+        let ver_pfx = encode_key(PREFIX_VERSION, &[&self.ns, &self.db, tb, id]);
+        let next_seq = (self.storage.scan_prefix(&ver_pfx)?.len() as u64) + 1;
+        let ver_key = encode_key(
+            PREFIX_VERSION,
+            &[&self.ns, &self.db, tb, id, &format!("{:020}", next_seq)],
+        );
+        self.put_raw(ver_key, bytes)?;
+
+        // Append Changefeed entry if enabled on table
+        if let Some(meta) = self.load_table_meta(tb)? {
+            if meta.changefeed.is_some() {
+                let cf_pfx = encode_key(PREFIX_CHANGEFEED, &[&self.ns, &self.db, tb]);
+                let cf_seq = (self.storage.scan_prefix(&cf_pfx)?.len() as u64) + 1;
+                let cf_key = encode_key(
+                    PREFIX_CHANGEFEED,
+                    &[&self.ns, &self.db, tb, &format!("{:020}", cf_seq)],
+                );
+                let cf_entry = serde_json::json!({
+                    "seq": cf_seq,
+                    "action": format!("{:?}", action).to_uppercase(),
+                    "record": val.to_json(),
+                });
+                self.put_raw(cf_key, serde_json::to_vec(&cf_entry)?)?;
+            }
+        }
+
         self.live.publish(&self.ns, &self.db, tb, action, &val);
 
         let ev_name = match action {
@@ -709,14 +816,149 @@ impl<'a> ExecContext<'a> {
             Statement::DefineTable {
                 name,
                 schemafull,
+                changefeed,
+                as_view,
+                permissions_where,
                 ..
             } => {
                 let key = encode_key(PREFIX_TABLE_META, &[&self.ns, &self.db, name]);
                 let meta = TableMeta {
                     name: name.clone(),
                     schemafull: *schemafull,
+                    changefeed: changefeed.clone(),
+                    as_view: as_view.as_deref().cloned(),
+                    permissions_where: permissions_where.clone(),
                 };
                 self.put_raw(key, serde_json::to_vec(&meta)?)?;
+                Ok(Vec::new())
+            }
+            Statement::DefineBucket { name, backend } => {
+                #[cfg(feature = "files")]
+                {
+                    crate::files::define_bucket(self.storage, &self.ns, &self.db, name, backend)?;
+                    Ok(Vec::new())
+                }
+                #[cfg(not(feature = "files"))]
+                {
+                    let _ = (name, backend);
+                    Err(anyhow!("Enable feature 'files' to use DEFINE BUCKET"))
+                }
+            }
+            Statement::DefineUser {
+                name,
+                level,
+                password,
+                roles,
+            } => {
+                #[cfg(feature = "auth")]
+                {
+                    crate::auth::save_user(
+                        self.storage,
+                        &self.ns,
+                        &self.db,
+                        name,
+                        level,
+                        password,
+                        roles.clone(),
+                    )?;
+                    Ok(Vec::new())
+                }
+                #[cfg(not(feature = "auth"))]
+                {
+                    let _ = (name, level, password, roles);
+                    Err(anyhow!("Enable feature 'auth' to use DEFINE USER"))
+                }
+            }
+            Statement::DefineAccess { name, access_type } => {
+                #[cfg(feature = "auth")]
+                {
+                    crate::auth::save_access(
+                        self.storage,
+                        &self.ns,
+                        &self.db,
+                        name,
+                        access_type,
+                        None,
+                    )?;
+                    Ok(Vec::new())
+                }
+                #[cfg(not(feature = "auth"))]
+                {
+                    let _ = (name, access_type);
+                    Err(anyhow!("Enable feature 'auth' to use DEFINE ACCESS"))
+                }
+            }
+            Statement::DefineAnalyzer {
+                name,
+                tokenizers,
+                filters,
+            } => {
+                let key = encode_key(PREFIX_ANALYZER_META, &[&self.ns, &self.db, name]);
+                let meta = serde_json::json!({
+                    "name": name,
+                    "tokenizers": tokenizers,
+                    "filters": filters,
+                });
+                self.put_raw(key, serde_json::to_vec(&meta)?)?;
+                Ok(Vec::new())
+            }
+            Statement::ShowChanges {
+                table,
+                since,
+                limit,
+            } => {
+                let cf_pfx = encode_key(PREFIX_CHANGEFEED, &[&self.ns, &self.db, table]);
+                let mut out = Vec::new();
+                for (_, raw) in self.storage.scan_prefix(&cf_pfx)? {
+                    if let Ok(jv) = serde_json::from_slice::<serde_json::Value>(&raw) {
+                        let seq = jv.get("seq").and_then(|v| v.as_u64()).unwrap_or(0);
+                        if let Some(min_seq) = since {
+                            if seq < *min_seq {
+                                continue;
+                            }
+                        }
+                        out.push(Value::from_json(&jv));
+                        if let Some(lim) = limit {
+                            if out.len() >= *lim {
+                                break;
+                            }
+                        }
+                    }
+                }
+                Ok(out)
+            }
+            Statement::If {
+                cond,
+                then_body,
+                else_body,
+            } => {
+                if self.eval_expr(cond, None, 0)?.is_truthy() {
+                    self.execute_all(then_body)
+                } else {
+                    self.execute_all(else_body)
+                }
+            }
+            Statement::For { var, iter, body } => {
+                let items = match self.eval_expr(iter, None, 0)? {
+                    Value::Array(arr) => arr,
+                    other => vec![other],
+                };
+                let mut last = Vec::new();
+                for item in items {
+                    self.params.insert(var.clone(), item);
+                    last = self.execute_all(body)?;
+                }
+                Ok(last)
+            }
+            Statement::Throw(expr) => {
+                let msg = self.eval_expr(expr, None, 0)?.display_compact();
+                Err(anyhow!("THROW: {}", msg))
+            }
+            Statement::Sleep(dur) => {
+                let secs = crate::stdlib::parse_duration_secs(dur).clamp(0, 5) as u64;
+                if secs > 0 {
+                    std::thread::sleep(std::time::Duration::from_secs(secs));
+                }
                 Ok(Vec::new())
             }
             Statement::DefineField {
@@ -1009,9 +1251,25 @@ impl<'a> ExecContext<'a> {
                 limit,
                 start,
                 fetch,
+                version,
             } => {
-                let (tb, id_opt) = self.resolve_target(target)?;
-                let raw_rows = self.scan_target(&tb, id_opt.as_deref())?;
+                let (tb, _) = self.resolve_target(target)?;
+                let mut raw_rows = self.scan_target_with_range(target, *version)?;
+
+                // Enforce row-level PERMISSIONS WHERE if defined on table and $auth is set
+                if let Some(meta) = self.load_table_meta(&tb)? {
+                    if let Some(ref perm_expr) = meta.permissions_where {
+                        if self.params.contains_key("auth") {
+                            let mut allowed = Vec::new();
+                            for r in raw_rows {
+                                if self.eval_expr(perm_expr, Some(&r), 0)?.is_truthy() {
+                                    allowed.push(r);
+                                }
+                            }
+                            raw_rows = allowed;
+                        }
+                    }
+                }
 
                 // 1. WHERE filter (with HNSW Vector KNN and BM25 FTS scoring support)
                 let mut filtered: Vec<Value> = if let Some(Expr::Binary {
@@ -1318,27 +1576,43 @@ impl<'a> ExecContext<'a> {
 
         let mut frontier = start_id;
         for hop in hops {
-            let mut next_frontier = Vec::new();
             let prefix_byte = match hop.dir {
                 GraphDir::Out => PREFIX_EDGE_OUT,
                 GraphDir::In => PREFIX_EDGE_IN,
             };
-            for (cur_tb, cur_id) in &frontier {
-                let cur_ref = format!("{}:{}", cur_tb, cur_id);
-                let pfx = encode_key(prefix_byte, &[&self.ns, &self.db, &cur_ref, &hop.edge]);
-                for (_, target_bytes) in self.storage.scan_prefix(&pfx)? {
-                    let target_str = String::from_utf8_lossy(&target_bytes);
-                    if let Some((t_tb, t_id)) = target_str.split_once(':') {
-                        if let Some(ref want_tb) = hop.target_table {
-                            if want_tb != t_tb {
-                                continue;
+            let mut collected: Vec<(String, String)> = Vec::new();
+            let mut current_level = frontier.clone();
+            let mut visited = std::collections::HashSet::new();
+
+            for depth in 1..=hop.max_depth.max(1) {
+                let mut next_level = Vec::new();
+                for (cur_tb, cur_id) in &current_level {
+                    let cur_ref = format!("{}:{}", cur_tb, cur_id);
+                    let pfx = encode_key(prefix_byte, &[&self.ns, &self.db, &cur_ref, &hop.edge]);
+                    for (_, target_bytes) in self.storage.scan_prefix(&pfx)? {
+                        let target_str = String::from_utf8_lossy(&target_bytes);
+                        if let Some((t_tb, t_id)) = target_str.split_once(':') {
+                            if let Some(ref want_tb) = hop.target_table {
+                                if want_tb != t_tb {
+                                    continue;
+                                }
+                            }
+                            let pair = (t_tb.to_string(), t_id.to_string());
+                            if visited.insert(pair.clone()) {
+                                next_level.push(pair.clone());
+                                if depth >= hop.min_depth {
+                                    collected.push(pair);
+                                }
                             }
                         }
-                        next_frontier.push((t_tb.to_string(), t_id.to_string()));
                     }
                 }
+                if next_level.is_empty() {
+                    break;
+                }
+                current_level = next_level;
             }
-            frontier = next_frontier;
+            frontier = collected;
         }
 
         let mut out = Vec::with_capacity(frontier.len());
@@ -1521,6 +1795,31 @@ impl<'a> ExecContext<'a> {
                 if name.eq_ignore_ascii_case("search::score") {
                     return Ok(Value::Float(self.last_fts_score));
                 }
+                if name.eq_ignore_ascii_case("session::ns") {
+                    return Ok(Value::String(self.ns.clone()));
+                }
+                if name.eq_ignore_ascii_case("session::db") {
+                    return Ok(Value::String(self.db.clone()));
+                }
+                if name.eq_ignore_ascii_case("graph::shortest_path") {
+                    return self.eval_shortest_path(&eval_args);
+                }
+                #[cfg(feature = "files")]
+                if name.starts_with("file::") {
+                    return crate::files::eval_file_fn(
+                        self.storage,
+                        &self.ns,
+                        &self.db,
+                        &name.to_ascii_lowercase(),
+                        &eval_args,
+                    );
+                }
+                #[cfg(feature = "ml")]
+                if name.starts_with("ml::") {
+                    if let Some(reg) = self.ml {
+                        return reg.eval(name, &eval_args);
+                    }
+                }
                 if name.starts_with("fn::") {
                     if let Some(fmeta) = self.load_function(name)? {
                         let mut fn_params = self.params.clone();
@@ -1540,6 +1839,60 @@ impl<'a> ExecContext<'a> {
                 eval_stdlib(name, &eval_args)
             }
         }
+    }
+
+    /// BFS shortest path between two RecordIds over `edge`: `graph::shortest_path(from, 'knows', to)`.
+    fn eval_shortest_path(&self, args: &[Value]) -> Result<Value> {
+        let start = args
+            .first()
+            .ok_or_else(|| anyhow!("graph::shortest_path requires (from, edge, to)"))?
+            .display_compact();
+        let edge = args
+            .get(1)
+            .ok_or_else(|| anyhow!("graph::shortest_path requires (from, edge, to)"))?
+            .display_compact();
+        let goal = args
+            .get(2)
+            .ok_or_else(|| anyhow!("graph::shortest_path requires (from, edge, to)"))?
+            .display_compact();
+
+        let mut queue = std::collections::VecDeque::new();
+        let mut visited = std::collections::HashSet::new();
+        queue.push_back(vec![start.clone()]);
+        visited.insert(start);
+
+        while let Some(path) = queue.pop_front() {
+            let curr = path.last().unwrap();
+            if curr == &goal {
+                let ids: Vec<Value> = path
+                    .into_iter()
+                    .map(|s| {
+                        if let Some((tb, id)) = s.split_once(':') {
+                            Value::RecordId {
+                                tb: tb.to_string(),
+                                id: id.to_string(),
+                            }
+                        } else {
+                            Value::String(s)
+                        }
+                    })
+                    .collect();
+                return Ok(Value::Array(ids));
+            }
+            if path.len() > 16 {
+                continue;
+            }
+            let pfx = encode_key(PREFIX_EDGE_OUT, &[&self.ns, &self.db, curr, &edge]);
+            for (_, target_bytes) in self.storage.scan_prefix(&pfx)? {
+                let next = String::from_utf8_lossy(&target_bytes).to_string();
+                if visited.insert(next.clone()) {
+                    let mut next_path = path.clone();
+                    next_path.push(next);
+                    queue.push_back(next_path);
+                }
+            }
+        }
+        Ok(Value::Array(Vec::new()))
     }
 }
 

@@ -10,10 +10,18 @@ pub mod value;
 pub mod search;
 #[cfg(feature = "vector")]
 pub mod vector_hnsw;
+#[cfg(feature = "files")]
+pub mod files;
+#[cfg(feature = "auth")]
+pub mod auth;
 #[cfg(feature = "geo")]
 pub mod geo;
 #[cfg(feature = "crypto")]
 pub mod crypto_ext;
+#[cfg(feature = "graphql")]
+pub mod graphql;
+#[cfg(feature = "ml")]
+pub mod ml;
 
 use anyhow::Result;
 use std::collections::HashMap;
@@ -32,6 +40,8 @@ pub use crate::value::Value;
 pub struct NexusDb {
     storage: Arc<dyn StorageBackend>,
     live: Arc<LiveBroker>,
+    #[cfg(feature = "ml")]
+    ml: Arc<crate::ml::MlRegistry>,
 }
 
 impl NexusDb {
@@ -40,6 +50,8 @@ impl NexusDb {
         Self {
             storage: Arc::new(MemStorage::new()),
             live: Arc::new(LiveBroker::new()),
+            #[cfg(feature = "ml")]
+            ml: Arc::new(crate::ml::MlRegistry::new()),
         }
     }
 
@@ -48,7 +60,39 @@ impl NexusDb {
         Ok(Self {
             storage: Arc::new(RedbStorage::open(path)?),
             live: Arc::new(LiveBroker::new()),
+            #[cfg(feature = "ml")]
+            ml: Arc::new(crate::ml::MlRegistry::new()),
         })
+    }
+
+    /// Execute a GraphQL query against `(ns, db)` (`feature = "graphql"`).
+    #[cfg(feature = "graphql")]
+    pub fn graphql(&self, ns: &str, db: &str, query: &str) -> Result<serde_json::Value> {
+        crate::graphql::execute_graphql(self, ns, db, query)
+    }
+
+    /// Register a SurrealML-compatible linear model (`feature = "ml"`).
+    #[cfg(feature = "ml")]
+    pub fn register_ml_model(&self, model: crate::ml::LinearModel) {
+        self.ml.register(model);
+    }
+
+    /// Authenticate a user defined via `DEFINE USER` (`feature = "auth"`).
+    #[cfg(feature = "auth")]
+    pub fn authenticate_user(
+        &self,
+        ns: &str,
+        db: &str,
+        username: &str,
+        password: &str,
+    ) -> Result<Option<crate::auth::UserMeta>> {
+        crate::auth::authenticate_user(
+            self.storage.as_ref(),
+            &sanitize_ident(ns),
+            &sanitize_ident(db),
+            username,
+            password,
+        )
     }
 
     /// Subscribe to real-time `LIVE SELECT` notifications on `(ns, db, table)`.
@@ -89,6 +133,10 @@ impl NexusDb {
             sanitize_ident(db),
             params,
         );
+        #[cfg(feature = "ml")]
+        {
+            ctx.ml = Some(self.ml.as_ref());
+        }
         ctx.execute_all(&stmts)
     }
 
@@ -498,5 +546,140 @@ mod tests {
         let decoded = crate::rpc::cbor_decode(&resp_cbor, &mut pos).unwrap();
         assert_eq!(decoded["id"], 7);
         assert!(decoded["result"].as_str().unwrap().contains("nexus-db"));
+
+        // Files & Buckets (`DEFINE BUCKET` + `f"bucket:/key"` + `file::put/get/head/exists/list/copy/rename/delete`)
+        db.query_scoped(
+            "ext",
+            "main",
+            "DEFINE BUCKET media BACKEND 'memory';
+             RETURN file::put(f'media:/hello.txt', 'nexus-bytes');",
+            vec![],
+        )
+        .unwrap();
+        let exists = db
+            .query_scoped("ext", "main", "RETURN file::exists(f'media:/hello.txt');", vec![])
+            .unwrap();
+        assert_eq!(exists, vec![Value::Bool(true)]);
+        let got = db
+            .query_scoped("ext", "main", "RETURN file::get(f'media:/hello.txt');", vec![])
+            .unwrap();
+        assert_eq!(got, vec![Value::Bytes(b"nexus-bytes".to_vec())]);
+        let listed = db
+            .query_scoped("ext", "main", "RETURN file::list('media');", vec![])
+            .unwrap();
+        assert_eq!(listed, vec![Value::Array(vec![Value::String("media:/hello.txt".into())])]);
+
+        // Auth (`DEFINE USER`, `DEFINE ACCESS`, `PERMISSIONS WHERE`, `crypto::argon2::generate/compare`)
+        db.query_scoped(
+            "ext",
+            "main",
+            "DEFINE USER alice ON DATABASE PASSWORD 'secret' ROLES OWNER;
+             DEFINE ACCESS user_jwt ON DATABASE TYPE JWT;
+             DEFINE TABLE secret_doc SCHEMALESS PERMISSIONS FOR select WHERE owner == $auth;",
+            vec![],
+        )
+        .unwrap();
+        assert!(db.authenticate_user("ext", "main", "alice", "secret").unwrap().is_some());
+        assert!(db.authenticate_user("ext", "main", "alice", "wrong").unwrap().is_none());
+
+        db.query_scoped(
+            "ext",
+            "main",
+            "CREATE secret_doc:1 SET owner = 'alice', title = 'Mine';
+             CREATE secret_doc:2 SET owner = 'bob', title = 'Theirs';",
+            vec![],
+        )
+        .unwrap();
+        let visible = db
+            .query_scoped(
+                "ext",
+                "main",
+                "SELECT VALUE title FROM secret_doc;",
+                vec![("auth".into(), Value::String("alice".into()))],
+            )
+            .unwrap();
+        assert_eq!(visible, vec![Value::String("Mine".into())]);
+
+        // Changefeed + Materialized View + MVCC VERSION + Composite Range + IF/FOR + Recursive Graph + Shortest Path
+        db.query_scoped(
+            "ext",
+            "main",
+            "DEFINE TABLE metric SCHEMALESS CHANGEFEED 1h;
+             DEFINE TABLE high_metric AS SELECT * FROM metric WHERE val >= 50;
+             CREATE metric:['s1', 1] SET val = 20;
+             CREATE metric:['s1', 2] SET val = 80;
+             UPDATE metric:['s1', 2] SET val = 95;",
+            vec![],
+        )
+        .unwrap();
+
+        let changes = db
+            .query_scoped("ext", "main", "SHOW CHANGES FOR TABLE metric SINCE 1;", vec![])
+            .unwrap();
+        assert_eq!(changes.len(), 3);
+
+        let view_rows = db
+            .query_scoped("ext", "main", "SELECT VALUE val FROM high_metric;", vec![])
+            .unwrap();
+        assert_eq!(view_rows, vec![Value::Int(95)]);
+
+        let old_ver = db
+            .query_scoped("ext", "main", "SELECT VALUE val FROM metric:['s1', 2] VERSION 1;", vec![])
+            .unwrap();
+        assert_eq!(old_ver, vec![Value::Int(80)]);
+
+        let range_rows = db
+            .query_scoped("ext", "main", "SELECT VALUE val FROM metric:['s1', 1]..['s1', 2] ORDER BY val ASC;", vec![])
+            .unwrap();
+        assert_eq!(range_rows, vec![Value::Int(20), Value::Int(95)]);
+
+        // IF / FOR procedural SurrealQL
+        let proc_out = db
+            .query_scoped(
+                "ext",
+                "main",
+                "FOR $x IN [1, 2, 3] { IF $x > 2 { CREATE bag SET n = $x } };
+                 SELECT VALUE n FROM bag;",
+                vec![],
+            )
+            .unwrap();
+        assert_eq!(proc_out, vec![Value::Int(3)]);
+
+        // Recursive Graph `@{1..2}` & `graph::shortest_path`
+        db.query_scoped(
+            "ext",
+            "main",
+            "CREATE node:a SET label = 'A';
+             CREATE node:b SET label = 'B';
+             CREATE node:c SET label = 'C';
+             RELATE node:a->link->node:b;
+             RELATE node:b->link->node:c;",
+            vec![],
+        )
+        .unwrap();
+        let rec_g = db
+            .query_scoped("ext", "main", "SELECT ->link@{1..2}->node.label AS reach FROM node:a;", vec![])
+            .unwrap();
+        assert_eq!(rec_g[0].to_json()["reach"].as_array().unwrap().len(), 2);
+
+        let sp = db
+            .query_scoped("ext", "main", "RETURN graph::shortest_path(node:a, 'link', node:c);", vec![])
+            .unwrap();
+        assert_eq!(sp[0].to_json().as_array().unwrap().len(), 3);
+
+        // GraphQL + SurrealML (`feature = "graphql"`, `feature = "ml"`)
+        let gql = db.graphql("ext", "main", "query { node(limit: 2) { label } }").unwrap();
+        assert_eq!(gql["data"]["node"].as_array().unwrap().len(), 2);
+
+        db.register_ml_model(crate::ml::LinearModel {
+            name: "price".into(),
+            version: "1.0".into(),
+            weights: vec![2.0, 3.0],
+            bias: 1.0,
+        });
+        let pred = db
+            .query_scoped("ext", "main", "RETURN ml::price([4.0, 5.0]);", vec![])
+            .unwrap();
+        assert_eq!(pred, vec![Value::Float(24.0)]);
     }
 }

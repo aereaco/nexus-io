@@ -112,6 +112,86 @@ pub fn eval_stdlib(name: &str, args: &[Value]) -> Result<Value> {
         "time::year" => Ok(Value::Int(Utc::now().year() as i64)),
         "time::month" => Ok(Value::Int(Utc::now().month() as i64)),
         "time::day" => Ok(Value::Int(Utc::now().day() as i64)),
+        "time::floor" | "time::group" => {
+            // Bucket ISO-8601 timestamp to 'year' | 'month' | 'day' | 'hour' | 'minute'
+            let ts = args.first().and_then(|v| v.as_str()).unwrap_or("");
+            let unit = args.get(1).and_then(|v| v.as_str()).unwrap_or("day").to_ascii_lowercase();
+            let prefix_len = match unit.as_str() {
+                "year" | "1y" => 4,
+                "month" | "1mo" => 7,
+                "day" | "1d" => 10,
+                "hour" | "1h" => 13,
+                "minute" | "1m" => 16,
+                _ => ts.len(),
+            };
+            Ok(Value::DateTime(ts.chars().take(prefix_len).collect()))
+        }
+
+        // --- duration::* ---
+        "duration::secs" => Ok(Value::Int(parse_duration_secs(args.first().map(|v| v.display_compact()).as_deref().unwrap_or("0s")))),
+        "duration::mins" => Ok(Value::Int(parse_duration_secs(args.first().map(|v| v.display_compact()).as_deref().unwrap_or("0s")) / 60)),
+        "duration::hours" => Ok(Value::Int(parse_duration_secs(args.first().map(|v| v.display_compact()).as_deref().unwrap_or("0s")) / 3600)),
+        "duration::days" => Ok(Value::Int(parse_duration_secs(args.first().map(|v| v.display_compact()).as_deref().unwrap_or("0s")) / 86400)),
+
+        // --- bytes::* ---
+        "bytes::len" => match args.first() {
+            Some(Value::Bytes(b)) => Ok(Value::Int(b.len() as i64)),
+            Some(Value::String(s)) => Ok(Value::Int(s.len() as i64)),
+            _ => Ok(Value::Int(0)),
+        },
+
+        // --- parse::* ---
+        "parse::email::host" => {
+            let s = args.first().and_then(|v| v.as_str()).unwrap_or("");
+            Ok(s.split_once('@')
+                .map(|(_, h)| Value::String(h.to_string()))
+                .unwrap_or(Value::None))
+        }
+        "parse::email::user" => {
+            let s = args.first().and_then(|v| v.as_str()).unwrap_or("");
+            Ok(s.split_once('@')
+                .map(|(u, _)| Value::String(u.to_string()))
+                .unwrap_or(Value::None))
+        }
+        "parse::url::host" => {
+            let s = args.first().and_then(|v| v.as_str()).unwrap_or("");
+            let rest = s.split("://").nth(1).unwrap_or(s);
+            let host = rest.split('/').next().unwrap_or("").split(':').next().unwrap_or("");
+            Ok(Value::String(host.to_string()))
+        }
+        "parse::url::path" => {
+            let s = args.first().and_then(|v| v.as_str()).unwrap_or("");
+            let rest = s.split("://").nth(1).unwrap_or(s);
+            let path = rest.find('/').map(|i| &rest[i..]).unwrap_or("/");
+            Ok(Value::String(path.split('?').next().unwrap_or(path).to_string()))
+        }
+
+        // --- encoding::base64::* ---
+        "encoding::base64::encode" => {
+            let bytes = match args.first() {
+                Some(Value::Bytes(b)) => b.as_slice(),
+                Some(Value::String(s)) => s.as_bytes(),
+                _ => &[],
+            };
+            Ok(Value::String(base64_encode_std(bytes)))
+        }
+        "encoding::base64::decode" => {
+            let s = args.first().and_then(|v| v.as_str()).unwrap_or("");
+            Ok(Value::Bytes(base64_decode_std(s)))
+        }
+
+        // --- auth password hashing (`crypto::argon2::generate/compare`) ---
+        #[cfg(feature = "auth")]
+        "crypto::argon2::generate" | "crypto::bcrypt::generate" | "crypto::scrypt::generate" => {
+            let pass = args.first().map(|v| v.display_compact()).unwrap_or_default();
+            Ok(Value::String(crate::auth::hash_password(&pass)))
+        }
+        #[cfg(feature = "auth")]
+        "crypto::argon2::compare" | "crypto::bcrypt::compare" | "crypto::scrypt::compare" => {
+            let hash = args.first().map(|v| v.display_compact()).unwrap_or_default();
+            let pass = args.get(1).map(|v| v.display_compact()).unwrap_or_default();
+            Ok(Value::Bool(crate::auth::verify_password(&hash, &pass)))
+        }
 
         // --- rand::* ---
         "rand::uuid" | "rand::uuid::v4" => Ok(Value::String(Uuid::new_v4().to_string())),
@@ -370,4 +450,67 @@ pub fn eval_stdlib(name: &str, args: &[Value]) -> Result<Value> {
 
         other => Err(anyhow!("Unknown SurrealQL function '{}'", other)),
     }
+}
+
+/// Parse SurrealQL duration strings (`30s`, `5m`, `2h`, `7d`, `1w`) into seconds.
+pub fn parse_duration_secs(s: &str) -> i64 {
+    let trimmed = s.trim();
+    if let Some(n) = trimmed.strip_suffix("ms").and_then(|x| x.parse::<i64>().ok()) {
+        return n / 1000;
+    }
+    if let Some(n) = trimmed.strip_suffix('s').and_then(|x| x.parse::<i64>().ok()) {
+        return n;
+    }
+    if let Some(n) = trimmed.strip_suffix('m').and_then(|x| x.parse::<i64>().ok()) {
+        return n * 60;
+    }
+    if let Some(n) = trimmed.strip_suffix('h').and_then(|x| x.parse::<i64>().ok()) {
+        return n * 3600;
+    }
+    if let Some(n) = trimmed.strip_suffix('d').and_then(|x| x.parse::<i64>().ok()) {
+        return n * 86400;
+    }
+    if let Some(n) = trimmed.strip_suffix('w').and_then(|x| x.parse::<i64>().ok()) {
+        return n * 604800;
+    }
+    trimmed.parse::<i64>().unwrap_or(0)
+}
+
+fn base64_encode_std(data: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[((n >> 18) & 63) as usize] as char);
+        out.push(TABLE[((n >> 12) & 63) as usize] as char);
+        out.push(if chunk.len() > 1 { TABLE[((n >> 6) & 63) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 2 { TABLE[(n & 63) as usize] as char } else { '=' });
+    }
+    out
+}
+
+fn base64_decode_std(s: &str) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut buf = 0u32;
+    let mut bits = 0u8;
+    for b in s.bytes() {
+        let val = match b {
+            b'A'..=b'Z' => b - b'A',
+            b'a'..=b'z' => b - b'a' + 26,
+            b'0'..=b'9' => b - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => continue,
+        };
+        buf = (buf << 6) | (val as u32);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push(((buf >> bits) & 0xFF) as u8);
+        }
+    }
+    out
 }

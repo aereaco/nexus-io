@@ -19,6 +19,13 @@ pub const PREFIX_FIELD_META: u8 = 0x09;
 pub const PREFIX_INDEX_META: u8 = 0x0A;
 pub const PREFIX_EVENT_META: u8 = 0x0B;
 pub const PREFIX_FUNCTION_META: u8 = 0x0C;
+pub const PREFIX_CHANGEFEED: u8 = 0x0D;
+pub const PREFIX_VERSION: u8 = 0x0E;
+pub const PREFIX_BUCKET_META: u8 = 0x0F;
+pub const PREFIX_FILE_BLOB: u8 = 0x10;
+pub const PREFIX_USER_META: u8 = 0x11;
+pub const PREFIX_ACCESS_META: u8 = 0x12;
+pub const PREFIX_ANALYZER_META: u8 = 0x13;
 
 /// Build a `\x00`-delimited ordered binary key for prefix scans.
 pub fn encode_key(prefix: u8, parts: &[&str]) -> Vec<u8> {

@@ -6,13 +6,17 @@ description = "Clean-room, MIT-licensed, ultra-low-footprint SurrealQL-compatibl
 license = "MIT"
 
 [features]
-default = ["fts", "vector"]
+default = ["fts", "vector", "files", "auth"]
 fts = []
 vector = []
+files = []
+auth = []
 geo = []
 crypto = ["dep:blake3"]
 cbor = []
-full = ["fts", "vector", "geo", "crypto", "cbor"]
+graphql = []
+ml = []
+full = ["fts", "vector", "files", "auth", "geo", "crypto", "cbor", "graphql", "ml"]
 
 [dependencies]
 anyhow = "1.0"

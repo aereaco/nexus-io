@@ -8,12 +8,14 @@ pub enum GraphDir {
     In,
 }
 
-/// One hop in a graph traversal expression (e.g. `->knows->person`).
+/// One hop in a graph traversal expression (e.g. `->knows->person` or `->knows@{1..3}->person`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GraphHop {
     pub dir: GraphDir,
     pub edge: String,
     pub target_table: Option<String>,
+    pub min_depth: usize,
+    pub max_depth: usize,
 }
 
 /// Index kind for `DEFINE INDEX`.
@@ -62,7 +64,46 @@ pub enum Statement {
         name: String,
         if_not_exists: bool,
         schemafull: bool,
+        changefeed: Option<String>,
+        as_view: Option<Box<Statement>>,
+        permissions_where: Option<Expr>,
     },
+    DefineBucket {
+        name: String,
+        backend: String,
+    },
+    DefineUser {
+        name: String,
+        level: String,
+        password: String,
+        roles: Vec<String>,
+    },
+    DefineAccess {
+        name: String,
+        access_type: String,
+    },
+    DefineAnalyzer {
+        name: String,
+        tokenizers: Vec<String>,
+        filters: Vec<String>,
+    },
+    ShowChanges {
+        table: String,
+        since: Option<u64>,
+        limit: Option<usize>,
+    },
+    If {
+        cond: Expr,
+        then_body: Vec<Statement>,
+        else_body: Vec<Statement>,
+    },
+    For {
+        var: String,
+        iter: Expr,
+        body: Vec<Statement>,
+    },
+    Throw(Expr),
+    Sleep(String),
     DefineField {
         name: String,
         table: String,
@@ -102,6 +143,7 @@ pub enum Statement {
         limit: Option<usize>,
         start: Option<usize>,
         fetch: Vec<String>,
+        version: Option<u64>,
     },
     Create {
         target: Target,
@@ -155,6 +197,7 @@ pub enum Projection {
 pub enum Target {
     Table(String),
     Record { tb: String, id: String },
+    RecordRange { tb: String, start: String, end: String },
     RecordFn { tb_expr: Expr, id_expr: Expr },
 }
 
@@ -235,6 +278,8 @@ enum Token {
     Colon,
     DoubleColon,
     Dot,
+    DotDot,
+    At,
     Star,
     Plus,
     Minus,
@@ -339,7 +384,12 @@ impl<'a> Lexer<'a> {
                 }
                 '.' => {
                     self.chars.next();
-                    tokens.push(Token::Dot);
+                    if self.chars.peek() == Some(&'.') {
+                        self.chars.next();
+                        tokens.push(Token::DotDot);
+                    } else {
+                        tokens.push(Token::Dot);
+                    }
                 }
                 '*' => {
                     self.chars.next();
@@ -363,7 +413,7 @@ impl<'a> Lexer<'a> {
                         self.chars.next();
                         tokens.push(Token::FtsOp);
                     } else {
-                        return Err(anyhow!("Expected '@@' full-text operator"));
+                        tokens.push(Token::At);
                     }
                 }
                 ':' => {
@@ -481,9 +531,15 @@ impl<'a> Lexer<'a> {
                             num.push(ch);
                             self.chars.next();
                         } else if ch == '.' && !is_float {
-                            is_float = true;
-                            num.push(ch);
-                            self.chars.next();
+                            let mut lookahead = self.chars.clone();
+                            lookahead.next();
+                            if lookahead.peek().map(|n| n.is_ascii_digit()).unwrap_or(false) {
+                                is_float = true;
+                                num.push(ch);
+                                self.chars.next();
+                            } else {
+                                break;
+                            }
                         } else {
                             break;
                         }
@@ -515,7 +571,22 @@ impl<'a> Lexer<'a> {
                             break;
                         }
                     }
-                    tokens.push(Token::Ident(ident));
+                    // File pointer literal `f"bucket:/key"` or datetime literal `d"2026-01-01"`
+                    if (ident == "f" || ident == "d")
+                        && matches!(self.chars.peek(), Some('"') | Some('\''))
+                    {
+                        let quote = self.chars.next().unwrap();
+                        let mut s = String::new();
+                        while let Some(c2) = self.chars.next() {
+                            if c2 == quote {
+                                break;
+                            }
+                            s.push(c2);
+                        }
+                        tokens.push(Token::Str(s));
+                    } else {
+                        tokens.push(Token::Ident(ident));
+                    }
                 }
                 other => return Err(anyhow!("Unexpected character in SurrealQL: '{}'", other)),
             }
@@ -633,6 +704,64 @@ impl Parser {
                 return Ok(Statement::InfoForTable(self.expect_ident()?));
             }
             return Err(anyhow!("Expected DB or TABLE after INFO FOR"));
+        }
+        if self.eat_kw("SHOW") {
+            let _ = self.eat_kw("CHANGES");
+            let _ = self.eat_kw("FOR");
+            let _ = self.eat_kw("TABLE");
+            let table = self.expect_ident()?;
+            let mut since = None;
+            let mut limit = None;
+            if self.eat_kw("SINCE") {
+                if let Token::Int(n) = self.next() {
+                    since = Some(n.max(0) as u64);
+                }
+            }
+            if self.eat_kw("LIMIT") {
+                if let Token::Int(n) = self.next() {
+                    limit = Some(n.max(0) as usize);
+                }
+            }
+            return Ok(Statement::ShowChanges { table, since, limit });
+        }
+        if self.eat_kw("IF") {
+            let cond = self.parse_expr()?;
+            let then_body = self.parse_block()?;
+            let else_body = if self.eat_kw("ELSE") {
+                if self.is_kw("IF") {
+                    vec![self.parse_statement()?]
+                } else {
+                    self.parse_block()?
+                }
+            } else {
+                Vec::new()
+            };
+            return Ok(Statement::If {
+                cond,
+                then_body,
+                else_body,
+            });
+        }
+        if self.eat_kw("FOR") {
+            let var = match self.next() {
+                Token::Param(p) | Token::Ident(p) => p,
+                other => return Err(anyhow!("Expected $var in FOR loop, got {:?}", other)),
+            };
+            let _ = self.eat_kw("IN");
+            let iter = self.parse_expr()?;
+            let body = self.parse_block()?;
+            return Ok(Statement::For { var, iter, body });
+        }
+        if self.eat_kw("THROW") {
+            return Ok(Statement::Throw(self.parse_expr()?));
+        }
+        if self.eat_kw("SLEEP") {
+            let dur = match self.next() {
+                Token::Str(s) | Token::Ident(s) => s,
+                Token::Int(n) => format!("{}ms", n),
+                _ => "0ms".to_string(),
+            };
+            return Ok(Statement::Sleep(dur));
         }
         if self.eat_kw("BEGIN") {
             let _ = self.eat_kw("TRANSACTION");
@@ -796,20 +925,186 @@ impl Parser {
         Err(anyhow!("Unexpected token at statement start: {:?}", self.peek()))
     }
 
+    fn parse_block(&mut self) -> Result<Vec<Statement>> {
+        let mut stmts = Vec::new();
+        if matches!(self.peek(), Token::LBrace) {
+            self.next();
+            while !matches!(self.peek(), Token::RBrace | Token::Eof) {
+                while matches!(self.peek(), Token::Semicolon) {
+                    self.next();
+                }
+                if matches!(self.peek(), Token::RBrace | Token::Eof) {
+                    break;
+                }
+                stmts.push(self.parse_statement()?);
+                if matches!(self.peek(), Token::Semicolon) {
+                    self.next();
+                }
+            }
+            if matches!(self.peek(), Token::RBrace) {
+                self.next();
+            }
+        } else {
+            let _ = self.eat_kw("THEN");
+            stmts.push(self.parse_statement()?);
+            let _ = self.eat_kw("END");
+        }
+        Ok(stmts)
+    }
+
     fn parse_define(&mut self) -> Result<Statement> {
         if self.eat_kw("TABLE") {
             let if_not_exists = self.eat_if_not_exists();
             let name = self.expect_ident()?;
             let mut schemafull = false;
-            if self.eat_kw("SCHEMAFULL") {
-                schemafull = true;
-            } else {
-                let _ = self.eat_kw("SCHEMALESS");
+            let mut changefeed = None;
+            let mut as_view = None;
+            let mut permissions_where = None;
+            loop {
+                if self.eat_kw("SCHEMAFULL") {
+                    schemafull = true;
+                } else if self.eat_kw("SCHEMALESS") {
+                    schemafull = false;
+                } else if self.eat_kw("CHANGEFEED") {
+                    let dur = match self.next() {
+                        Token::Str(s) | Token::Ident(s) => s,
+                        Token::Int(n) => {
+                            let unit = if matches!(self.peek(), Token::Ident(_)) {
+                                self.expect_ident().unwrap_or_default()
+                            } else {
+                                "s".to_string()
+                            };
+                            format!("{}{}", n, unit)
+                        }
+                        _ => "1h".to_string(),
+                    };
+                    changefeed = Some(dur);
+                } else if self.eat_kw("AS") {
+                    if self.eat_kw("SELECT") {
+                        as_view = Some(Box::new(self.parse_select()?));
+                    }
+                } else if self.eat_kw("PERMISSIONS") {
+                    if self.eat_kw("NONE") {
+                        permissions_where = Some(Expr::Bool(false));
+                    } else if self.eat_kw("FULL") {
+                        permissions_where = Some(Expr::Bool(true));
+                    } else {
+                        let _ = self.eat_kw("FOR");
+                        while !self.is_kw("WHERE") && !matches!(self.peek(), Token::Semicolon | Token::Eof) {
+                            self.next();
+                        }
+                        if self.eat_kw("WHERE") {
+                            permissions_where = Some(self.parse_expr()?);
+                        }
+                    }
+                } else {
+                    break;
+                }
             }
             return Ok(Statement::DefineTable {
                 name,
                 if_not_exists,
                 schemafull,
+                changefeed,
+                as_view,
+                permissions_where,
+            });
+        }
+
+        if self.eat_kw("BUCKET") {
+            let _ = self.eat_if_not_exists();
+            let name = self.expect_ident()?;
+            let mut backend = "memory".to_string();
+            if self.eat_kw("BACKEND") {
+                if let Token::Str(s) | Token::Ident(s) = self.next() {
+                    backend = s;
+                }
+            }
+            return Ok(Statement::DefineBucket { name, backend });
+        }
+
+        if self.eat_kw("USER") {
+            let _ = self.eat_if_not_exists();
+            let name = self.expect_ident()?;
+            let mut level = "DATABASE".to_string();
+            let mut password = String::new();
+            let mut roles = Vec::new();
+            loop {
+                if self.eat_kw("ON") {
+                    level = self.expect_ident()?.to_ascii_uppercase();
+                } else if self.eat_kw("PASSWORD") {
+                    if let Token::Str(s) | Token::Ident(s) = self.next() {
+                        password = s;
+                    }
+                } else if self.eat_kw("ROLES") {
+                    loop {
+                        roles.push(self.expect_ident()?);
+                        if matches!(self.peek(), Token::Comma) {
+                            self.next();
+                        } else {
+                            break;
+                        }
+                    }
+                } else {
+                    break;
+                }
+            }
+            return Ok(Statement::DefineUser {
+                name,
+                level,
+                password,
+                roles,
+            });
+        }
+
+        if self.eat_kw("ACCESS") {
+            let _ = self.eat_if_not_exists();
+            let name = self.expect_ident()?;
+            let mut access_type = "RECORD".to_string();
+            while !matches!(self.peek(), Token::Semicolon | Token::Eof) {
+                if self.eat_kw("TYPE") {
+                    if let Ok(t) = self.expect_ident() {
+                        access_type = t.to_ascii_uppercase();
+                    }
+                } else {
+                    self.next();
+                }
+            }
+            return Ok(Statement::DefineAccess { name, access_type });
+        }
+
+        if self.eat_kw("ANALYZER") {
+            let _ = self.eat_if_not_exists();
+            let name = self.expect_ident()?;
+            let mut tokenizers = Vec::new();
+            let mut filters = Vec::new();
+            while !matches!(self.peek(), Token::Semicolon | Token::Eof) {
+                if self.eat_kw("TOKENIZERS") {
+                    loop {
+                        tokenizers.push(self.expect_ident()?);
+                        if matches!(self.peek(), Token::Comma) {
+                            self.next();
+                        } else {
+                            break;
+                        }
+                    }
+                } else if self.eat_kw("FILTERS") {
+                    loop {
+                        filters.push(self.expect_ident()?);
+                        if matches!(self.peek(), Token::Comma) {
+                            self.next();
+                        } else {
+                            break;
+                        }
+                    }
+                } else {
+                    self.next();
+                }
+            }
+            return Ok(Statement::DefineAnalyzer {
+                name,
+                tokenizers,
+                filters,
             });
         }
 
@@ -1105,6 +1400,14 @@ impl Parser {
                 }
             }
         }
+        let version = if self.eat_kw("VERSION") {
+            match self.next() {
+                Token::Int(n) if n >= 0 => Some(n as u64),
+                _ => None,
+            }
+        } else {
+            None
+        };
 
         Ok(Statement::Select {
             value_only,
@@ -1118,6 +1421,7 @@ impl Parser {
             limit,
             start,
             fetch,
+            version,
         })
     }
 
@@ -1145,15 +1449,47 @@ impl Parser {
 
         if matches!(self.peek(), Token::Colon) {
             self.next();
-            let id = match self.next() {
-                Token::Ident(s) | Token::Str(s) => s,
-                Token::Int(n) => n.to_string(),
-                other => return Err(anyhow!("Expected record id after ':', got {:?}", other)),
-            };
+            let id = self.parse_record_id_part()?;
+            if matches!(self.peek(), Token::DotDot) {
+                self.next();
+                let end = self.parse_record_id_part()?;
+                return Ok(Target::RecordRange {
+                    tb: first,
+                    start: id,
+                    end,
+                });
+            }
             return Ok(Target::Record { tb: first, id });
         }
 
         Ok(Target::Table(first))
+    }
+
+    fn parse_record_id_part(&mut self) -> Result<String> {
+        if matches!(self.peek(), Token::LBracket) {
+            self.next();
+            let mut parts = Vec::new();
+            while !matches!(self.peek(), Token::RBracket | Token::Eof) {
+                match self.next() {
+                    Token::Ident(s) | Token::Str(s) => parts.push(s),
+                    Token::Int(n) => parts.push(format!("{:020}", n)),
+                    Token::Float(f) => parts.push(f.to_string()),
+                    _ => {}
+                }
+                if matches!(self.peek(), Token::Comma) {
+                    self.next();
+                }
+            }
+            if matches!(self.peek(), Token::RBracket) {
+                self.next();
+            }
+            return Ok(parts.join("|"));
+        }
+        match self.next() {
+            Token::Ident(s) | Token::Str(s) => Ok(s),
+            Token::Int(n) => Ok(n.to_string()),
+            other => Err(anyhow!("Expected record id after ':', got {:?}", other)),
+        }
     }
 
     fn parse_mutation_data(&mut self) -> Result<MutationData> {
@@ -1347,6 +1683,28 @@ impl Parser {
                 _ => unreachable!(),
             };
             let edge = self.expect_ident()?;
+            let mut min_depth = 1usize;
+            let mut max_depth = 1usize;
+            // Optional recursive depth `@{min..max}` or `@{depth}`
+            if matches!(self.peek(), Token::At) {
+                self.next();
+                if matches!(self.peek(), Token::LBrace) {
+                    self.next();
+                    if let Token::Int(n) = self.next() {
+                        min_depth = n.max(1) as usize;
+                        max_depth = min_depth;
+                    }
+                    if matches!(self.peek(), Token::DotDot) {
+                        self.next();
+                        if let Token::Int(m) = self.next() {
+                            max_depth = m.max(min_depth as i64) as usize;
+                        }
+                    }
+                    if matches!(self.peek(), Token::RBrace) {
+                        self.next();
+                    }
+                }
+            }
             let mut target_table = None;
             if matches!(self.peek(), Token::ArrowRight | Token::ArrowLeft) {
                 self.next();
@@ -1360,6 +1718,8 @@ impl Parser {
                 dir,
                 edge,
                 target_table,
+                min_depth,
+                max_depth,
             });
         }
         let tail_field = if matches!(self.peek(), Token::Dot) {
