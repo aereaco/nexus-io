@@ -16,7 +16,9 @@ crypto = ["dep:blake3"]
 cbor = []
 graphql = []
 ml = []
-full = ["fts", "vector", "files", "auth", "geo", "crypto", "cbor", "graphql", "ml"]
+gql = []
+pgwire = []
+full = ["fts", "vector", "files", "auth", "geo", "crypto", "cbor", "graphql", "ml", "gql", "pgwire"]
 
 [dependencies]
 anyhow = "1.0"

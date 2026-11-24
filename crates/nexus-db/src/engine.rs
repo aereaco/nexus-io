@@ -16,11 +16,11 @@ use crate::parser::{
 use crate::stdlib::{cosine_similarity, euclidean_distance, manhattan_distance};
 use crate::stdlib::{eval_stdlib, tokenize_fts, value_to_vec};
 use crate::storage::{
-    encode_key, BatchOp, StorageBackend, PREFIX_ACCESS_META, PREFIX_ANALYZER_META,
+    encode_key, BatchOp, StorageBackend, PREFIX_ACCESS_META, PREFIX_ANALYZER_META, PREFIX_API_META,
     PREFIX_BUCKET_META, PREFIX_CHANGEFEED, PREFIX_EDGE_IN, PREFIX_EDGE_OUT, PREFIX_EVENT_META,
     PREFIX_FIELD_META, PREFIX_FTS, PREFIX_FUNCTION_META, PREFIX_INDEX, PREFIX_INDEX_META,
-    PREFIX_PARAM_META, PREFIX_RECORD, PREFIX_TABLE_META, PREFIX_USER_META, PREFIX_VEC,
-    PREFIX_VERSION,
+    PREFIX_MODULE_META, PREFIX_PARAM_META, PREFIX_RECORD, PREFIX_SEQUENCE_META, PREFIX_TABLE_META,
+    PREFIX_USER_META, PREFIX_VEC, PREFIX_VERSION,
 };
 use crate::value::Value;
 
@@ -46,8 +46,32 @@ struct FieldMeta {
     default_expr: Option<Expr>,
     #[serde(default)]
     value_expr: Option<Expr>,
+    #[serde(default)]
+    computed_expr: Option<Expr>,
+    #[serde(default)]
+    readonly: bool,
     #[serde(default = "default_on_delete")]
     on_delete: OnDeleteAction,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SequenceMeta {
+    name: String,
+    batch: i64,
+    next_val: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiMeta {
+    pub path: String,
+    pub methods: Vec<String>,
+    pub body: Expr,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModuleMeta {
+    pub name: String,
+    pub source: String,
 }
 
 fn default_on_delete() -> OnDeleteAction {
@@ -129,6 +153,7 @@ pub struct ExecContext<'a> {
     pub live: &'a LiveBroker,
     #[cfg(feature = "ml")]
     pub ml: Option<&'a crate::ml::MlRegistry>,
+    pub module_invoker: Option<&'a (dyn Fn(&str, &str, &[Value]) -> Result<Value> + Send + Sync)>,
     pub ns: String,
     pub db: String,
     pub params: HashMap<String, Value>,
@@ -151,6 +176,7 @@ impl<'a> ExecContext<'a> {
             live,
             #[cfg(feature = "ml")]
             ml: None,
+            module_invoker: None,
             ns,
             db,
             params,
@@ -499,9 +525,27 @@ impl<'a> ExecContext<'a> {
     fn apply_defaults_computed_and_validate(
         &self,
         tb: &str,
+        old_map: Option<&BTreeMap<String, Value>>,
         obj: &mut BTreeMap<String, Value>,
     ) -> Result<()> {
         let fields = self.load_fields(tb)?;
+
+        // 0. Enforce READONLY immutability on updates
+        if let Some(prev) = old_map {
+            for f in &fields {
+                if f.readonly {
+                    if let Some(old_v) = prev.get(&f.name) {
+                        if !matches!(old_v, Value::None | Value::Null) && obj.get(&f.name) != Some(old_v) {
+                            return Err(anyhow!(
+                                "Field '{}' on table '{}' is READONLY and cannot be modified",
+                                f.name,
+                                tb
+                            ));
+                        }
+                    }
+                }
+            }
+        }
 
         // 1. Apply DEFAULT expressions for missing fields
         for f in &fields {
@@ -848,7 +892,7 @@ impl<'a> ExecContext<'a> {
                 id: id.to_string(),
             },
         );
-        self.apply_defaults_computed_and_validate(tb, &mut obj)?;
+        self.apply_defaults_computed_and_validate(tb, old_map.as_ref(), &mut obj)?;
         let candidate = Value::Object(obj.clone());
         self.check_mutation_permission(tb, &candidate)?;
         self.maintain_indexes_on_write(tb, id, old_map.as_ref(), &obj)?;
@@ -1126,6 +1170,18 @@ impl<'a> ExecContext<'a> {
                         self.delete_raw(k)?;
                         self.params.remove(name);
                     }
+                    "SEQUENCE" => {
+                        let k = encode_key(PREFIX_SEQUENCE_META, &[&self.ns, &self.db, name]);
+                        self.delete_raw(k)?;
+                    }
+                    "API" => {
+                        let k = encode_key(PREFIX_API_META, &[&self.ns, &self.db, name]);
+                        self.delete_raw(k)?;
+                    }
+                    "MODULE" => {
+                        let k = encode_key(PREFIX_MODULE_META, &[&self.ns, &self.db, name]);
+                        self.delete_raw(k)?;
+                    }
                     other => return Err(anyhow!("Unsupported REMOVE kind '{}'", other)),
                 }
                 Ok(Vec::new())
@@ -1381,6 +1437,8 @@ impl<'a> ExecContext<'a> {
                 assert_expr,
                 default_expr,
                 value_expr,
+                computed_expr,
+                readonly,
                 on_delete,
                 ..
             } => {
@@ -1391,7 +1449,42 @@ impl<'a> ExecContext<'a> {
                     assert_expr: assert_expr.clone(),
                     default_expr: default_expr.clone(),
                     value_expr: value_expr.clone(),
+                    computed_expr: computed_expr.clone(),
+                    readonly: *readonly,
                     on_delete: *on_delete,
+                };
+                self.put_raw(key, serde_json::to_vec(&meta)?)?;
+                Ok(Vec::new())
+            }
+            Statement::DefineSequence { name, batch, start } => {
+                let key = encode_key(PREFIX_SEQUENCE_META, &[&self.ns, &self.db, name]);
+                let meta = SequenceMeta {
+                    name: name.clone(),
+                    batch: *batch,
+                    next_val: *start,
+                };
+                self.put_raw(key, serde_json::to_vec(&meta)?)?;
+                Ok(Vec::new())
+            }
+            Statement::DefineApi {
+                path,
+                methods,
+                body,
+            } => {
+                let key = encode_key(PREFIX_API_META, &[&self.ns, &self.db, path]);
+                let meta = ApiMeta {
+                    path: path.clone(),
+                    methods: methods.clone(),
+                    body: body.clone(),
+                };
+                self.put_raw(key, serde_json::to_vec(&meta)?)?;
+                Ok(Vec::new())
+            }
+            Statement::DefineModule { name, source } => {
+                let key = encode_key(PREFIX_MODULE_META, &[&self.ns, &self.db, name]);
+                let meta = ModuleMeta {
+                    name: name.clone(),
+                    source: source.clone(),
                 };
                 self.put_raw(key, serde_json::to_vec(&meta)?)?;
                 Ok(Vec::new())
@@ -1684,6 +1777,27 @@ impl<'a> ExecContext<'a> {
                     plan.insert("operation".into(), Value::String(plan_op));
                     plan.insert("rows_scanned".into(), Value::Int(raw_rows.len() as i64));
                     return Ok(vec![Value::Object(plan)]);
+                }
+
+                // Evaluate read-time `COMPUTED` fields dynamically on every read
+                let computed_fields: Vec<FieldMeta> = self
+                    .load_fields(&tb)?
+                    .into_iter()
+                    .filter(|f| f.computed_expr.is_some())
+                    .collect();
+                if !computed_fields.is_empty() {
+                    for row in &mut raw_rows {
+                        let snap = row.clone();
+                        if let Value::Object(ref mut map) = row {
+                            for cf in &computed_fields {
+                                if let Some(ref cexpr) = cf.computed_expr {
+                                    if let Ok(cv) = self.eval_expr(cexpr, Some(&snap), 0) {
+                                        map.insert(cf.name.clone(), cv);
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
 
                 // Enforce row-level PERMISSIONS WHERE if defined on table and $auth is set
@@ -2403,6 +2517,44 @@ impl<'a> ExecContext<'a> {
                 }
                 if lname == "graph::shortest_path" {
                     return self.eval_shortest_path(&eval_args);
+                }
+                if lname == "sequence::nextval" {
+                    let seq_name = eval_args
+                        .first()
+                        .ok_or_else(|| anyhow!("sequence::nextval requires sequence name"))?
+                        .display_compact();
+                    let skey = encode_key(PREFIX_SEQUENCE_META, &[&self.ns, &self.db, &seq_name]);
+                    let raw = self
+                        .get_raw(&skey)?
+                        .ok_or_else(|| anyhow!("Sequence '{}' is not defined", seq_name))?;
+                    let mut meta: SequenceMeta = serde_json::from_slice(&raw)?;
+                    let val = meta.next_val;
+                    meta.next_val += 1;
+                    self.storage.put(&skey, &serde_json::to_vec(&meta)?)?;
+                    return Ok(Value::Int(val));
+                }
+                if name.starts_with("mod::") {
+                    // Look up Surrealism module (`mod::my_mod::func` -> module `mod::my_mod`)
+                    let parts: Vec<&str> = name.split("::").collect();
+                    let mod_name = if parts.len() >= 2 {
+                        format!("{}::{}", parts[0], parts[1])
+                    } else {
+                        name.clone()
+                    };
+                    let fn_name = parts.last().copied().unwrap_or(name.as_str());
+                    let mkey = encode_key(PREFIX_MODULE_META, &[&self.ns, &self.db, &mod_name]);
+                    let raw = self
+                        .get_raw(&mkey)?
+                        .ok_or_else(|| anyhow!("Module '{}' is not defined", mod_name))?;
+                    let meta: ModuleMeta = serde_json::from_slice(&raw)?;
+                    if let Some(invoker) = self.module_invoker {
+                        return invoker(&meta.source, fn_name, &eval_args);
+                    }
+                    return Err(anyhow!(
+                        "Module '{}' registered (source '{}'), attach a Wasm CrystalEngine invoker to execute",
+                        mod_name,
+                        meta.source
+                    ));
                 }
                 #[cfg(feature = "files")]
                 if lname.starts_with("file::") {

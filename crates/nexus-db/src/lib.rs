@@ -23,18 +23,26 @@ pub mod crypto_ext;
 pub mod graphql;
 #[cfg(feature = "ml")]
 pub mod ml;
+#[cfg(feature = "gql")]
+pub mod gql;
+#[cfg(feature = "pgwire")]
+pub mod pgwire;
 
 use anyhow::Result;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{mpsc, Arc};
 
-use crate::engine::ExecContext;
+use crate::engine::{ApiMeta, ExecContext};
 use crate::live::{LiveBroker, LiveNotification};
-use crate::parser::parse_surql;
+use crate::parser::{parse_surql, Statement};
 use crate::rpc::RpcSession;
-use crate::storage::{encode_key, MemStorage, RedbStorage, StorageBackend, PREFIX_CELL_KV};
+use crate::storage::{
+    encode_key, MemStorage, RedbStorage, StorageBackend, PREFIX_API_META, PREFIX_CELL_KV,
+};
 pub use crate::value::Value;
+
+pub type ModuleInvoker = Arc<dyn Fn(&str, &str, &[Value]) -> Result<Value> + Send + Sync>;
 
 /// Clean-room, MIT-licensed, ultra-low-footprint SurrealQL-compatible embedded multi-model database.
 #[derive(Clone)]
@@ -43,6 +51,7 @@ pub struct NexusDb {
     live: Arc<LiveBroker>,
     #[cfg(feature = "ml")]
     ml: Arc<crate::ml::MlRegistry>,
+    module_invoker: Option<ModuleInvoker>,
 }
 
 impl NexusDb {
@@ -53,6 +62,7 @@ impl NexusDb {
             live: Arc::new(LiveBroker::new()),
             #[cfg(feature = "ml")]
             ml: Arc::new(crate::ml::MlRegistry::new()),
+            module_invoker: None,
         }
     }
 
@@ -63,7 +73,71 @@ impl NexusDb {
             live: Arc::new(LiveBroker::new()),
             #[cfg(feature = "ml")]
             ml: Arc::new(crate::ml::MlRegistry::new()),
+            module_invoker: None,
         })
+    }
+
+    /// Attach a Surrealism Wasm module invoker (e.g. Nexus-IO's `CrystalEngine`) for `mod::*` calls.
+    pub fn with_module_invoker(mut self, invoker: ModuleInvoker) -> Self {
+        self.module_invoker = Some(invoker);
+        self
+    }
+
+    /// Invoke a custom SurrealQL API endpoint defined via `DEFINE API <path> FOR <methods> THEN <expr>`.
+    pub fn invoke_api(
+        &self,
+        ns: &str,
+        db: &str,
+        method: &str,
+        path: &str,
+        request_body: Value,
+    ) -> Result<Value> {
+        let ns_clean = sanitize_ident(ns);
+        let db_clean = sanitize_ident(db);
+        let key = encode_key(PREFIX_API_META, &[&ns_clean, &db_clean, path]);
+        let raw = self
+            .storage
+            .get(&key)?
+            .ok_or_else(|| anyhow::anyhow!("API endpoint '{}' not found", path))?;
+        let meta: ApiMeta = serde_json::from_slice(&raw)?;
+        let method_upper = method.to_ascii_uppercase();
+        if !meta.methods.iter().any(|m| m == &method_upper) {
+            return Err(anyhow::anyhow!(
+                "Method {} not allowed for API endpoint '{}'",
+                method_upper,
+                path
+            ));
+        }
+        let mut params = HashMap::new();
+        params.insert("request".into(), request_body);
+        let mut ctx = ExecContext::new(
+            self.storage.as_ref(),
+            self.live.as_ref(),
+            ns_clean,
+            db_clean,
+            params,
+        );
+        #[cfg(feature = "ml")]
+        {
+            ctx.ml = Some(self.ml.as_ref());
+        }
+        if let Some(ref inv) = self.module_invoker {
+            ctx.module_invoker = Some(inv.as_ref());
+        }
+        let rows = ctx.execute_all(&[Statement::Return(meta.body)])?;
+        Ok(rows.into_iter().next().unwrap_or(Value::Null))
+    }
+
+    /// Execute an ISO GQL `MATCH (...) RETURN ...` graph query (`feature = "gql"`).
+    #[cfg(feature = "gql")]
+    pub fn gql(&self, ns: &str, db: &str, query: &str) -> Result<Vec<Value>> {
+        crate::gql::execute_gql(self, ns, db, query)
+    }
+
+    /// Create a PostgreSQL v3 Wire Protocol session (`feature = "pgwire"`).
+    #[cfg(feature = "pgwire")]
+    pub fn pgwire_session(&self, ns: &str, db: &str) -> crate::pgwire::PgWireSession {
+        crate::pgwire::PgWireSession::new(self.clone(), sanitize_ident(ns), sanitize_ident(db))
     }
 
     /// Execute a GraphQL query against `(ns, db)` (`feature = "graphql"`).
@@ -137,6 +211,9 @@ impl NexusDb {
         #[cfg(feature = "ml")]
         {
             ctx.ml = Some(self.ml.as_ref());
+        }
+        if let Some(ref inv) = self.module_invoker {
+            ctx.module_invoker = Some(inv.as_ref());
         }
         ctx.execute_all(&stmts)
     }
@@ -810,5 +887,117 @@ mod tests {
             .query_scoped("prod", "main", "SELECT * FROM order_item;", vec![])
             .unwrap()
             .is_empty());
+    }
+
+    #[cfg(feature = "full")]
+    #[test]
+    fn wave_e_surrealdb_v3_v4_computed_readonly_sequence_api_module_gql_pgwire() {
+        // Attach a mock Surrealism Wasm invoker (in nexus-io this delegates to CrystalEngine)
+        let db = NexusDb::open_mem().with_module_invoker(Arc::new(|src, func, args| {
+            let x = args.first().and_then(|v| v.as_f64()).unwrap_or(0.0);
+            Ok(Value::String(format!("{}:{}({})", src, func, x as i64)))
+        }));
+
+        // 1. Read-time COMPUTED field + READONLY immutability + ON DELETE RESTRICT
+        db.query_scoped(
+            "v4",
+            "main",
+            "DEFINE TABLE OVERWRITE account SCHEMALESS;
+             DEFINE FIELD created_by ON account TYPE string READONLY;
+             DEFINE FIELD display ON account COMPUTED string::concat(first, ' ', last);
+             CREATE account:1 SET created_by = 'root', first = 'Ada', last = 'Lovelace';",
+            vec![],
+        )
+        .unwrap();
+
+        let read = db
+            .query_scoped("v4", "main", "SELECT VALUE display FROM account:1;", vec![])
+            .unwrap();
+        assert_eq!(read, vec![Value::String("Ada Lovelace".into())]);
+
+        // Modifying READONLY field must fail
+        let ro_err = db.query_scoped(
+            "v4",
+            "main",
+            "UPDATE account:1 SET created_by = 'hacker';",
+            vec![],
+        );
+        assert!(ro_err.is_err(), "READONLY field must reject updates");
+
+        // 2. DEFINE SEQUENCE + ALTER SEQUENCE + sequence::nextval()
+        db.query_scoped(
+            "v4",
+            "main",
+            "DEFINE SEQUENCE IF NOT EXISTS inv_seq BATCH 10 START 100;",
+            vec![],
+        )
+        .unwrap();
+        let s1 = db
+            .query_scoped("v4", "main", "RETURN sequence::nextval('inv_seq');", vec![])
+            .unwrap();
+        let s2 = db
+            .query_scoped("v4", "main", "RETURN sequence::nextval('inv_seq');", vec![])
+            .unwrap();
+        assert_eq!(s1, vec![Value::Int(100)]);
+        assert_eq!(s2, vec![Value::Int(101)]);
+
+        // 3. DEFINE API + invoke_api
+        db.query_scoped(
+            "v4",
+            "main",
+            "DEFINE API OVERWRITE /hello FOR GET, POST THEN { status: 200, body: $request };",
+            vec![],
+        )
+        .unwrap();
+        let api_res = db
+            .invoke_api("v4", "main", "POST", "/hello", Value::String("world".into()))
+            .unwrap();
+        assert_eq!(api_res.to_json()["status"], 200);
+        assert_eq!(api_res.to_json()["body"], "world");
+
+        // 4. DEFINE MODULE (Surrealism Wasm extension)
+        db.query_scoped(
+            "v4",
+            "main",
+            "DEFINE MODULE mod::pricing FROM f'plugins:/pricing.wasm' UNSIGNED;",
+            vec![],
+        )
+        .unwrap();
+        let mod_out = db
+            .query_scoped("v4", "main", "RETURN mod::pricing::calc(42);", vec![])
+            .unwrap();
+        assert_eq!(
+            mod_out,
+            vec![Value::String("plugins:/pricing.wasm:calc(42)".into())]
+        );
+
+        // 5. ISO GQL `MATCH (a:person)-[:knows]->(b:person) RETURN b.name`
+        db.query_scoped(
+            "v4",
+            "main",
+            "CREATE person:1 SET name = 'Alice';
+             CREATE person:2 SET name = 'Bob';
+             RELATE person:1->knows->person:2;",
+            vec![],
+        )
+        .unwrap();
+        let gql_rows = db
+            .gql(
+                "v4",
+                "main",
+                "MATCH (a:person)-[:knows]->(b:person) WHERE a.name = 'Alice' RETURN b.name",
+            )
+            .unwrap();
+        assert_eq!(gql_rows, vec![Value::String("Bob".into())]);
+
+        // 6. PostgreSQL v3 Wire Protocol (`PgWireSession`)
+        let mut pg = db.pgwire_session("v4", "main");
+        let startup = pg.startup_response();
+        assert_eq!(startup[0], b'R'); // AuthenticationOk
+        let q_frame = crate::pgwire::PgWireSession::encode_query_frame("SELECT name FROM person:1;");
+        let resp = pg.handle_frame(&q_frame).unwrap();
+        assert_eq!(resp[0], b'T'); // RowDescription
+        assert!(resp.windows(5).any(|w| w == b"Alice"));
+        assert_eq!(resp[resp.len() - 6], b'Z'); // ReadyForQuery
     }
 }

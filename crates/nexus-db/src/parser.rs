@@ -140,7 +140,23 @@ pub enum Statement {
         assert_expr: Option<Expr>,
         default_expr: Option<Expr>,
         value_expr: Option<Expr>,
+        computed_expr: Option<Expr>,
+        readonly: bool,
         on_delete: OnDeleteAction,
+    },
+    DefineSequence {
+        name: String,
+        batch: i64,
+        start: i64,
+    },
+    DefineApi {
+        path: String,
+        methods: Vec<String>,
+        body: Expr,
+    },
+    DefineModule {
+        name: String,
+        source: String,
     },
     DefineIndex {
         name: String,
@@ -710,6 +726,7 @@ impl Parser {
     }
 
     fn eat_if_not_exists(&mut self) -> bool {
+        let _ = self.eat_kw("OVERWRITE");
         if self.eat_kw("IF") {
             let _ = self.eat_kw("NOT");
             let _ = self.eat_kw("EXISTS");
@@ -849,7 +866,7 @@ impl Parser {
             let _ = self.eat_kw("TRANSACTION");
             return Ok(Statement::Cancel);
         }
-        if self.eat_kw("DEFINE") {
+        if self.eat_kw("DEFINE") || self.eat_kw("ALTER") {
             return self.parse_define();
         }
         if self.eat_kw("REMOVE") {
@@ -1230,6 +1247,8 @@ impl Parser {
             let mut assert_expr = None;
             let mut default_expr = None;
             let mut value_expr = None;
+            let mut computed_expr = None;
+            let mut readonly = false;
             let mut on_delete = OnDeleteAction::Ignore;
             loop {
                 if self.eat_kw("TYPE") {
@@ -1249,12 +1268,16 @@ impl Parser {
                     default_expr = Some(self.parse_expr()?);
                 } else if self.eat_kw("VALUE") {
                     value_expr = Some(self.parse_expr()?);
+                } else if self.eat_kw("COMPUTED") {
+                    computed_expr = Some(self.parse_expr()?);
+                } else if self.eat_kw("READONLY") {
+                    readonly = true;
                 } else if self.eat_kw("REFERENCE") {
                     if self.eat_kw("ON") {
                         let _ = self.eat_kw("DELETE");
                         if self.eat_kw("CASCADE") {
                             on_delete = OnDeleteAction::Cascade;
-                        } else if self.eat_kw("REJECT") {
+                        } else if self.eat_kw("REJECT") || self.eat_kw("RESTRICT") {
                             on_delete = OnDeleteAction::Reject;
                         } else if self.eat_kw("UNSET") {
                             on_delete = OnDeleteAction::Unset;
@@ -1274,7 +1297,91 @@ impl Parser {
                 assert_expr,
                 default_expr,
                 value_expr,
+                computed_expr,
+                readonly,
                 on_delete,
+            });
+        }
+
+        if self.eat_kw("SEQUENCE") {
+            let _ = self.eat_if_not_exists();
+            let name = self.expect_ident()?;
+            let mut batch = 1i64;
+            let mut start = 0i64;
+            loop {
+                if self.eat_kw("BATCH") {
+                    if let Token::Int(n) = self.next() {
+                        batch = n.max(1);
+                    }
+                } else if self.eat_kw("START") {
+                    if let Token::Int(n) = self.next() {
+                        start = n;
+                    }
+                } else {
+                    break;
+                }
+            }
+            return Ok(Statement::DefineSequence { name, batch, start });
+        }
+
+        if self.eat_kw("API") {
+            let _ = self.eat_if_not_exists();
+            let path = match self.next() {
+                Token::Str(s) | Token::Ident(s) => s,
+                Token::Slash => {
+                    let mut p = String::from("/");
+                    while let Token::Ident(seg) | Token::Str(seg) = self.peek().clone() {
+                        self.next();
+                        p.push_str(&seg);
+                        if matches!(self.peek(), Token::Slash) {
+                            self.next();
+                            p.push('/');
+                        } else {
+                            break;
+                        }
+                    }
+                    p
+                }
+                other => return Err(anyhow!("Expected API path, got {:?}", other)),
+            };
+            let mut methods = vec!["GET".to_string()];
+            if self.eat_kw("FOR") {
+                methods.clear();
+                loop {
+                    methods.push(self.expect_ident()?.to_ascii_uppercase());
+                    if matches!(self.peek(), Token::Comma) {
+                        self.next();
+                    } else {
+                        break;
+                    }
+                }
+            }
+            let _ = self.eat_kw("THEN");
+            let body = self.parse_expr()?;
+            return Ok(Statement::DefineApi {
+                path,
+                methods,
+                body,
+            });
+        }
+
+        if self.eat_kw("MODULE") {
+            let _ = self.eat_if_not_exists();
+            let mut full_name = self.expect_ident()?;
+            while matches!(self.peek(), Token::DoubleColon) {
+                self.next();
+                full_name.push_str("::");
+                full_name.push_str(&self.expect_ident()?);
+            }
+            let _ = self.eat_kw("FROM");
+            let source = match self.next() {
+                Token::Str(s) | Token::Ident(s) => s,
+                other => return Err(anyhow!("Expected module file pointer, got {:?}", other)),
+            };
+            let _ = self.eat_kw("UNSIGNED");
+            return Ok(Statement::DefineModule {
+                name: full_name,
+                source,
             });
         }
 
