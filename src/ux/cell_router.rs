@@ -4,6 +4,7 @@ use salvo::prelude::*;
 use salvo::websocket::{Message, WebSocketUpgrade};
 use std::sync::Arc;
 
+use crate::compute::k8s_bridge::{export_k8s_yaml, import_k8s_yaml, ExportOptions};
 use crate::compute::md_runtime::deploy_markdown;
 use crate::db::Database;
 use crate::js::cell::{CellManager, CellPolicy};
@@ -74,6 +75,80 @@ impl Handler for CellGatewayHandler {
                 Err(e) => {
                     res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
                     res.render(Text::Plain(format!("Markdown deploy error: {}", e)));
+                }
+            }
+            return;
+        }
+
+        // POST /cells/import-k8s -> import Kubernetes YAML into Nexus .md (and optionally deploy with ?deploy=true)
+        if req.method() == &Method::POST && req.uri().path().trim_end_matches('/') == "/cells/import-k8s" {
+            let yaml = match req.payload().await {
+                Ok(bytes) => String::from_utf8_lossy(bytes).to_string(),
+                Err(e) => {
+                    res.status_code(StatusCode::BAD_REQUEST);
+                    res.render(Text::Plain(format!("Failed to read Kubernetes YAML body: {}", e)));
+                    return;
+                }
+            };
+            let should_deploy = req
+                .uri()
+                .query()
+                .map(|q| q.split('&').any(|p| p == "deploy=true" || p == "deploy=1"))
+                .unwrap_or(false);
+            match import_k8s_yaml(&yaml) {
+                Ok(report) => {
+                    if should_deploy {
+                        if let Err(e) = deploy_markdown(&self.cells, self.db.as_ref(), &report.markdown).await {
+                            res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+                            res.render(Text::Plain(format!("Kubernetes deploy error: {}", e)));
+                            return;
+                        }
+                    }
+                    res.status_code(StatusCode::OK);
+                    res.render(Json(serde_json::json!({
+                        "app": report.app,
+                        "deployed": should_deploy,
+                        "workloads": report.workloads,
+                        "warnings": report.warnings,
+                        "markdown": report.markdown
+                    })));
+                }
+                Err(e) => {
+                    res.status_code(StatusCode::BAD_REQUEST);
+                    res.render(Text::Plain(format!("Kubernetes import error: {}", e)));
+                }
+            }
+            return;
+        }
+
+        // POST /cells/export-k8s -> export Nexus .md service document to standard Kubernetes YAML
+        if req.method() == &Method::POST && req.uri().path().trim_end_matches('/') == "/cells/export-k8s" {
+            let md = match req.payload().await {
+                Ok(bytes) => String::from_utf8_lossy(bytes).to_string(),
+                Err(e) => {
+                    res.status_code(StatusCode::BAD_REQUEST);
+                    res.render(Text::Plain(format!("Failed to read markdown body: {}", e)));
+                    return;
+                }
+            };
+            let mut opts = ExportOptions::default();
+            if let Some(q) = req.uri().query() {
+                for pair in q.split('&') {
+                    if let Some(img) = pair.strip_prefix("image=") {
+                        if !img.is_empty() {
+                            opts.runtime_image = img.to_string();
+                        }
+                    }
+                }
+            }
+            match export_k8s_yaml(&md, opts) {
+                Ok(yaml) => {
+                    res.status_code(StatusCode::OK);
+                    res.render(Text::Plain(yaml));
+                }
+                Err(e) => {
+                    res.status_code(StatusCode::BAD_REQUEST);
+                    res.render(Text::Plain(format!("Kubernetes export error: {}", e)));
                 }
             }
             return;

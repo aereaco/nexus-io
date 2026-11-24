@@ -260,6 +260,19 @@ async fn async_main(args: Vec<String>, is_test: bool) -> Result<(), Box<dyn std:
     }));
 
     working_set.add_decl(Box::new(iam::GuardedCommand {
+        inner: Box::new(compute::k8s_bridge::K8sImportCommand {
+            db: db.clone(),
+            bridge: bridge.clone(),
+        }),
+        kernel: kernel.clone(),
+    }));
+
+    working_set.add_decl(Box::new(iam::GuardedCommand {
+        inner: Box::new(compute::k8s_bridge::K8sExportCommand),
+        kernel: kernel.clone(),
+    }));
+
+    working_set.add_decl(Box::new(iam::GuardedCommand {
         inner: Box::new(shell::verify_command::VerifyCommand { 
             db: db.clone(),
             bridge: bridge.clone(),

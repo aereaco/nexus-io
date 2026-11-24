@@ -62,6 +62,7 @@ base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+serde_norway = "0.9"
 sysinfo = { version = "0.31", features = ["system", "user"] }
 futures = "0.3"
 anyhow = "1.0"

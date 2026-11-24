@@ -103,6 +103,26 @@ pub fn parse_markdown_nodes(md: &str) -> Vec<SystemNode> {
             continue;
         }
 
+        // 2b. Optional per-node policy override comment: `<!-- policy: pinned|elastic|mobile -->`
+        if let Some(inner) = line
+            .strip_prefix("<!--")
+            .and_then(|s| s.strip_suffix("-->"))
+        {
+            if let Some((k, v)) = inner.trim().split_once(':') {
+                if k.trim().eq_ignore_ascii_case("policy") {
+                    if let Some(node) = current.as_mut() {
+                        node.policy = match v.trim().to_ascii_lowercase().as_str() {
+                            "pinned" => CellPolicy::Pinned,
+                            "mobile" => CellPolicy::elastic_mobile(),
+                            _ => CellPolicy::elastic_default(),
+                        };
+                    }
+                    i += 1;
+                    continue;
+                }
+            }
+        }
+
         // 3. Fenced code block
         if let Some(fence_info) = line.strip_prefix("```") {
             let mut fence_parts = fence_info.split_whitespace();

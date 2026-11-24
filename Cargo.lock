@@ -5983,6 +5983,7 @@ dependencies = [
  "salvo",
  "serde",
  "serde_json",
+ "serde_norway",
  "sqlparser",
  "surrealdb",
  "sysinfo 0.31.4",
