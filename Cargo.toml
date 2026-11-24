@@ -4,6 +4,10 @@ version = "0.1.0"
 description = "Nexus-IO Sovereign Binary"
 edition = "2021"
 
+[lib]
+name = "nexus_io"
+path = "src/lib.rs"
+
 [dependencies]
 # 1. The Mind (State)
 surrealdb = { version = "4.0.1", default-features = false, features = ["kv-mem", "kv-surrealkv"] } # SQL included, Scripting (Internal QuickJS) disabled

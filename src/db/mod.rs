@@ -10,7 +10,13 @@ pub struct Database {
 
 impl Database {
     pub async fn init() -> Self {
-        let db = Surreal::new::<SurrealKv>("nexus.db").await.unwrap();
+        Self::init_in(".").await
+    }
+
+    /// Initialize SurrealDB (`SurrealKv`) inside an explicit writable `data_dir` (required on Android/iOS sandboxes).
+    pub async fn init_in(data_dir: impl AsRef<std::path::Path>) -> Self {
+        let db_path = data_dir.as_ref().join("nexus.db");
+        let db = Surreal::new::<SurrealKv>(db_path).await.unwrap();
         
         // Select Namespace
         db.use_ns("nexus").use_db("system").await.unwrap();

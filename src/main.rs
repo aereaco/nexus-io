@@ -1,37 +1,11 @@
-mod db;
-mod js;
-mod shell;
-mod iam;
-mod storage;
-mod compute;
-mod ux;
-mod economy;
+use nexus_io::{compute, db, economy, iam, js, shell, storage, ux};
 
 use std::sync::Arc;
-use std::borrow::Cow;
 use std::time::Instant;
 use nu_protocol::engine::{StateWorkingSet, Stack};
 use nu_cmd_lang::create_default_context;
 use nu_command::add_shell_command_context;
-use nu_protocol::{Value, Span, ShellError};
-use nu_protocol::shell_error::generic::GenericError;
-
-/// Shared helper to construct a `ShellError::Generic` across Nexus-IO modules.
-pub fn shell_err(
-    title: impl Into<Cow<'static, str>>,
-    msg: impl Into<Cow<'static, str>>,
-    span: Option<Span>,
-    help: Option<Cow<'static, str>>,
-) -> ShellError {
-    let mut err = match span {
-        Some(s) => GenericError::new(title, msg, s),
-        None => GenericError::new_internal(title, msg),
-    };
-    if let Some(h) = help {
-        err = err.with_help(h);
-    }
-    ShellError::Generic(err)
-}
+use nu_protocol::{Value, Span};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();

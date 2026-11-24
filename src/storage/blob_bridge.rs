@@ -31,14 +31,16 @@ struct BlobNode {
 static BLOB_NODE: Lazy<Arc<RwLock<Option<Arc<BlobNode>>>>> =
     Lazy::new(|| Arc::new(RwLock::new(None)));
 
-/// Initialize or get the global `iroh-blobs` `FsStore` + `iroh` P2P endpoint.
-async fn init_blob_node() -> Result<Arc<BlobNode>> {
+/// Initialize or get the global `iroh-blobs` `FsStore` + `iroh` P2P endpoint in `data_dir`.
+async fn init_blob_node(data_dir: &std::path::Path) -> Result<Arc<BlobNode>> {
     let mut node_lock = BLOB_NODE.write().await;
 
     if node_lock.is_none() {
         let vpn_ip = crate::storage::wireguard::WireGuardInterface::get_vpn_ip();
         let bind_addr = vpn_ip.clone().map(|ip| format!("{}:3900", ip));
-        let config = create_dev_config(bind_addr);
+        let mut config = create_dev_config(bind_addr);
+        let blob_path = data_dir.join("nexus-blobs");
+        config.data_dir = blob_path.to_string_lossy().to_string();
 
         if let Some(ip) = &vpn_ip {
             println!("🔒 Secure Mesh Detected: Binding storage to {}", ip);
@@ -124,7 +126,12 @@ pub struct BlobBridge {
 
 impl BlobBridge {
     pub async fn new(db: Arc<Database>) -> Result<Self> {
-        let node = init_blob_node().await?;
+        Self::new_in(db, ".").await
+    }
+
+    /// Initialize `BlobBridge` inside an explicit writable `data_dir` (required on Android/iOS sandboxes).
+    pub async fn new_in(db: Arc<Database>, data_dir: impl AsRef<std::path::Path>) -> Result<Self> {
+        let node = init_blob_node(data_dir.as_ref()).await?;
 
         // Ensure storage metadata tables exist and register this node in `sys::node` for HRW placement.
         let _ = db
