@@ -5,6 +5,7 @@ use nu_protocol::{Category, PipelineData, ShellError, Signature, SyntaxShape, Va
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::compute::crystal::CrystalEngine;
 use crate::db::sql_compiler::compile_sqlite_to_surql;
 use crate::db::{Database, StateEngine};
 use crate::js::cell::{CellManager, CellPolicy};
@@ -21,6 +22,10 @@ pub struct SystemNode {
     pub sql_blocks: Vec<String>,
     pub surql_blocks: Vec<String>,
     pub script_blocks: Vec<String>,
+    /// Inline WebAssembly Text (`wat`) Crystal blocks (compiled via `CrystalEngine`).
+    pub wat_blocks: Vec<String>,
+    /// External pre-compiled `.wasm` / `.cwasm` artifact URIs (from Rust, Zig, Go, C, AssemblyScript).
+    pub wasm_refs: Vec<String>,
 }
 
 /// Parse a declarative Markdown service document into typed `SystemNode`s.
@@ -91,6 +96,8 @@ pub fn parse_markdown_nodes(md: &str) -> Vec<SystemNode> {
                 sql_blocks: Vec::new(),
                 surql_blocks: Vec::new(),
                 script_blocks: Vec::new(),
+                wat_blocks: Vec::new(),
+                wasm_refs: Vec::new(),
             });
             i += 1;
             continue;
@@ -98,11 +105,9 @@ pub fn parse_markdown_nodes(md: &str) -> Vec<SystemNode> {
 
         // 3. Fenced code block
         if let Some(fence_info) = line.strip_prefix("```") {
-            let lang = fence_info
-                .split_whitespace()
-                .next()
-                .unwrap_or("")
-                .to_ascii_lowercase();
+            let mut fence_parts = fence_info.split_whitespace();
+            let lang = fence_parts.next().unwrap_or("").to_ascii_lowercase();
+            let fence_rest: Vec<&str> = fence_parts.collect();
             i += 1;
             let mut block = Vec::new();
             while i < lines.len() && !lines[i].trim().starts_with("```") {
@@ -123,12 +128,27 @@ pub fn parse_markdown_nodes(md: &str) -> Vec<SystemNode> {
                 sql_blocks: Vec::new(),
                 surql_blocks: Vec::new(),
                 script_blocks: Vec::new(),
+                wat_blocks: Vec::new(),
+                wasm_refs: Vec::new(),
             });
 
             match lang.as_str() {
                 "ts" | "typescript" | "js" | "javascript" => node.script_blocks.push(content),
                 "sql" | "sqlite" => node.sql_blocks.push(content),
                 "surql" | "surrealql" => node.surql_blocks.push(content),
+                "wat" => node.wat_blocks.push(content),
+                "wasm" | "cwasm" => {
+                    // Extract `src="..."` attribute from fence info or non-empty body line
+                    let src_attr = fence_rest.iter().find_map(|tok| {
+                        tok.strip_prefix("src=")
+                            .map(|v| v.trim_matches(|c| c == '"' || c == '\'').to_string())
+                    });
+                    if let Some(uri) = src_attr {
+                        node.wasm_refs.push(uri);
+                    } else if !content.trim().is_empty() {
+                        node.wasm_refs.push(content.trim().to_string());
+                    }
+                }
                 "json" | "yaml" | "yml" => {
                     let key = format!("signal_{}", node.signals.len());
                     node.signals.insert(key, content);
@@ -192,6 +212,25 @@ pub async fn deploy_markdown(
     }
 
     Ok(nodes)
+}
+
+/// Execute an exported `(i64, i64) -> i64` function from the first inline `wat` Crystal block
+/// on a `SystemNode` via `CrystalEngine` (pre-compiled AOT + fuel metering).
+#[cfg(not(target_os = "ios"))]
+pub fn execute_node_crystal_i64(
+    node: &SystemNode,
+    fn_name: &str,
+    a: i64,
+    b: i64,
+    fuel_limit: u64,
+) -> Result<i64> {
+    let wat = node
+        .wat_blocks
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("SystemNode '{}' has no inline `wat` Crystal block", node.name))?;
+    let crystal = CrystalEngine::new()?;
+    let aot = crystal.compile_aot(wat.as_bytes())?;
+    crystal.run_aot_i64(&aot, fn_name, a, b, fuel_limit)
 }
 
 /// Nushell/CLI command: `cell deploy <path.md>` — deploys a declarative Markdown service file
@@ -305,11 +344,23 @@ function record(m: Metric): number {
     return ctx.storage.sql.exec("SELECT val FROM metrics").toArray().length;
 }
 ```
+
+```wat
+(module
+  (func (export "mul") (param i64 i64) (result i64)
+    local.get 0
+    local.get 1
+    i64.mul))
+```
+
+```wasm src="s3://crystals/pricing.wasm"
+```
 "#;
 
                     let nodes = deploy_markdown(&manager, db.as_ref(), md).await.unwrap();
                     assert_eq!(nodes.len(), 1);
                     assert_eq!(nodes[0].cell_id, "counter_service");
+                    assert_eq!(nodes[0].wasm_refs, vec!["s3://crystals/pricing.wasm"]);
 
                     let out = manager
                         .eval_in_cell(
@@ -320,6 +371,9 @@ function record(m: Metric): number {
                         .await
                         .unwrap();
                     assert_eq!(out, "1");
+
+                    let prod = execute_node_crystal_i64(&nodes[0], "mul", 6, 7, 10_000).unwrap();
+                    assert_eq!(prod, 42);
                 }));
             })
             .unwrap()
