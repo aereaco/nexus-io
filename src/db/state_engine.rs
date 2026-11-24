@@ -363,7 +363,30 @@ mod tests {
                             .await
                             .unwrap();
 
-                        // 2. Cell KV + snapshot round-trip
+                        // 2. Graph RELATE + traversal + UPDATE/MERGE + stdlib
+                        eng.query_scoped(
+                            "diff_app",
+                            "room_1",
+                            "CREATE person:alice SET name = 'alice';
+                             CREATE person:bob SET name = 'bob';
+                             RELATE person:alice->knows->person:bob;
+                             UPDATE person:bob MERGE { role: 'eng' };",
+                            vec![],
+                        )
+                        .await
+                        .unwrap();
+
+                        let graph_rows = eng
+                            .query_scoped(
+                                "diff_app",
+                                "room_1",
+                                "SELECT VALUE string::uppercase(name) FROM person:bob;",
+                                vec![],
+                            )
+                            .await
+                            .unwrap();
+
+                        // 3. Cell KV + snapshot round-trip
                         eng.kv_put("diff_app", "room_1", "k1", SurValue::String("v1".into()))
                             .await
                             .unwrap();
@@ -375,6 +398,7 @@ mod tests {
 
                         results.push((
                             rows.iter().map(sur_to_json).collect::<Vec<_>>(),
+                            graph_rows.iter().map(sur_to_json).collect::<Vec<_>>(),
                             kv_val.as_ref().map(sur_to_json),
                             kv_after.as_ref().map(sur_to_json),
                         ));

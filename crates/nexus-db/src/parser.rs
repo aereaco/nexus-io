@@ -1,11 +1,47 @@
 use anyhow::{anyhow, Result};
+use serde::{Deserialize, Serialize};
 
-/// SurrealQL AST Statements supported in Phase 1.
+/// Graph traversal direction for `->edge->target` / `<-edge<-source`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GraphDir {
+    Out,
+    In,
+}
+
+/// One hop in a graph traversal expression (e.g. `->knows->person`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GraphHop {
+    pub dir: GraphDir,
+    pub edge: String,
+    pub target_table: Option<String>,
+}
+
+/// Index kind for `DEFINE INDEX`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IndexKind {
+    Standard,
+    Unique,
+    FtsBm25,
+    VectorHnsw { dim: usize, metric: VectorMetric },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VectorMetric {
+    Cosine,
+    Euclidean,
+    Manhattan,
+}
+
+/// SurrealQL AST Statements (Phases 1–3: CRUD, Graph, Schema, Indexes, Events, Live Queries, Let).
 #[derive(Debug, Clone)]
 pub enum Statement {
     Use {
         ns: Option<String>,
         db: Option<String>,
+    },
+    Let {
+        name: String,
+        expr: Expr,
     },
     Begin,
     Commit,
@@ -15,14 +51,38 @@ pub enum Statement {
         if_not_exists: bool,
         schemafull: bool,
     },
+    DefineField {
+        name: String,
+        table: String,
+        if_not_exists: bool,
+        field_type: Option<String>,
+        assert_expr: Option<Expr>,
+        default_expr: Option<Expr>,
+    },
+    DefineIndex {
+        name: String,
+        table: String,
+        if_not_exists: bool,
+        columns: Vec<String>,
+        kind: IndexKind,
+    },
+    DefineEvent {
+        name: String,
+        table: String,
+        if_not_exists: bool,
+        when_expr: Expr,
+        then_stmt: Box<Statement>,
+    },
     Select {
         value_only: bool,
         projections: Vec<Projection>,
         target: Target,
         where_clause: Option<Expr>,
-        order_by: Option<(String, bool)>, // (field, ascending)
+        group_by: Vec<String>,
+        order_by: Option<(String, bool)>,
         limit: Option<usize>,
         start: Option<usize>,
+        fetch: Vec<String>,
     },
     Create {
         target: Target,
@@ -47,6 +107,18 @@ pub enum Statement {
     Delete {
         target: Target,
         where_clause: Option<Expr>,
+    },
+    Relate {
+        from: Expr,
+        edge: String,
+        to: Expr,
+        data: MutationData,
+    },
+    LiveSelect {
+        table: String,
+    },
+    Kill {
+        live_id: Expr,
     },
 }
 
@@ -86,6 +158,10 @@ pub enum Expr {
     Array(Vec<Expr>),
     Object(Vec<(String, Expr)>),
     FunctionCall { name: String, args: Vec<Expr> },
+    GraphTraverse {
+        hops: Vec<GraphHop>,
+        tail_field: Option<String>,
+    },
     Unary { op: UnaryOp, expr: Box<Expr> },
     Binary { left: Box<Expr>, op: BinaryOp, right: Box<Expr> },
 }
@@ -112,6 +188,8 @@ pub enum BinaryOp {
     Or,
     Contains,
     In,
+    FtsMatch,
+    VecKnn { k: usize, metric: VectorMetric },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -144,6 +222,10 @@ enum Token {
     Gt,
     Ge,
     Bang,
+    ArrowRight,   // ->
+    ArrowLeft,    // <-
+    FtsOp,        // @@
+    VecKnnOp(usize, VectorMetric), // <|K|> or <|K,COSINE|>
     Eof,
 }
 
@@ -175,6 +257,12 @@ impl<'a> Lexer<'a> {
                             break;
                         }
                     }
+                    continue;
+                }
+                if clone.peek() == Some(&'>') {
+                    self.chars.next();
+                    self.chars.next();
+                    tokens.push(Token::ArrowRight);
                     continue;
                 }
             }
@@ -244,6 +332,15 @@ impl<'a> Lexer<'a> {
                     self.chars.next();
                     tokens.push(Token::Slash);
                 }
+                '@' => {
+                    self.chars.next();
+                    if self.chars.peek() == Some(&'@') {
+                        self.chars.next();
+                        tokens.push(Token::FtsOp);
+                    } else {
+                        return Err(anyhow!("Expected '@@' full-text operator"));
+                    }
+                }
                 ':' => {
                     self.chars.next();
                     if self.chars.peek() == Some(&':') {
@@ -273,7 +370,32 @@ impl<'a> Lexer<'a> {
                 }
                 '<' => {
                     self.chars.next();
-                    if self.chars.peek() == Some(&'=') {
+                    if self.chars.peek() == Some(&'-') {
+                        self.chars.next();
+                        tokens.push(Token::ArrowLeft);
+                    } else if self.chars.peek() == Some(&'|') {
+                        self.chars.next();
+                        // Parse `<|K|>` or `<|K,COSINE|>` or `<|K,40|>`
+                        let mut inner = String::new();
+                        while let Some(ch) = self.chars.next() {
+                            if ch == '|' && self.chars.peek() == Some(&'>') {
+                                self.chars.next();
+                                break;
+                            }
+                            inner.push(ch);
+                        }
+                        let mut parts = inner.split(',').map(|s| s.trim());
+                        let k = parts
+                            .next()
+                            .and_then(|s| s.parse::<usize>().ok())
+                            .unwrap_or(5);
+                        let metric = match parts.next().map(|s| s.to_ascii_uppercase()).as_deref() {
+                            Some("EUCLIDEAN") => VectorMetric::Euclidean,
+                            Some("MANHATTAN") => VectorMetric::Manhattan,
+                            _ => VectorMetric::Cosine,
+                        };
+                        tokens.push(Token::VecKnnOp(k, metric));
+                    } else if self.chars.peek() == Some(&'=') {
                         self.chars.next();
                         tokens.push(Token::Le);
                     } else if self.chars.peek() == Some(&'>') {
@@ -348,7 +470,6 @@ impl<'a> Lexer<'a> {
                     }
                 }
                 '`' => {
-                    // Backtick-quoted identifier
                     self.chars.next();
                     let mut ident = String::new();
                     while let Some(ch) = self.chars.next() {
@@ -418,6 +539,16 @@ impl Parser {
         }
     }
 
+    fn eat_if_not_exists(&mut self) -> bool {
+        if self.eat_kw("IF") {
+            let _ = self.eat_kw("NOT");
+            let _ = self.eat_kw("EXISTS");
+            true
+        } else {
+            false
+        }
+    }
+
     fn expect_ident(&mut self) -> Result<String> {
         match self.next() {
             Token::Ident(s) => Ok(s),
@@ -454,6 +585,17 @@ impl Parser {
             }
             return Ok(Statement::Use { ns, db });
         }
+        if self.eat_kw("LET") {
+            let name = match self.next() {
+                Token::Param(p) | Token::Ident(p) => p,
+                other => return Err(anyhow!("Expected $param after LET, got {:?}", other)),
+            };
+            if !matches!(self.next(), Token::Eq) {
+                return Err(anyhow!("Expected '=' in LET statement"));
+            }
+            let expr = self.parse_expr()?;
+            return Ok(Statement::Let { name, expr });
+        }
         if self.eat_kw("BEGIN") {
             let _ = self.eat_kw("TRANSACTION");
             return Ok(Statement::Begin);
@@ -467,28 +609,40 @@ impl Parser {
             return Ok(Statement::Cancel);
         }
         if self.eat_kw("DEFINE") {
-            if self.eat_kw("TABLE") {
-                let if_not_exists = if self.eat_kw("IF") {
-                    let _ = self.eat_kw("NOT");
-                    let _ = self.eat_kw("EXISTS");
-                    true
-                } else {
-                    false
-                };
-                let name = self.expect_ident()?;
-                let mut schemafull = false;
-                if self.eat_kw("SCHEMAFULL") {
-                    schemafull = true;
-                } else {
-                    let _ = self.eat_kw("SCHEMALESS");
-                }
-                return Ok(Statement::DefineTable {
-                    name,
-                    if_not_exists,
-                    schemafull,
-                });
+            return self.parse_define();
+        }
+        if self.eat_kw("LIVE") {
+            if !self.eat_kw("SELECT") {
+                return Err(anyhow!("Expected SELECT after LIVE"));
             }
-            return Err(anyhow!("Unsupported DEFINE target in Phase 1"));
+            if matches!(self.peek(), Token::Star) {
+                self.next();
+            }
+            let _ = self.eat_kw("FROM");
+            let table = self.expect_ident()?;
+            return Ok(Statement::LiveSelect { table });
+        }
+        if self.eat_kw("KILL") {
+            let live_id = self.parse_expr()?;
+            return Ok(Statement::Kill { live_id });
+        }
+        if self.eat_kw("RELATE") {
+            let from = self.parse_primary()?;
+            if !matches!(self.next(), Token::ArrowRight) {
+                return Err(anyhow!("Expected '->' in RELATE statement"));
+            }
+            let edge = self.expect_ident()?;
+            if !matches!(self.next(), Token::ArrowRight) {
+                return Err(anyhow!("Expected second '->' in RELATE statement"));
+            }
+            let to = self.parse_primary()?;
+            let data = self.parse_mutation_data()?;
+            return Ok(Statement::Relate {
+                from,
+                edge,
+                to,
+                data,
+            });
         }
         if self.eat_kw("SELECT") {
             return self.parse_select();
@@ -597,6 +751,148 @@ impl Parser {
         Err(anyhow!("Unexpected token at statement start: {:?}", self.peek()))
     }
 
+    fn parse_define(&mut self) -> Result<Statement> {
+        if self.eat_kw("TABLE") {
+            let if_not_exists = self.eat_if_not_exists();
+            let name = self.expect_ident()?;
+            let mut schemafull = false;
+            if self.eat_kw("SCHEMAFULL") {
+                schemafull = true;
+            } else {
+                let _ = self.eat_kw("SCHEMALESS");
+            }
+            return Ok(Statement::DefineTable {
+                name,
+                if_not_exists,
+                schemafull,
+            });
+        }
+
+        if self.eat_kw("FIELD") {
+            let if_not_exists = self.eat_if_not_exists();
+            let name = self.expect_ident()?;
+            let _ = self.eat_kw("ON");
+            let _ = self.eat_kw("TABLE");
+            let table = self.expect_ident()?;
+            let mut field_type = None;
+            let mut assert_expr = None;
+            let mut default_expr = None;
+            loop {
+                if self.eat_kw("TYPE") {
+                    let mut ty = self.expect_ident()?;
+                    if matches!(self.peek(), Token::Lt) {
+                        self.next();
+                        let inner = self.expect_ident()?;
+                        if matches!(self.peek(), Token::Gt) {
+                            self.next();
+                        }
+                        ty = format!("{}<{}>", ty, inner);
+                    }
+                    field_type = Some(ty);
+                } else if self.eat_kw("ASSERT") {
+                    assert_expr = Some(self.parse_expr()?);
+                } else if self.eat_kw("DEFAULT") {
+                    default_expr = Some(self.parse_expr()?);
+                } else {
+                    break;
+                }
+            }
+            return Ok(Statement::DefineField {
+                name,
+                table,
+                if_not_exists,
+                field_type,
+                assert_expr,
+                default_expr,
+            });
+        }
+
+        if self.eat_kw("INDEX") {
+            let if_not_exists = self.eat_if_not_exists();
+            let name = self.expect_ident()?;
+            let _ = self.eat_kw("ON");
+            let _ = self.eat_kw("TABLE");
+            let table = self.expect_ident()?;
+            let mut columns = Vec::new();
+            if self.eat_kw("FIELDS") || self.eat_kw("COLUMNS") {
+                loop {
+                    columns.push(self.expect_ident()?);
+                    if matches!(self.peek(), Token::Comma) {
+                        self.next();
+                    } else {
+                        break;
+                    }
+                }
+            }
+            let mut kind = IndexKind::Standard;
+            if self.eat_kw("UNIQUE") {
+                kind = IndexKind::Unique;
+            } else if self.eat_kw("SEARCH") {
+                // Consume optional ANALYZER <name> BM25
+                while !matches!(self.peek(), Token::Semicolon | Token::Eof) {
+                    self.next();
+                }
+                kind = IndexKind::FtsBm25;
+            } else if self.eat_kw("HNSW") || self.eat_kw("MTREE") {
+                let mut dim = 3usize;
+                let mut metric = VectorMetric::Cosine;
+                while !matches!(self.peek(), Token::Semicolon | Token::Eof) {
+                    if self.eat_kw("DIMENSION") {
+                        if let Token::Int(d) = self.next() {
+                            dim = d.max(1) as usize;
+                        }
+                    } else if self.eat_kw("DIST") {
+                        if let Ok(m) = self.expect_ident() {
+                            metric = match m.to_ascii_uppercase().as_str() {
+                                "EUCLIDEAN" => VectorMetric::Euclidean,
+                                "MANHATTAN" => VectorMetric::Manhattan,
+                                _ => VectorMetric::Cosine,
+                            };
+                        }
+                    } else {
+                        self.next();
+                    }
+                }
+                kind = IndexKind::VectorHnsw { dim, metric };
+            }
+            return Ok(Statement::DefineIndex {
+                name,
+                table,
+                if_not_exists,
+                columns,
+                kind,
+            });
+        }
+
+        if self.eat_kw("EVENT") {
+            let if_not_exists = self.eat_if_not_exists();
+            let name = self.expect_ident()?;
+            let _ = self.eat_kw("ON");
+            let _ = self.eat_kw("TABLE");
+            let table = self.expect_ident()?;
+            let _ = self.eat_kw("WHEN");
+            let when_expr = self.parse_expr()?;
+            let _ = self.eat_kw("THEN");
+            let wrapped = matches!(self.peek(), Token::LBrace | Token::LParen);
+            if wrapped {
+                self.next();
+            }
+            let then_stmt = self.parse_statement()?;
+            if wrapped && matches!(self.peek(), Token::RBrace | Token::RParen) {
+                self.next();
+            }
+            return Ok(Statement::DefineEvent {
+                name,
+                table,
+                if_not_exists,
+                when_expr,
+                then_stmt: Box::new(then_stmt),
+            });
+        }
+
+        Err(anyhow!("Unsupported DEFINE target"))
+    }
+
     fn parse_select(&mut self) -> Result<Statement> {
         let value_only = self.eat_kw("VALUE");
         let mut projections = Vec::new();
@@ -629,6 +925,20 @@ impl Parser {
         } else {
             None
         };
+        let mut group_by = Vec::new();
+        if self.eat_kw("GROUP") {
+            let _ = self.eat_kw("BY");
+            if !self.eat_kw("ALL") {
+                loop {
+                    group_by.push(self.expect_ident()?);
+                    if matches!(self.peek(), Token::Comma) {
+                        self.next();
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
         let order_by = if self.eat_kw("ORDER") {
             let _ = self.eat_kw("BY");
             let field = self.expect_ident()?;
@@ -659,25 +969,39 @@ impl Parser {
         } else {
             None
         };
+        let mut fetch = Vec::new();
+        if self.eat_kw("FETCH") {
+            loop {
+                fetch.push(self.expect_ident()?);
+                if matches!(self.peek(), Token::Comma) {
+                    self.next();
+                } else {
+                    break;
+                }
+            }
+        }
 
         Ok(Statement::Select {
             value_only,
             projections,
             target,
             where_clause,
+            group_by,
             order_by,
             limit,
             start,
+            fetch,
         })
     }
 
     fn parse_target(&mut self) -> Result<Target> {
         let first = self.expect_ident()?;
-        // `type::record(tb, id)`
         if first.eq_ignore_ascii_case("type") && matches!(self.peek(), Token::DoubleColon) {
             self.next();
             let fn_name = self.expect_ident()?;
-            if fn_name.eq_ignore_ascii_case("record") && matches!(self.peek(), Token::LParen) {
+            if (fn_name.eq_ignore_ascii_case("record") || fn_name.eq_ignore_ascii_case("thing"))
+                && matches!(self.peek(), Token::LParen)
+            {
                 self.next();
                 let tb_expr = self.parse_expr()?;
                 if matches!(self.peek(), Token::Comma) {
@@ -692,7 +1016,6 @@ impl Parser {
             return Err(anyhow!("Unsupported target function type::{}", fn_name));
         }
 
-        // `table:id`
         if matches!(self.peek(), Token::Colon) {
             self.next();
             let id = match self.next() {
@@ -766,7 +1089,7 @@ impl Parser {
     fn parse_cmp(&mut self) -> Result<Expr> {
         let mut left = self.parse_add()?;
         loop {
-            let op = match self.peek() {
+            let op = match self.peek().clone() {
                 Token::Eq | Token::EqEq => {
                     self.next();
                     BinaryOp::Eq
@@ -790,6 +1113,14 @@ impl Parser {
                 Token::Ge => {
                     self.next();
                     BinaryOp::Ge
+                }
+                Token::FtsOp => {
+                    self.next();
+                    BinaryOp::FtsMatch
+                }
+                Token::VecKnnOp(k, metric) => {
+                    self.next();
+                    BinaryOp::VecKnn { k, metric }
                 }
                 Token::Ident(s) if s.eq_ignore_ascii_case("CONTAINS") => {
                     self.next();
@@ -877,7 +1208,49 @@ impl Parser {
         self.parse_primary()
     }
 
+    fn parse_graph_traversal(&mut self) -> Result<Expr> {
+        let mut hops = Vec::new();
+        while matches!(self.peek(), Token::ArrowRight | Token::ArrowLeft) {
+            let dir = match self.next() {
+                Token::ArrowRight => GraphDir::Out,
+                Token::ArrowLeft => GraphDir::In,
+                _ => unreachable!(),
+            };
+            let edge = self.expect_ident()?;
+            let mut target_table = None;
+            if matches!(self.peek(), Token::ArrowRight | Token::ArrowLeft) {
+                self.next();
+                if matches!(self.peek(), Token::Ident(_)) {
+                    target_table = Some(self.expect_ident()?);
+                } else if matches!(self.peek(), Token::Star) {
+                    self.next();
+                }
+            }
+            hops.push(GraphHop {
+                dir,
+                edge,
+                target_table,
+            });
+        }
+        let tail_field = if matches!(self.peek(), Token::Dot) {
+            self.next();
+            if matches!(self.peek(), Token::Star) {
+                self.next();
+                None
+            } else {
+                Some(self.expect_ident()?)
+            }
+        } else {
+            None
+        };
+        Ok(Expr::GraphTraverse { hops, tail_field })
+    }
+
     fn parse_primary(&mut self) -> Result<Expr> {
+        if matches!(self.peek(), Token::ArrowRight | Token::ArrowLeft) {
+            return self.parse_graph_traversal();
+        }
+
         match self.next() {
             Token::Int(n) => Ok(Expr::Int(n)),
             Token::Float(f) => Ok(Expr::Float(f)),
@@ -938,7 +1311,6 @@ impl Parser {
                     return Ok(Expr::None);
                 }
 
-                // Namespaced function call: `ns::fn(args...)`
                 let mut full_name = s;
                 while matches!(self.peek(), Token::DoubleColon) {
                     self.next();
@@ -951,7 +1323,12 @@ impl Parser {
                     self.next();
                     let mut args = Vec::new();
                     while !matches!(self.peek(), Token::RParen | Token::Eof) {
-                        args.push(self.parse_expr()?);
+                        if matches!(self.peek(), Token::Star) {
+                            self.next();
+                            args.push(Expr::Int(1));
+                        } else {
+                            args.push(self.parse_expr()?);
+                        }
                         if matches!(self.peek(), Token::Comma) {
                             self.next();
                         }
@@ -965,7 +1342,6 @@ impl Parser {
                     });
                 }
 
-                // RecordId literal: `table:id` (only when not followed by nothing/whitespace)
                 if matches!(self.peek(), Token::Colon)
                     && matches!(
                         self.peek_next(),
@@ -981,7 +1357,6 @@ impl Parser {
                     return Ok(Expr::RecordId { tb: full_name, id });
                 }
 
-                // Dotted field path: `a.b.c`
                 if matches!(self.peek(), Token::Dot) {
                     let mut path = vec![full_name];
                     while matches!(self.peek(), Token::Dot) {

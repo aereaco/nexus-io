@@ -1,22 +1,28 @@
 pub mod engine;
+pub mod live;
 pub mod parser;
+pub mod rpc;
+pub mod stdlib;
 pub mod storage;
 pub mod value;
 
 use anyhow::Result;
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
 
 use crate::engine::ExecContext;
+use crate::live::{LiveBroker, LiveNotification};
 use crate::parser::parse_surql;
+use crate::rpc::RpcSession;
 use crate::storage::{encode_key, MemStorage, RedbStorage, StorageBackend, PREFIX_CELL_KV};
 pub use crate::value::Value;
 
-/// Clean-room, ultra-low-footprint SurrealQL-compatible embedded multi-model database.
+/// Clean-room, MIT-licensed, ultra-low-footprint SurrealQL-compatible embedded multi-model database.
 #[derive(Clone)]
 pub struct NexusDb {
     storage: Arc<dyn StorageBackend>,
+    live: Arc<LiveBroker>,
 }
 
 impl NexusDb {
@@ -24,6 +30,7 @@ impl NexusDb {
     pub fn open_mem() -> Self {
         Self {
             storage: Arc::new(MemStorage::new()),
+            live: Arc::new(LiveBroker::new()),
         }
     }
 
@@ -31,7 +38,29 @@ impl NexusDb {
     pub fn open_disk<P: AsRef<Path>>(path: P) -> Result<Self> {
         Ok(Self {
             storage: Arc::new(RedbStorage::open(path)?),
+            live: Arc::new(LiveBroker::new()),
         })
+    }
+
+    /// Subscribe to real-time `LIVE SELECT` notifications on `(ns, db, table)`.
+    pub fn subscribe_live(
+        &self,
+        ns: &str,
+        db: &str,
+        table: &str,
+    ) -> (String, mpsc::Receiver<LiveNotification>) {
+        self.live
+            .subscribe(&sanitize_ident(ns), &sanitize_ident(db), table)
+    }
+
+    /// Cancel an active `LIVE SELECT` subscription (`KILL <uuid>`).
+    pub fn kill_live(&self, live_id: &str) -> bool {
+        self.live.kill(live_id)
+    }
+
+    /// Create a SurrealDB-compatible JSON-RPC 2.0 session (for WebSocket / HTTP wire protocol).
+    pub fn rpc_session(&self, ns: &str, db: &str) -> RpcSession {
+        RpcSession::new(self.clone(), sanitize_ident(ns), sanitize_ident(db))
     }
 
     /// Execute one or more SurrealQL statements scoped to `(ns, db)` with named `$param` bindings.
@@ -46,6 +75,7 @@ impl NexusDb {
         let params: HashMap<String, Value> = bindings.into_iter().collect();
         let mut ctx = ExecContext::new(
             self.storage.as_ref(),
+            self.live.as_ref(),
             sanitize_ident(ns),
             sanitize_ident(db),
             params,
@@ -92,7 +122,8 @@ impl NexusDb {
         let mut out = Vec::new();
         for (k_bytes, v_bytes) in entries {
             let tail = &k_bytes[scan_pfx.len()..];
-            let k_str = String::from_utf8_lossy(tail.strip_suffix(&[0x00]).unwrap_or(tail)).to_string();
+            let k_str =
+                String::from_utf8_lossy(tail.strip_suffix(&[0x00]).unwrap_or(tail)).to_string();
             if let Some(p) = prefix {
                 if !k_str.starts_with(p) {
                     continue;
@@ -141,6 +172,7 @@ fn sanitize_ident(ident: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::live::LiveAction;
 
     #[test]
     fn crud_query_kv_and_redb_persistence() {
@@ -199,5 +231,112 @@ mod tests {
         }
 
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn graph_relate_schema_unique_live_fts_vector_and_rpc() {
+        let db = NexusDb::open_mem();
+
+        // 1. Schema + UNIQUE index enforcement
+        db.query_scoped(
+            "social",
+            "main",
+            "DEFINE TABLE person SCHEMAFULL;
+             DEFINE FIELD name ON person TYPE string;
+             DEFINE FIELD email ON person TYPE string;
+             DEFINE FIELD bio ON person TYPE string;
+             DEFINE FIELD embedding ON person TYPE array;
+             DEFINE INDEX idx_email ON person FIELDS email UNIQUE;
+             DEFINE INDEX idx_bio ON person FIELDS bio SEARCH ANALYZER ascii BM25;
+             DEFINE INDEX idx_vec ON person FIELDS embedding HNSW DIMENSION 3 DIST COSINE;",
+            vec![],
+        )
+        .unwrap();
+
+        // Live subscription before mutations
+        let (live_id, rx) = db.subscribe_live("social", "main", "person");
+
+        db.query_scoped(
+            "social",
+            "main",
+            "CREATE person:alice SET name = 'Alice', email = 'a@x.io', bio = 'rust distributed systems', embedding = [1.0, 0.0, 0.0];
+             CREATE person:bob SET name = 'Bob', email = 'b@x.io', bio = 'web frontend design', embedding = [0.0, 1.0, 0.0];
+             CREATE person:carol SET name = 'Carol', email = 'c@x.io', bio = 'rust database kernel', embedding = [0.9, 0.1, 0.0];",
+            vec![],
+        )
+        .unwrap();
+
+        // Verify LIVE SELECT emitted 3 CREATE events
+        let ev1 = rx.try_recv().unwrap();
+        assert_eq!(ev1.action, LiveAction::Create);
+        assert!(db.kill_live(&live_id));
+
+        // Verify UNIQUE constraint rejects duplicate email
+        let dup = db.query_scoped(
+            "social",
+            "main",
+            "CREATE person:dave SET name = 'Dave', email = 'a@x.io', bio = 'dup', embedding = [0.0, 0.0, 1.0];",
+            vec![],
+        );
+        assert!(dup.is_err(), "Duplicate UNIQUE email must fail");
+
+        // 2. Graph RELATE + outbound & inbound traversal
+        db.query_scoped(
+            "social",
+            "main",
+            "RELATE person:alice->knows->person:bob SET since = 2024;
+             RELATE person:alice->knows->person:carol SET since = 2025;",
+            vec![],
+        )
+        .unwrap();
+
+        let friends = db
+            .query_scoped(
+                "social",
+                "main",
+                "SELECT ->knows->person.name AS friends FROM person:alice;",
+                vec![],
+            )
+            .unwrap();
+        let friends_json = friends[0].to_json();
+        let arr = friends_json["friends"].as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+
+        // 3. Full-Text `@@` search
+        let fts = db
+            .query_scoped(
+                "social",
+                "main",
+                "SELECT VALUE name FROM person WHERE bio @@ 'rust' ORDER BY name ASC;",
+                vec![],
+            )
+            .unwrap();
+        assert_eq!(
+            fts,
+            vec![Value::String("Alice".into()), Value::String("Carol".into())]
+        );
+
+        // 4. Vector KNN `<|2,COSINE|>` search (closest to [1, 0, 0] -> Alice, Carol)
+        let knn = db
+            .query_scoped(
+                "social",
+                "main",
+                "SELECT VALUE name FROM person WHERE embedding <|2,COSINE|> [1.0, 0.0, 0.0];",
+                vec![],
+            )
+            .unwrap();
+        assert_eq!(
+            knn,
+            vec![Value::String("Alice".into()), Value::String("Carol".into())]
+        );
+
+        // 5. SurrealDB JSON-RPC 2.0 wire session
+        let mut rpc = db.rpc_session("social", "main");
+        let resp_str = rpc.handle_json(
+            r#"{"id":1,"method":"query","params":["SELECT VALUE string::uppercase(name) FROM person:alice;"]}"#,
+        );
+        let resp: serde_json::Value = serde_json::from_str(&resp_str).unwrap();
+        assert_eq!(resp["result"][0]["status"], "OK");
+        assert_eq!(resp["result"][0]["result"][0], "ALICE");
     }
 }

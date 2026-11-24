@@ -12,7 +12,12 @@ pub const PREFIX_RECORD: u8 = 0x02;
 pub const PREFIX_EDGE_OUT: u8 = 0x03;
 pub const PREFIX_EDGE_IN: u8 = 0x04;
 pub const PREFIX_INDEX: u8 = 0x05;
+pub const PREFIX_FTS: u8 = 0x06;
+pub const PREFIX_VEC: u8 = 0x07;
 pub const PREFIX_CELL_KV: u8 = 0x08;
+pub const PREFIX_FIELD_META: u8 = 0x09;
+pub const PREFIX_INDEX_META: u8 = 0x0A;
+pub const PREFIX_EVENT_META: u8 = 0x0B;
 
 /// Build a `\x00`-delimited ordered binary key for prefix scans.
 pub fn encode_key(prefix: u8, parts: &[&str]) -> Vec<u8> {

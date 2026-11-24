@@ -1,0 +1,353 @@
+use anyhow::{anyhow, Result};
+use chrono::{Datelike, Utc};
+use uuid::Uuid;
+
+use crate::value::Value;
+
+/// Tokenize text for BM25 full-text indexing and `@@` search matching.
+pub fn tokenize_fts(text: &str) -> Vec<String> {
+    text.to_ascii_lowercase()
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect()
+}
+
+/// Extract a numeric `Vec<f64>` vector from a `Value::Array`.
+pub fn value_to_vec(v: &Value) -> Option<Vec<f64>> {
+    match v {
+        Value::Array(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                out.push(item.as_f64()?);
+            }
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
+/// Cosine similarity in `[-1.0, 1.0]` between two equal-length vectors.
+pub fn cosine_similarity(a: &[f64], b: &[f64]) -> f64 {
+    if a.len() != b.len() || a.is_empty() {
+        return 0.0;
+    }
+    let mut dot = 0.0;
+    let mut norm_a = 0.0;
+    let mut norm_b = 0.0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        dot += x * y;
+        norm_a += x * x;
+        norm_b += y * y;
+    }
+    let denom = norm_a.sqrt() * norm_b.sqrt();
+    if denom == 0.0 {
+        0.0
+    } else {
+        dot / denom
+    }
+}
+
+/// Euclidean distance (`L2`) between two equal-length vectors.
+pub fn euclidean_distance(a: &[f64], b: &[f64]) -> f64 {
+    if a.len() != b.len() {
+        return f64::INFINITY;
+    }
+    a.iter()
+        .zip(b.iter())
+        .map(|(x, y)| (x - y) * (x - y))
+        .sum::<f64>()
+        .sqrt()
+}
+
+/// Manhattan distance (`L1`) between two equal-length vectors.
+pub fn manhattan_distance(a: &[f64], b: &[f64]) -> f64 {
+    if a.len() != b.len() {
+        return f64::INFINITY;
+    }
+    a.iter().zip(b.iter()).map(|(x, y)| (x - y).abs()).sum()
+}
+
+/// Evaluate a built-in SurrealQL standard library function (`string::*`, `math::*`, `array::*`,
+/// `object::*`, `time::*`, `type::*`, `vector::*`, `rand::*`, `count`).
+pub fn eval_stdlib(name: &str, args: &[Value]) -> Result<Value> {
+    match name.to_ascii_lowercase().as_str() {
+        // --- type::* ---
+        "type::record" | "type::thing" => {
+            if args.len() != 2 {
+                return Err(anyhow!("type::record expects 2 arguments (table, id)"));
+            }
+            Ok(Value::RecordId {
+                tb: args[0].display_compact(),
+                id: args[1].display_compact(),
+            })
+        }
+        "type::string" => Ok(Value::String(
+            args.first().map(|v| v.display_compact()).unwrap_or_default(),
+        )),
+        "type::int" => {
+            let n = match args.first() {
+                Some(Value::Int(i)) => *i,
+                Some(Value::Float(f)) => *f as i64,
+                Some(Value::String(s)) => s.trim().parse::<i64>().unwrap_or(0),
+                Some(Value::Bool(b)) => i64::from(*b),
+                _ => 0,
+            };
+            Ok(Value::Int(n))
+        }
+        "type::float" => {
+            let f = match args.first() {
+                Some(Value::Float(x)) => *x,
+                Some(Value::Int(i)) => *i as f64,
+                Some(Value::String(s)) => s.trim().parse::<f64>().unwrap_or(0.0),
+                _ => 0.0,
+            };
+            Ok(Value::Float(f))
+        }
+        "type::bool" => Ok(Value::Bool(args.first().map(|v| v.is_truthy()).unwrap_or(false))),
+
+        // --- time::* ---
+        "time::now" => Ok(Value::DateTime(Utc::now().to_rfc3339())),
+        "time::unix" => Ok(Value::Int(Utc::now().timestamp())),
+        "time::year" => Ok(Value::Int(Utc::now().year() as i64)),
+        "time::month" => Ok(Value::Int(Utc::now().month() as i64)),
+        "time::day" => Ok(Value::Int(Utc::now().day() as i64)),
+
+        // --- rand::* ---
+        "rand::uuid" | "rand::uuid::v4" => Ok(Value::String(Uuid::new_v4().to_string())),
+
+        // --- string::* ---
+        "string::lowercase" => Ok(Value::String(
+            args.first()
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_ascii_lowercase(),
+        )),
+        "string::uppercase" => Ok(Value::String(
+            args.first()
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_ascii_uppercase(),
+        )),
+        "string::trim" => Ok(Value::String(
+            args.first()
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string(),
+        )),
+        "string::len" => Ok(Value::Int(
+            args.first()
+                .and_then(|v| v.as_str())
+                .map(|s| s.chars().count() as i64)
+                .unwrap_or(0),
+        )),
+        "string::concat" => {
+            let mut out = String::new();
+            for a in args {
+                out.push_str(&a.display_compact());
+            }
+            Ok(Value::String(out))
+        }
+        "string::contains" => {
+            let hay = args.first().and_then(|v| v.as_str()).unwrap_or("");
+            let needle = args.get(1).and_then(|v| v.as_str()).unwrap_or("");
+            Ok(Value::Bool(hay.contains(needle)))
+        }
+        "string::starts_with" => {
+            let hay = args.first().and_then(|v| v.as_str()).unwrap_or("");
+            let pfx = args.get(1).and_then(|v| v.as_str()).unwrap_or("");
+            Ok(Value::Bool(hay.starts_with(pfx)))
+        }
+        "string::ends_with" => {
+            let hay = args.first().and_then(|v| v.as_str()).unwrap_or("");
+            let sfx = args.get(1).and_then(|v| v.as_str()).unwrap_or("");
+            Ok(Value::Bool(hay.ends_with(sfx)))
+        }
+        "string::split" => {
+            let hay = args.first().and_then(|v| v.as_str()).unwrap_or("");
+            let sep = args.get(1).and_then(|v| v.as_str()).unwrap_or(" ");
+            Ok(Value::Array(
+                hay.split(sep).map(|s| Value::String(s.to_string())).collect(),
+            ))
+        }
+        "string::replace" => {
+            let hay = args.first().and_then(|v| v.as_str()).unwrap_or("");
+            let from = args.get(1).and_then(|v| v.as_str()).unwrap_or("");
+            let to = args.get(2).and_then(|v| v.as_str()).unwrap_or("");
+            Ok(Value::String(hay.replace(from, to)))
+        }
+
+        // --- math::* & aggregates ---
+        "count" => match args.first() {
+            Some(Value::Array(a)) => Ok(Value::Int(a.len() as i64)),
+            Some(Value::String(s)) => Ok(Value::Int(s.len() as i64)),
+            Some(Value::None) | Some(Value::Null) | None => Ok(Value::Int(0)),
+            _ => Ok(Value::Int(1)),
+        },
+        "math::abs" => match args.first() {
+            Some(Value::Int(i)) => Ok(Value::Int(i.abs())),
+            Some(Value::Float(f)) => Ok(Value::Float(f.abs())),
+            _ => Ok(Value::Int(0)),
+        },
+        "math::ceil" => Ok(Value::Float(
+            args.first().and_then(|v| v.as_f64()).unwrap_or(0.0).ceil(),
+        )),
+        "math::floor" => Ok(Value::Float(
+            args.first().and_then(|v| v.as_f64()).unwrap_or(0.0).floor(),
+        )),
+        "math::round" => Ok(Value::Float(
+            args.first().and_then(|v| v.as_f64()).unwrap_or(0.0).round(),
+        )),
+        "math::sqrt" => Ok(Value::Float(
+            args.first().and_then(|v| v.as_f64()).unwrap_or(0.0).sqrt(),
+        )),
+        "math::pow" => {
+            let a = args.first().and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let b = args.get(1).and_then(|v| v.as_f64()).unwrap_or(1.0);
+            Ok(Value::Float(a.powf(b)))
+        }
+        "math::sum" => match args.first() {
+            Some(Value::Array(a)) => {
+                if a.iter().all(|v| matches!(v, Value::Int(_))) {
+                    let s: i64 = a
+                        .iter()
+                        .filter_map(|v| match v {
+                            Value::Int(i) => Some(*i),
+                            _ => None,
+                        })
+                        .sum();
+                    Ok(Value::Int(s))
+                } else {
+                    let s: f64 = a.iter().filter_map(|v| v.as_f64()).sum();
+                    Ok(Value::Float(s))
+                }
+            }
+            _ => Ok(Value::Int(0)),
+        },
+        "math::mean" => match args.first() {
+            Some(Value::Array(a)) if !a.is_empty() => {
+                let vals: Vec<f64> = a.iter().filter_map(|v| v.as_f64()).collect();
+                if vals.is_empty() {
+                    Ok(Value::Float(0.0))
+                } else {
+                    Ok(Value::Float(vals.iter().sum::<f64>() / vals.len() as f64))
+                }
+            }
+            _ => Ok(Value::Float(0.0)),
+        },
+        "math::min" => match args.first() {
+            Some(Value::Array(a)) => Ok(a
+                .iter()
+                .min_by(|x, y| x.cmp_order(y))
+                .cloned()
+                .unwrap_or(Value::None)),
+            _ => Ok(Value::None),
+        },
+        "math::max" => match args.first() {
+            Some(Value::Array(a)) => Ok(a
+                .iter()
+                .max_by(|x, y| x.cmp_order(y))
+                .cloned()
+                .unwrap_or(Value::None)),
+            _ => Ok(Value::None),
+        },
+
+        // --- array::* ---
+        "array::len" => match args.first() {
+            Some(Value::Array(a)) => Ok(Value::Int(a.len() as i64)),
+            _ => Ok(Value::Int(0)),
+        },
+        "array::distinct" => match args.first() {
+            Some(Value::Array(a)) => {
+                let mut out = Vec::new();
+                for item in a {
+                    if !out.contains(item) {
+                        out.push(item.clone());
+                    }
+                }
+                Ok(Value::Array(out))
+            }
+            _ => Ok(Value::Array(Vec::new())),
+        },
+        "array::flatten" => match args.first() {
+            Some(Value::Array(a)) => {
+                let mut out = Vec::new();
+                for item in a {
+                    match item {
+                        Value::Array(inner) => out.extend(inner.iter().cloned()),
+                        other => out.push(other.clone()),
+                    }
+                }
+                Ok(Value::Array(out))
+            }
+            _ => Ok(Value::Array(Vec::new())),
+        },
+        "array::reverse" => match args.first() {
+            Some(Value::Array(a)) => {
+                let mut out = a.clone();
+                out.reverse();
+                Ok(Value::Array(out))
+            }
+            _ => Ok(Value::Array(Vec::new())),
+        },
+        "array::sort" => match args.first() {
+            Some(Value::Array(a)) => {
+                let mut out = a.clone();
+                out.sort_by(|x, y| x.cmp_order(y));
+                Ok(Value::Array(out))
+            }
+            _ => Ok(Value::Array(Vec::new())),
+        },
+        "array::concat" => {
+            let mut out = Vec::new();
+            for arg in args {
+                if let Value::Array(a) = arg {
+                    out.extend(a.iter().cloned());
+                }
+            }
+            Ok(Value::Array(out))
+        }
+
+        // --- object::* ---
+        "object::keys" => match args.first() {
+            Some(Value::Object(m)) => Ok(Value::Array(
+                m.keys().map(|k| Value::String(k.clone())).collect(),
+            )),
+            _ => Ok(Value::Array(Vec::new())),
+        },
+        "object::values" => match args.first() {
+            Some(Value::Object(m)) => Ok(Value::Array(m.values().cloned().collect())),
+            _ => Ok(Value::Array(Vec::new())),
+        },
+        "object::len" => match args.first() {
+            Some(Value::Object(m)) => Ok(Value::Int(m.len() as i64)),
+            _ => Ok(Value::Int(0)),
+        },
+
+        // --- vector::* ---
+        "vector::similarity::cosine" => {
+            let a = args.first().and_then(value_to_vec).unwrap_or_default();
+            let b = args.get(1).and_then(value_to_vec).unwrap_or_default();
+            Ok(Value::Float(cosine_similarity(&a, &b)))
+        }
+        "vector::distance::euclidean" => {
+            let a = args.first().and_then(value_to_vec).unwrap_or_default();
+            let b = args.get(1).and_then(value_to_vec).unwrap_or_default();
+            Ok(Value::Float(euclidean_distance(&a, &b)))
+        }
+        "vector::distance::manhattan" => {
+            let a = args.first().and_then(value_to_vec).unwrap_or_default();
+            let b = args.get(1).and_then(value_to_vec).unwrap_or_default();
+            Ok(Value::Float(manhattan_distance(&a, &b)))
+        }
+        "vector::dot" => {
+            let a = args.first().and_then(value_to_vec).unwrap_or_default();
+            let b = args.get(1).and_then(value_to_vec).unwrap_or_default();
+            let dot: f64 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+            Ok(Value::Float(dot))
+        }
+
+        other => Err(anyhow!("Unknown SurrealQL function '{}'", other)),
+    }
+}
