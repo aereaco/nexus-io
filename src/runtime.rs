@@ -61,14 +61,15 @@ impl CapabilityRegistry {
         reg("gql", cfg!(feature = "gql"));
         reg("unified-multi-flavor-query", true);
         reg("gateway", true);
-        reg("js-runtime", true);
+        reg("wasm-runtime", cfg!(feature = "wasm-runtime"));
+        reg("js-wasm", cfg!(feature = "wasm-runtime"));
+        reg("js-native", cfg!(feature = "js-native"));
         reg("cells", true);
         reg("iam", true);
         reg("object-storage", true);
         reg("p2p-storage", cfg!(feature = "p2p-storage"));
         reg("s3-gateway", cfg!(feature = "s3-gateway"));
         reg("shell", cfg!(feature = "shell"));
-        reg("wasm-runtime", cfg!(feature = "wasm-runtime"));
         reg("k8s-bridge", cfg!(feature = "k8s-bridge"));
         reg("vpn", cfg!(feature = "vpn"));
         reg("hardware-monitoring", cfg!(feature = "hardware-monitoring"));

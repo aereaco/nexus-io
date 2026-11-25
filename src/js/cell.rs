@@ -55,6 +55,13 @@ pub enum CellDbMode {
         target_cell_id: String,
         role: MeshDbRole,
     },
+    /// Database engine itself runs inside Wasmtime (e.g. `pglite.wasm`, `sqlite.wasm`, `duckdb.wasm`,
+    /// or sandboxed `nexus-db.wasm`) backed by `BlobBridge` virtual storage.
+    WasmEngine {
+        engine: String,
+        module_cid: String,
+        mount_path: String,
+    },
 }
 
 /// Unified per-cell declarative database configuration governing topology (`mode`),
@@ -146,6 +153,24 @@ impl CellDbConfig {
             ],
         }
     }
+
+    /// Mount a Wasmtime-hosted database engine (e.g. `pglite`, `sqlite`, `duckdb`, `nexus-db`)
+    /// backed by `BlobBridge` virtual storage.
+    pub fn wasm_engine(
+        engine: impl Into<String>,
+        module_cid: impl Into<String>,
+        flavor: impl Into<String>,
+    ) -> Self {
+        Self {
+            mode: CellDbMode::WasmEngine {
+                engine: engine.into(),
+                module_cid: module_cid.into(),
+                mount_path: "/data".to_string(),
+            },
+            flavors: vec![flavor.into()],
+            transports: vec![CellDbTransport::Internal, CellDbTransport::HttpRest],
+        }
+    }
 }
 
 /// Resolved target `(ns, db)` and access constraints returned by `CellManager::resolve_db_binding`.
@@ -192,9 +217,44 @@ pub struct CellKey {
     pub cell_id: String,
 }
 
+/// Universal compute workload executed by a `CellManager` actor.
+/// Wasmtime (`WasiModule`, `WasiCgi`, `JsOnWasm`) is the primary microkernel compute primitive;
+/// `NativeJs` (`quickrs-core`) is retained as a transitional path during the `quickjs.wasm` migration.
+#[derive(Debug, Clone)]
+pub enum CellWorkload {
+    NativeJs {
+        script: String,
+    },
+    JsOnWasm {
+        script: String,
+        engine_wasm: Vec<u8>,
+        fuel_limit: u64,
+    },
+    WasiModule {
+        module_bytes: Vec<u8>,
+        args: Vec<String>,
+        env: Vec<(String, String)>,
+        preopen_dirs: Vec<(std::path::PathBuf, String, bool)>,
+        fuel_limit: u64,
+    },
+    WasiCgi {
+        module_bytes: Vec<u8>,
+        doc_root: Option<std::path::PathBuf>,
+        fuel_limit: u64,
+    },
+}
+
+/// HTTP response returned by `CellManager::invoke_http` for WASI CGI / WASI / JS-on-Wasm cells.
+#[derive(Debug, Clone)]
+pub struct CellHttpResponse {
+    pub status: u16,
+    pub headers: std::collections::BTreeMap<String, String>,
+    pub body: Vec<u8>,
+}
+
 struct ActiveCell {
     policy: CellPolicy,
-    script: String,
+    workload: CellWorkload,
     lease_etag: Option<String>,
     last_active: Instant,
 }
@@ -328,17 +388,35 @@ impl CellManager {
                 read_only: !matches!(role, MeshDbRole::Leader),
                 mesh_cluster: Some(cluster.clone()),
             }),
+            CellDbMode::WasmEngine { .. } => Ok(ResolvedDbBinding {
+                target_ns: app.to_string(),
+                target_db: cell_id.to_string(),
+                read_only: false,
+                mesh_cluster: None,
+            }),
         }
     }
 
-    /// Wake (or reuse) a cell under `policy`. For `Elastic` cells, acquires a single-writer CAS lease
-    /// in `BlobBridge` and hydrates any persisted snapshot into `(app, cell_id)`.
+    /// Wake (or reuse) a JS/TS cell under `policy`.
     pub async fn wake(
         &self,
         app: &str,
         cell_id: &str,
         policy: CellPolicy,
         script: String,
+    ) -> Result<()> {
+        self.wake_workload(app, cell_id, policy, CellWorkload::NativeJs { script })
+            .await
+    }
+
+    /// Wake (or reuse) any universal `CellWorkload` (`WasiModule`, `WasiCgi`, `JsOnWasm`, or `NativeJs`)
+    /// under `policy`, acquiring a single-writer CAS lease and hydrating hibernated snapshots for `Elastic` cells.
+    pub async fn wake_workload(
+        &self,
+        app: &str,
+        cell_id: &str,
+        policy: CellPolicy,
+        workload: CellWorkload,
     ) -> Result<()> {
         let key = CellKey {
             app: app.to_string(),
@@ -347,6 +425,7 @@ impl CellManager {
 
         if let Some(existing) = self.active.write().await.get_mut(&key) {
             existing.last_active = Instant::now();
+            existing.workload = workload;
             return Ok(());
         }
 
@@ -361,7 +440,7 @@ impl CellManager {
                 .await?;
             lease_etag = Some(etag);
 
-            // Hydrate snapshot from `iroh-blobs` if the cell was previously hibernated
+            // Hydrate snapshot from `BlobBridge` if the cell was previously hibernated
             let snap_key = format!("snapshots/{}/{}.json", app, cell_id);
             if let Some(snap) = self.blobs.get_object(lease_bucket, &snap_key).await? {
                 self.engine.import_snapshot(app, cell_id, snap).await?;
@@ -372,12 +451,154 @@ impl CellManager {
             key,
             ActiveCell {
                 policy,
-                script,
+                workload,
                 lease_etag,
                 last_active: Instant::now(),
             },
         );
         Ok(())
+    }
+
+    /// Returns `true` if `(app, cell_id)` is currently awake with a Wasmtime workload (`WasiModule`, `WasiCgi`, or `JsOnWasm`).
+    pub async fn is_wasm_workload(&self, app: &str, cell_id: &str) -> bool {
+        let key = CellKey {
+            app: app.to_string(),
+            cell_id: cell_id.to_string(),
+        };
+        matches!(
+            self.active.read().await.get(&key).map(|c| &c.workload),
+            Some(
+                CellWorkload::WasiModule { .. }
+                    | CellWorkload::WasiCgi { .. }
+                    | CellWorkload::JsOnWasm { .. }
+            )
+        )
+    }
+
+    /// Invoke an HTTP request against a Wasmtime cell (`WasiCgi`, `WasiModule`, or `JsOnWasm`)
+    /// with its `NexusHostContext` (`CellDbConfig`, `StateEngine`, `BlobBridge`) automatically attached.
+    #[cfg(all(feature = "wasm-runtime", not(target_os = "ios")))]
+    pub async fn invoke_http(
+        &self,
+        app: &str,
+        cell_id: &str,
+        method: &str,
+        path: &str,
+        query_string: &str,
+        body: &[u8],
+    ) -> Result<CellHttpResponse> {
+        let key = CellKey {
+            app: app.to_string(),
+            cell_id: cell_id.to_string(),
+        };
+        let workload = {
+            let mut map = self.active.write().await;
+            let cell = map
+                .get_mut(&key)
+                .ok_or_else(|| anyhow::anyhow!("Cell {}/{} is not awake", app, cell_id))?;
+            cell.last_active = Instant::now();
+            cell.workload.clone()
+        };
+
+        let db_config = self.get_db_config(app, cell_id).await;
+        let host = crate::compute::crystal::NexusHostContext::new(
+            app,
+            cell_id,
+            db_config,
+            self.engine.clone(),
+            self.blobs.clone(),
+        );
+        let crystal = crate::compute::crystal::CrystalEngine::new()?;
+
+        match workload {
+            CellWorkload::WasiCgi {
+                module_bytes,
+                doc_root,
+                fuel_limit,
+            } => {
+                let method = method.to_string();
+                let path = path.to_string();
+                let query = query_string.to_string();
+                let body_vec = body.to_vec();
+                let cgi = tokio::task::spawn_blocking(move || {
+                    crystal.invoke_wasi_cgi_with_host(
+                        &module_bytes,
+                        &method,
+                        &path,
+                        &query,
+                        &body_vec,
+                        doc_root.as_deref(),
+                        Some(host),
+                        fuel_limit,
+                    )
+                })
+                .await??;
+                Ok(CellHttpResponse {
+                    status: cgi.status,
+                    headers: cgi.headers,
+                    body: cgi.body,
+                })
+            }
+            CellWorkload::WasiModule {
+                module_bytes,
+                args,
+                env,
+                preopen_dirs,
+                fuel_limit,
+            } => {
+                let mut env = env;
+                env.push(("REQUEST_METHOD".to_string(), method.to_ascii_uppercase()));
+                env.push(("PATH_INFO".to_string(), path.to_string()));
+                env.push(("QUERY_STRING".to_string(), query_string.to_string()));
+                let cfg = crate::compute::crystal::WasiRunConfig {
+                    args,
+                    env,
+                    stdin: body.to_vec(),
+                    preopen_dirs,
+                    fuel_limit,
+                };
+                let out = tokio::task::spawn_blocking(move || {
+                    crystal.run_wasi_with_host(&module_bytes, cfg, host)
+                })
+                .await??;
+                Ok(CellHttpResponse {
+                    status: if out.exit_code == 0 { 200 } else { 500 },
+                    headers: std::collections::BTreeMap::new(),
+                    body: out.stdout,
+                })
+            }
+            CellWorkload::JsOnWasm {
+                script,
+                engine_wasm,
+                fuel_limit,
+            } => {
+                let js_script = if super::transformer::is_likely_ts(&script) {
+                    super::transformer::transform_ts_to_js(&script, nu_protocol::Span::unknown())
+                        .unwrap_or(script)
+                } else {
+                    script
+                };
+                let body_vec = body.to_vec();
+                let out = tokio::task::spawn_blocking(move || {
+                    crystal.invoke_js_wasm(&engine_wasm, &js_script, &body_vec, Some(host), fuel_limit)
+                })
+                .await??;
+                Ok(CellHttpResponse {
+                    status: if out.exit_code == 0 { 200 } else { 500 },
+                    headers: std::collections::BTreeMap::new(),
+                    body: out.stdout,
+                })
+            }
+            CellWorkload::NativeJs { .. } => {
+                let expr = String::from_utf8_lossy(body).to_string();
+                let out = self.eval_in_cell(app, cell_id, &expr).await?;
+                Ok(CellHttpResponse {
+                    status: 200,
+                    headers: std::collections::BTreeMap::new(),
+                    body: out.into_bytes(),
+                })
+            }
+        }
     }
 
     /// Ensure a cell is awake (acquiring its CAS lease, hydrating any hibernated snapshot from
@@ -410,7 +631,16 @@ impl CellManager {
                 .get_mut(&key)
                 .ok_or_else(|| anyhow::anyhow!("Cell {}/{} is not awake", app, cell_id))?;
             cell.last_active = Instant::now();
-            cell.script.clone()
+            match &cell.workload {
+                CellWorkload::NativeJs { script } | CellWorkload::JsOnWasm { script, .. } => {
+                    script.clone()
+                }
+                _ => anyhow::bail!(
+                    "Cell {}/{} is a Wasmtime binary workload; invoke it via CellManager::invoke_http",
+                    app,
+                    cell_id
+                ),
+            }
         };
 
         let engine = self.engine.clone();

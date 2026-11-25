@@ -8,7 +8,7 @@ use std::sync::Arc;
 use crate::compute::k8s_bridge::{export_k8s_yaml, import_k8s_yaml, ExportOptions};
 use crate::compute::md_runtime::deploy_markdown;
 use crate::db::Database;
-use crate::js::cell::{CellManager, CellPolicy};
+use crate::js::cell::{CellManager, CellPolicy, CellWorkload};
 
 /// HTTP & WebSocket ingress handler for `/cells/<**path>` (`/cells/<app>/<cell_id>` and `POST /cells/deploy-md`).
 /// Supports deploying/waking `pinned` or `elastic` (`celld`) cells, evaluating requests,
@@ -198,18 +198,53 @@ impl Handler for CellGatewayHandler {
         }
 
         match req.method() {
-            // PUT /cells/<app>/<cell_id> -> wake/deploy TS or JS cell script
+            // PUT /cells/<app>/<cell_id> -> wake/deploy WASI, WASI-CGI, or TS/JS cell workload
             &Method::PUT => {
                 let policy = policy_from_headers(req);
-                let script = match req.payload().await {
-                    Ok(bytes) => String::from_utf8_lossy(bytes).to_string(),
+                let runtime_hdr = req
+                    .headers()
+                    .get("x-nexus-runtime")
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| s.to_ascii_lowercase());
+                let is_wasm_ct = req
+                    .headers()
+                    .get("content-type")
+                    .and_then(|v| v.to_str().ok())
+                    .map(|v| v.contains("application/wasm"))
+                    .unwrap_or(false);
+                let raw_bytes = match req.payload().await {
+                    Ok(bytes) => bytes.to_vec(),
                     Err(e) => {
                         res.status_code(StatusCode::BAD_REQUEST);
-                        res.render(Text::Plain(format!("Failed to read cell script: {}", e)));
+                        res.render(Text::Plain(format!("Failed to read cell payload: {}", e)));
                         return;
                     }
                 };
-                match self.cells.wake(&app, &cell_id, policy, script).await {
+                let workload = match runtime_hdr.as_deref() {
+                    Some("wasi-cgi") | Some("cgi") | Some("php") => CellWorkload::WasiCgi {
+                        module_bytes: raw_bytes,
+                        doc_root: None,
+                        fuel_limit: 50_000_000,
+                    },
+                    Some("wasi") | Some("wasm") => CellWorkload::WasiModule {
+                        module_bytes: raw_bytes,
+                        args: vec!["cell.wasm".to_string()],
+                        env: Vec::new(),
+                        preopen_dirs: Vec::new(),
+                        fuel_limit: 50_000_000,
+                    },
+                    _ if is_wasm_ct => CellWorkload::WasiModule {
+                        module_bytes: raw_bytes,
+                        args: vec!["cell.wasm".to_string()],
+                        env: Vec::new(),
+                        preopen_dirs: Vec::new(),
+                        fuel_limit: 50_000_000,
+                    },
+                    _ => CellWorkload::NativeJs {
+                        script: String::from_utf8_lossy(&raw_bytes).to_string(),
+                    },
+                };
+                match self.cells.wake_workload(&app, &cell_id, policy, workload).await {
                     Ok(()) => {
                         res.status_code(StatusCode::OK);
                         res.render(Text::Plain(format!("Cell {}/{} awake", app, cell_id)));
@@ -225,16 +260,46 @@ impl Handler for CellGatewayHandler {
                 }
             }
 
-            // POST /cells/<app>/<cell_id> -> evaluate expression / RPC inside cell
+            // POST /cells/<app>/<cell_id> -> invoke WASI/CGI cell or evaluate expression/RPC inside JS cell
             &Method::POST => {
-                let expr = match req.payload().await {
-                    Ok(bytes) => String::from_utf8_lossy(bytes).to_string(),
+                let raw_bytes = match req.payload().await {
+                    Ok(bytes) => bytes.to_vec(),
                     Err(e) => {
                         res.status_code(StatusCode::BAD_REQUEST);
-                        res.render(Text::Plain(format!("Failed to read expression: {}", e)));
+                        res.render(Text::Plain(format!("Failed to read body: {}", e)));
                         return;
                     }
                 };
+                #[cfg(all(feature = "wasm-runtime", not(target_os = "ios")))]
+                if self.cells.is_wasm_workload(&app, &cell_id).await {
+                    let query = req.uri().query().unwrap_or("");
+                    match self
+                        .cells
+                        .invoke_http(&app, &cell_id, "POST", req.uri().path(), query, &raw_bytes)
+                        .await
+                    {
+                        Ok(resp) => {
+                            res.status_code(
+                                StatusCode::from_u16(resp.status).unwrap_or(StatusCode::OK),
+                            );
+                            for (k, v) in resp.headers {
+                                if let (Ok(name), Ok(val)) = (
+                                    salvo::http::header::HeaderName::from_bytes(k.as_bytes()),
+                                    salvo::http::header::HeaderValue::from_str(&v),
+                                ) {
+                                    res.headers_mut().insert(name, val);
+                                }
+                            }
+                            let _ = res.write_body(resp.body);
+                        }
+                        Err(e) => {
+                            res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+                            res.render(Text::Plain(format!("WASI cell error: {}", e)));
+                        }
+                    }
+                    return;
+                }
+                let expr = String::from_utf8_lossy(&raw_bytes).to_string();
                 match self.cells.eval_in_cell(&app, &cell_id, &expr).await {
                     Ok(out) => {
                         res.status_code(StatusCode::OK);
@@ -258,8 +323,37 @@ impl Handler for CellGatewayHandler {
                 }
             },
 
-            // GET /cells/<app>/<cell_id> -> invoke WinterCG fetch(request) or return status
+            // GET /cells/<app>/<cell_id> -> invoke WASI/CGI handler or WinterCG fetch(request)
             &Method::GET => {
+                #[cfg(all(feature = "wasm-runtime", not(target_os = "ios")))]
+                if self.cells.is_wasm_workload(&app, &cell_id).await {
+                    let query = req.uri().query().unwrap_or("");
+                    match self
+                        .cells
+                        .invoke_http(&app, &cell_id, "GET", req.uri().path(), query, b"")
+                        .await
+                    {
+                        Ok(resp) => {
+                            res.status_code(
+                                StatusCode::from_u16(resp.status).unwrap_or(StatusCode::OK),
+                            );
+                            for (k, v) in resp.headers {
+                                if let (Ok(name), Ok(val)) = (
+                                    salvo::http::header::HeaderName::from_bytes(k.as_bytes()),
+                                    salvo::http::header::HeaderValue::from_str(&v),
+                                ) {
+                                    res.headers_mut().insert(name, val);
+                                }
+                            }
+                            let _ = res.write_body(resp.body);
+                        }
+                        Err(e) => {
+                            res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+                            res.render(Text::Plain(format!("WASI cell error: {}", e)));
+                        }
+                    }
+                    return;
+                }
                 let req_url = format!("http://localhost{}", req.uri());
                 let eval_expr = format!(
                     "typeof fetch === 'function' ? (() => {{ const r = fetch(new Request({:?}, {{ method: 'GET' }})); return r && typeof r === 'object' && '_body' in r ? r._body : String(r); }})() : 'ok'",

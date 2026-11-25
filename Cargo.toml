@@ -20,6 +20,7 @@ default = ["profile-core"]
 profile-core = [
     "database",
     "gateway",
+    "wasm-runtime",
     "js-runtime",
     "cells",
     "iam",
@@ -97,7 +98,8 @@ profile-ios = [
 # Granular capability flags
 database = []
 gateway = []
-js-runtime = []
+js-runtime = ["js-native"]
+js-native = ["dep:quickrs-core"]
 cells = []
 iam = []
 sqlite-hrana = ["nexus-db/sqlite"]
@@ -129,8 +131,8 @@ nu-command = { version = "0.117.0", features = ["os", "network", "rand", "sqlite
 nu-parser = "0.117.0"
 nu-cmd-lang = "0.117.0"
 
-# 3. The Trampoline (Pure-Rust JS + Native TS via OXC + optional Wasmtime/WASI Crystal Cells)
-quickrs-core = "0.16.2"
+# 3. The Trampoline (Unified Wasmtime/WASI Core + Native TS via OXC + transitional optional quickrs-core)
+quickrs-core = { version = "0.16.2", optional = true }
 wasmtime = { version = "51.0.0", optional = true, default-features = false, features = ["runtime"] }
 wasmtime-wasi = { version = "51.0.0", optional = true }
 
