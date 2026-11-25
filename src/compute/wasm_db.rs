@@ -9,16 +9,19 @@ use tokio::sync::{Mutex, RwLock};
 
 use crate::compute::crystal::{CrystalEngine, WasiRunConfig};
 use crate::compute::wasm_registry::{ResolvedRuntime, WasmRuntimeRegistry};
+use crate::storage::cas_store::DEFAULT_EXECUTION_LEASE_TTL_MS;
 use crate::storage::{BlobBridge, CasStore};
 
 pub const WASM_DB_BUCKET: &str = "nexus-wasm-db";
 
 /// Multi-file virtual filesystem manifest persisted per `(app, cell_id)` in `BlobBridge`.
-/// Preserves full directory hierarchies, SQLite `-wal`/`-shm`/`-journal` files, and
-/// PostgreSQL/PGlite `PGDATA` trees across elastic hibernation and node restarts.
+/// Carries a monotonic `fencing_token` from the distributed `ExecutionLease` so stale writers
+/// that paused past lease expiry are strictly rejected at commit time.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct WasmDbFsManifest {
     pub version: u64,
+    #[serde(default)]
+    pub fencing_token: u64,
     /// Relative POSIX path inside `mount_path` (e.g. `"main.db"`, `"main.db-wal"`, `"pgdata/PG_VERSION"`)
     /// mapped to its content-addressed BLAKE3 CID in `BlobBridge`.
     pub files: BTreeMap<String, String>,
@@ -102,10 +105,89 @@ impl WasmDbMount {
         query: &str,
         fuel_limit: u64,
     ) -> Result<JsonValue> {
-        // 1. Serialize all concurrent queries on the same `(app, cell_id)`
+        // 1. Serialize in-process concurrency AND acquire distributed fenced ExecutionLease
+        //    covering the entire hydrate -> execute -> persist cycle across processes/nodes.
         let lock = self.cell_lock(app, cell_id).await;
         let _guard = lock.lock().await;
 
+        let cas = CasStore::new(blobs.clone());
+        let lease_key = format!("leases/wasmdb/{}/{}.lease.json", app, cell_id);
+        let holder = format!("{}:{}", blobs.node_id(), uuid::Uuid::new_v4().simple());
+        let lease = cas
+            .acquire_execution_lease(
+                WASM_DB_BUCKET,
+                &lease_key,
+                &holder,
+                DEFAULT_EXECUTION_LEASE_TTL_MS,
+            )
+            .await?;
+
+        // Background lease heartbeat renewal (every ttl / 3) for long-running queries
+        let hb_cas = cas.clone();
+        let hb_key = lease_key.clone();
+        let hb_holder = holder.clone();
+        let hb_token = lease.fencing_token;
+        let hb_task = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_millis(
+                DEFAULT_EXECUTION_LEASE_TTL_MS / 3,
+            ));
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                if hb_cas
+                    .renew_execution_lease(
+                        WASM_DB_BUCKET,
+                        &hb_key,
+                        &hb_holder,
+                        hb_token,
+                        DEFAULT_EXECUTION_LEASE_TTL_MS,
+                    )
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+
+        let exec_result = self
+            .execute_query_under_lease(
+                &cas,
+                registry,
+                app,
+                cell_id,
+                engine_name,
+                module_cid,
+                mount_path,
+                flavor,
+                query,
+                fuel_limit,
+                lease.fencing_token,
+            )
+            .await;
+
+        hb_task.abort();
+        let _ = cas
+            .release_execution_lease(WASM_DB_BUCKET, &lease_key, &holder, lease.fencing_token)
+            .await;
+        exec_result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_query_under_lease(
+        &self,
+        cas: &CasStore,
+        registry: &WasmRuntimeRegistry,
+        app: &str,
+        cell_id: &str,
+        engine_name: &str,
+        module_cid: &str,
+        mount_path: &str,
+        flavor: &str,
+        query: &str,
+        fuel_limit: u64,
+        fencing_token: u64,
+    ) -> Result<JsonValue> {
         // 2. Resolve Wasm/AOT DB engine module
         let resolved = match registry.resolve_runtime(module_cid).await {
             Ok(r) => r,
@@ -113,12 +195,21 @@ impl WasmDbMount {
         };
 
         // 3. Hydrate entire multi-file virtual directory tree via shared CasStore (BLAKE3 verified)
-        let cas = CasStore::new(blobs.clone());
         let manifest_key = format!("cells/{}/{}/manifest.json", app, cell_id);
         let (prev_manifest, prev_etag) = match cas.read_manifest::<WasmDbFsManifest>(WASM_DB_BUCKET, &manifest_key).await? {
             Some((m, etag)) => (m, Some(etag)),
             None => (WasmDbFsManifest::default(), None),
         };
+        // Reject stale fenced writers immediately
+        if fencing_token < prev_manifest.fencing_token {
+            anyhow::bail!(
+                "Fenced out: lease fencing_token {} < manifest fencing_token {} for {}/{}",
+                fencing_token,
+                prev_manifest.fencing_token,
+                app,
+                cell_id
+            );
+        }
         let work_dir = std::env::temp_dir().join(format!(
             "nexus_wasmdb_{}_{}_{}",
             sanitize(app),
@@ -223,6 +314,7 @@ impl WasmDbMount {
 
             let next_manifest = WasmDbFsManifest {
                 version: prev_manifest.version + 1,
+                fencing_token,
                 files: next_files,
             };
             cas.commit_manifest_cas(

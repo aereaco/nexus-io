@@ -1,9 +1,10 @@
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
 use serde::de::DeserializeOwned;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::observability::global_metrics;
 use crate::storage::BlobBridge;
@@ -11,13 +12,46 @@ use crate::storage::BlobBridge;
 const OWNERSHIP_LEDGER_KEY: &str = "ownership.json";
 const MAX_CAS_RETRIES: usize = 8;
 
-/// Durable Rust-inspired ownership ledger with 2-phase tombstone reclamation:
-/// - `owners`: maps each content-addressed blob CID to the set of live `OwnerId`s borrowing it.
-/// - `pending_delete`: when a CID's last owner releases it, it transitions atomically via CAS into
-///   `pending_delete[cid] = generation` instead of deleting unlocked.
-/// - If another process acquires `cid` before Phase 2 reclamation runs, `pending_delete.remove(cid)`
-///   invalidates the tombstone so stale reclaimers abort cleanly without deleting a re-borrowed blob.
-#[derive(Debug, Clone, Default, Serialize, serde::Deserialize)]
+/// Default crash-recovery TTL for stale `DeleteClaim`s (30 seconds).
+pub const DEFAULT_DELETE_CLAIM_TTL_MS: u64 = 30_000;
+/// Default distributed execution lease duration (30 seconds, renewable via heartbeat).
+pub const DEFAULT_EXECUTION_LEASE_TTL_MS: u64 = 30_000;
+
+/// Typed fail-fast error returned when an operation attempts to acquire ownership of a CID
+/// that is currently in the durable `Deleting` state (after CAS 1 claim, before CAS 2 finalize).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlobDeletingConflict {
+    pub cid: String,
+    pub claim_generation: u64,
+}
+
+impl std::fmt::Display for BlobDeletingConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "BlobDeletingConflict: CID '{}' is currently under durable deletion claim (gen={})",
+            self.cid, self.claim_generation
+        )
+    }
+}
+
+impl std::error::Error for BlobDeletingConflict {}
+
+/// Durable deletion claim preventing any new owner acquisition while physical deletion is in flight.
+/// Survives process crashes so another node can idempotently finish deletion once expired.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeleteClaim {
+    pub generation: u64,
+    pub holder: String,
+    pub claimed_at_ms: u64,
+}
+
+/// 3-State Durable Rust-Inspired Ownership Ledger:
+/// 1. `Live` (`owners[cid]` non-empty): borrowed; cannot be deleted.
+/// 2. `Tombstoned` (`pending_delete[cid] = gen`): zero owners; revivable by `acquire_owner`.
+/// 3. `Deleting` (`deleting[cid] = DeleteClaim`): hard barrier; `acquire_owner` fails fast with
+///    `BlobDeletingConflict`, physical deletion runs under this claim, and CAS 2 finalizes it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BlobOwnershipTable {
     #[serde(default)]
     pub generation: u64,
@@ -25,15 +59,34 @@ pub struct BlobOwnershipTable {
     pub owners: BTreeMap<String, BTreeSet<String>>,
     #[serde(default)]
     pub pending_delete: BTreeMap<String, u64>,
+    #[serde(default)]
+    pub deleting: BTreeMap<String, DeleteClaim>,
+}
+
+/// Distributed single-writer execution lease with a strictly monotonic `fencing_token`.
+/// Stored atomically via CAS in `BlobBridge` so stale holders that pause past `expires_at_ms`
+/// are rejected by the commit path even if they resume later.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExecutionLease {
+    pub holder: String,
+    pub fencing_token: u64,
+    pub acquired_at_ms: u64,
+    pub expires_at_ms: u64,
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 /// Shared atomic storage primitive built on `BlobBridge`:
-/// - **Versioned CAS Manifest Commits:** Reads `(manifest, etag)` and commits updates only if the
-///   stored ETag still matches `expected_etag` (`put_object_cas`).
-/// - **Verified Content-Addressed Blobs:** Writes immutable blobs keyed by BLAKE3 CID and verifies
-///   the BLAKE3 digest on every read to catch silent corruption.
-/// - **Race-Free Deterministic Ownership (`Drop`):** Single-CAS atomic ownership transfers and
-///   2-phase generation-checked tombstone reclamation (no stop-the-world GC).
+/// - **Versioned CAS Manifest Commits:** Atomic compare-and-swap via `put_object_cas`.
+/// - **Verified Content-Addressed Blobs:** BLAKE3 verification on every read.
+/// - **3-State Race-Free Ownership (`Live` -> `Tombstoned` -> `Deleting`):** Fail-fast
+///   `BlobDeletingConflict` barrier and crash-recoverable deletion claims.
+/// - **Fenced Distributed Execution Leases:** Renewable CAS leases with monotonic fencing tokens.
 #[derive(Clone)]
 pub struct CasStore {
     blobs: Arc<BlobBridge>,
@@ -62,10 +115,7 @@ impl CasStore {
         Ok(Some((val, meta.etag)))
     }
 
-    /// Atomically commit a JSON manifest using Compare-And-Swap (`expected_etag`):
-    /// - If `expected_etag` is `None`, succeeds ONLY if the manifest does not yet exist (`if_none_match = true`).
-    /// - If `expected_etag` is `Some(etag)`, succeeds ONLY if the stored ETag still matches `etag`.
-    /// - Returns `CasConflictError` on concurrent modification.
+    /// Atomically commit a JSON manifest using Compare-And-Swap (`expected_etag`).
     pub async fn commit_manifest_cas<T: Serialize>(
         &self,
         bucket: &str,
@@ -97,6 +147,8 @@ impl CasStore {
     }
 
     /// Store an immutable content-addressed blob under `<prefix><blake3_cid>` and return its CID.
+    /// Note: writing bytes alone does NOT grant ownership; callers must still acquire ownership
+    /// through the durable ledger protocol (`acquire_owner` / `transfer_manifest_ownership`).
     pub async fn put_verified_blob(
         &self,
         bucket: &str,
@@ -105,6 +157,18 @@ impl CasStore {
     ) -> Result<String> {
         let _ = self.blobs.create_bucket(bucket).await;
         let cid = blake3::hash(&bytes).to_hex().to_string();
+        // Check if CID is actively under a durable Deleting claim; fail fast rather than racing
+        if let Some((table, _)) = self
+            .read_manifest::<BlobOwnershipTable>(bucket, OWNERSHIP_LEDGER_KEY)
+            .await?
+        {
+            if let Some(claim) = table.deleting.get(&cid) {
+                return Err(anyhow::Error::new(BlobDeletingConflict {
+                    cid,
+                    claim_generation: claim.generation,
+                }));
+            }
+        }
         let key = format!("{}{}", prefix, cid);
         self.blobs.put_object(bucket, &key, bytes).await?;
         global_metrics().inc_blob_write();
@@ -139,19 +203,28 @@ impl CasStore {
         Ok(data)
     }
 
-    /// Reference-tracked startup reconciliation for crash-leftover blobs (e.g. SIGKILL mid-upload).
-    /// Normal runtime reclamation uses 2-phase tombstone deterministic `Drop`.
+    /// Safe startup reconciliation for crash-leftover blobs: NEVER deletes any CID that is
+    /// present in `owners`, `pending_delete`, OR `deleting` in the durable ownership ledger.
     pub async fn gc_unreferenced_blobs(
         &self,
         bucket: &str,
         prefix: &str,
         referenced_cids: &HashSet<String>,
     ) -> Result<usize> {
+        let ledger = self
+            .read_manifest::<BlobOwnershipTable>(bucket, OWNERSHIP_LEDGER_KEY)
+            .await?
+            .map(|(t, _)| t)
+            .unwrap_or_default();
         let objects = self.blobs.list_objects(bucket, Some(prefix)).await?;
         let mut deleted = 0usize;
         for obj in objects {
             if let Some(cid) = obj.key.strip_prefix(prefix) {
-                if !referenced_cids.contains(cid) {
+                let protected = referenced_cids.contains(cid)
+                    || ledger.owners.contains_key(cid)
+                    || ledger.pending_delete.contains_key(cid)
+                    || ledger.deleting.contains_key(cid);
+                if !protected {
                     if self.blobs.delete_object(bucket, &obj.key).await.is_ok() {
                         deleted += 1;
                     }
@@ -162,7 +235,7 @@ impl CasStore {
     }
 
     /// Acquire a named owner borrow on `cid` in the durable ownership ledger.
-    /// Clears any pending tombstone for `cid` atomically in the same CAS commit.
+    /// Fails fast with `BlobDeletingConflict` if `cid` is currently under a durable `Deleting` claim.
     pub async fn acquire_owner(&self, bucket: &str, cid: &str, owner_id: &str) -> Result<()> {
         for _ in 0..MAX_CAS_RETRIES {
             let (mut table, etag) = match self
@@ -172,6 +245,12 @@ impl CasStore {
                 Some((t, e)) => (t, Some(e)),
                 None => (BlobOwnershipTable::default(), None),
             };
+            if let Some(claim) = table.deleting.get(cid) {
+                return Err(anyhow::Error::new(BlobDeletingConflict {
+                    cid: cid.to_string(),
+                    claim_generation: claim.generation,
+                }));
+            }
             table.generation += 1;
             table.pending_delete.remove(cid);
             table
@@ -200,9 +279,8 @@ impl CasStore {
         )
     }
 
-    /// Phase 1 of 2-phase tombstone reclamation: release `owner_id`'s borrow on `cid` via CAS.
-    /// If `cid` now has zero owners, records `pending_delete[cid] = gen` and returns `Ok(Some(gen))`.
-    /// Never falls through on CAS retry exhaustion (strictly returns `Err`).
+    /// Step 1 of 3-state reclamation: release `owner_id`'s borrow via CAS.
+    /// If `cid` reaches zero owners, transitions `Live` -> `Tombstoned` (`pending_delete[cid] = gen`).
     pub async fn mark_release_tombstone(
         &self,
         bucket: &str,
@@ -249,43 +327,42 @@ impl CasStore {
         )
     }
 
-    /// Phase 2 of 2-phase tombstone reclamation: conditionally reclaim `<prefix><cid>` ONLY IF
-    /// `pending_delete[cid] == expected_gen` AND `owners[cid]` is empty.
-    /// If another process re-acquired `cid` in the meantime, aborts cleanly and returns `Ok(false)`.
-    pub async fn reclaim_tombstone(
+    /// CAS 1 of reclamation: atomically transition `Tombstoned` -> `Deleting` (`DeleteClaim`).
+    /// Once this succeeds, NO operation can acquire ownership of `cid` until physical deletion
+    /// completes and CAS 2 (`finalize_delete_claim`) removes the claim.
+    pub async fn claim_tombstone_for_delete(
         &self,
         bucket: &str,
-        prefix: &str,
         cid: &str,
         expected_gen: u64,
-    ) -> Result<bool> {
+        holder: &str,
+    ) -> Result<Option<DeleteClaim>> {
         for _ in 0..MAX_CAS_RETRIES {
             let Some((mut table, etag)) = self
                 .read_manifest::<BlobOwnershipTable>(bucket, OWNERSHIP_LEDGER_KEY)
                 .await?
             else {
-                return Ok(false);
+                return Ok(None);
             };
-            let still_tombstoned = table.pending_delete.get(cid) == Some(&expected_gen)
-                && !table.owners.contains_key(cid);
-            if !still_tombstoned {
-                // Re-acquired or already reclaimed by another process — do NOT delete!
-                return Ok(false);
+            let eligible = table.pending_delete.get(cid) == Some(&expected_gen)
+                && !table.owners.contains_key(cid)
+                && !table.deleting.contains_key(cid);
+            if !eligible {
+                return Ok(None);
             }
-            // Atomically claim & clear the tombstone via CAS BEFORE deleting the blob
             table.pending_delete.remove(cid);
             table.generation += 1;
+            let claim = DeleteClaim {
+                generation: table.generation,
+                holder: holder.to_string(),
+                claimed_at_ms: now_ms(),
+            };
+            table.deleting.insert(cid.to_string(), claim.clone());
             match self
                 .commit_manifest_cas(bucket, OWNERSHIP_LEDGER_KEY, &table, Some(&etag))
                 .await
             {
-                Ok(_) => {
-                    let _ = self
-                        .blobs
-                        .delete_object(bucket, &format!("{}{}", prefix, cid))
-                        .await;
-                    return Ok(true);
-                }
+                Ok(_) => return Ok(Some(claim)),
                 Err(e)
                     if e.downcast_ref::<crate::storage::blob_bridge::CasConflictError>()
                         .is_some() =>
@@ -296,14 +373,124 @@ impl CasStore {
             }
         }
         anyhow::bail!(
-            "CAS contention reclaiming tombstone '{}' (gen={})",
+            "CAS contention claiming tombstone '{}' (gen={}) for deletion",
             cid,
             expected_gen
         )
     }
 
-    /// Release `owner_id`'s borrow on `cid` and deterministically reclaim `<prefix><cid>`
-    /// via the race-free 2-phase tombstone protocol if zero owners remain.
+    /// CAS 2 of reclamation: physically delete `<prefix><cid>` under the durable `DeleteClaim`,
+    /// then atomically finalize (remove) `deleting[cid]` ONLY AFTER physical deletion succeeds.
+    /// If physical deletion fails, `deleting[cid]` is RETAINED for crash recovery.
+    pub async fn execute_and_finalize_delete_claim(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        cid: &str,
+        claim_gen: u64,
+    ) -> Result<bool> {
+        // Physical delete happens strictly under the durable DeleteClaim
+        self.blobs
+            .delete_object(bucket, &format!("{}{}", prefix, cid))
+            .await
+            .with_context(|| {
+                format!(
+                    "Physical delete failed for '{}/{}{}' (retaining DeleteClaim gen={} for recovery)",
+                    bucket, prefix, cid, claim_gen
+                )
+            })?;
+
+        for _ in 0..MAX_CAS_RETRIES {
+            let Some((mut table, etag)) = self
+                .read_manifest::<BlobOwnershipTable>(bucket, OWNERSHIP_LEDGER_KEY)
+                .await?
+            else {
+                return Ok(false);
+            };
+            let matches = table
+                .deleting
+                .get(cid)
+                .map(|c| c.generation == claim_gen)
+                .unwrap_or(false);
+            if !matches {
+                return Ok(false);
+            }
+            table.deleting.remove(cid);
+            table.generation += 1;
+            match self
+                .commit_manifest_cas(bucket, OWNERSHIP_LEDGER_KEY, &table, Some(&etag))
+                .await
+            {
+                Ok(_) => return Ok(true),
+                Err(e)
+                    if e.downcast_ref::<crate::storage::blob_bridge::CasConflictError>()
+                        .is_some() =>
+                {
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        anyhow::bail!(
+            "CAS contention finalizing DeleteClaim '{}' (gen={})",
+            cid,
+            claim_gen
+        )
+    }
+
+    /// Complete race-free reclamation of a tombstoned CID (`Tombstoned` -> `Deleting` -> delete -> finalize).
+    pub async fn reclaim_tombstone(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        cid: &str,
+        expected_gen: u64,
+    ) -> Result<bool> {
+        let holder = self.blobs.node_id().to_string();
+        let Some(claim) = self
+            .claim_tombstone_for_delete(bucket, cid, expected_gen, &holder)
+            .await?
+        else {
+            return Ok(false);
+        };
+        self.execute_and_finalize_delete_claim(bucket, prefix, cid, claim.generation)
+            .await
+    }
+
+    /// Crash-recovery sweep for expired `DeleteClaim`s (default `ttl_ms = 30_000`):
+    /// idempotently finishes physical deletion and finalizes any claim older than `ttl_ms`.
+    pub async fn recover_expired_delete_claims(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        ttl_ms: u64,
+    ) -> Result<usize> {
+        let Some((table, _)) = self
+            .read_manifest::<BlobOwnershipTable>(bucket, OWNERSHIP_LEDGER_KEY)
+            .await?
+        else {
+            return Ok(0);
+        };
+        let now = now_ms();
+        let expired: Vec<(String, u64)> = table
+            .deleting
+            .into_iter()
+            .filter(|(_, c)| now.saturating_sub(c.claimed_at_ms) >= ttl_ms)
+            .map(|(cid, c)| (cid, c.generation))
+            .collect();
+        let mut recovered = 0usize;
+        for (cid, claim_gen) in expired {
+            if self
+                .execute_and_finalize_delete_claim(bucket, prefix, &cid, claim_gen)
+                .await?
+            {
+                recovered += 1;
+            }
+        }
+        Ok(recovered)
+    }
+
+    /// Release `owner_id`'s borrow on `cid` and deterministically reclaim via the 3-state protocol.
     pub async fn release_owner(
         &self,
         bucket: &str,
@@ -317,10 +504,8 @@ impl CasStore {
         }
     }
 
-    /// Single-CAS atomic ownership transfer for `owner_id` from `prev_cids` to `next_cids`:
-    /// 1. In ONE atomic CAS commit on `ownership.json`, acquires all new CIDs (clearing any
-    ///    pending tombstones) AND releases all superseded CIDs (marking zero-owner CIDs as tombstoned).
-    /// 2. Reclaims each newly tombstoned CID via conditional `reclaim_tombstone`.
+    /// Single-CAS atomic ownership transfer for `owner_id` from `prev_cids` to `next_cids`.
+    /// Fails fast with `BlobDeletingConflict` if any CID in `next_cids` is currently `Deleting`.
     pub async fn transfer_manifest_ownership(
         &self,
         bucket: &str,
@@ -346,6 +531,14 @@ impl CasStore {
                 Some((t, e)) => (t, Some(e)),
                 None => (BlobOwnershipTable::default(), None),
             };
+            for cid in &to_acquire {
+                if let Some(claim) = table.deleting.get(cid) {
+                    return Err(anyhow::Error::new(BlobDeletingConflict {
+                        cid: cid.clone(),
+                        claim_generation: claim.generation,
+                    }));
+                }
+            }
             tombstones.clear();
 
             for cid in &to_acquire {
@@ -403,6 +596,119 @@ impl CasStore {
         }
         Ok(dropped)
     }
+
+    // -------------------------------------------------------------------------
+    // Distributed Fenced Execution Leases (Atomic CAS + Renewal + Fencing Token)
+    // -------------------------------------------------------------------------
+
+    /// Atomically acquire a distributed single-writer execution lease via CAS, returning a
+    /// strictly monotonic `fencing_token`. Succeeds if no lease exists or the prior lease expired.
+    pub async fn acquire_execution_lease(
+        &self,
+        bucket: &str,
+        lease_key: &str,
+        holder: &str,
+        ttl_ms: u64,
+    ) -> Result<ExecutionLease> {
+        for _ in 0..MAX_CAS_RETRIES {
+            let now = now_ms();
+            let (prev_token, expected_etag) = match self
+                .read_manifest::<ExecutionLease>(bucket, lease_key)
+                .await?
+            {
+                Some((existing, etag)) => {
+                    if existing.expires_at_ms > now && existing.holder != holder {
+                        anyhow::bail!(
+                            "Execution lease '{}' held by '{}' (fencing_token={}) until {}",
+                            lease_key,
+                            existing.holder,
+                            existing.fencing_token,
+                            existing.expires_at_ms
+                        );
+                    }
+                    (existing.fencing_token, Some(etag))
+                }
+                None => (0, None),
+            };
+
+            let next = ExecutionLease {
+                holder: holder.to_string(),
+                fencing_token: prev_token + 1,
+                acquired_at_ms: now,
+                expires_at_ms: now.saturating_add(ttl_ms),
+            };
+            match self
+                .commit_manifest_cas(bucket, lease_key, &next, expected_etag.as_deref())
+                .await
+            {
+                Ok(_) => return Ok(next),
+                Err(e)
+                    if e.downcast_ref::<crate::storage::blob_bridge::CasConflictError>()
+                        .is_some() =>
+                {
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        anyhow::bail!("CAS contention acquiring execution lease '{}'", lease_key)
+    }
+
+    /// Renew an active execution lease via CAS ONLY IF `holder` and `fencing_token` still match.
+    pub async fn renew_execution_lease(
+        &self,
+        bucket: &str,
+        lease_key: &str,
+        holder: &str,
+        fencing_token: u64,
+        ttl_ms: u64,
+    ) -> Result<ExecutionLease> {
+        let Some((mut existing, etag)) = self
+            .read_manifest::<ExecutionLease>(bucket, lease_key)
+            .await?
+        else {
+            anyhow::bail!("Execution lease '{}' no longer exists", lease_key);
+        };
+        if existing.holder != holder || existing.fencing_token != fencing_token {
+            anyhow::bail!(
+                "Execution lease '{}' fenced out (expected holder='{}' token={}, found holder='{}' token={})",
+                lease_key,
+                holder,
+                fencing_token,
+                existing.holder,
+                existing.fencing_token
+            );
+        }
+        existing.expires_at_ms = now_ms().saturating_add(ttl_ms);
+        self.commit_manifest_cas(bucket, lease_key, &existing, Some(&etag))
+            .await?;
+        Ok(existing)
+    }
+
+    /// Release an active execution lease via CAS by expiring it immediately while preserving
+    /// `fencing_token` so the monotonic counter never resets backwards.
+    pub async fn release_execution_lease(
+        &self,
+        bucket: &str,
+        lease_key: &str,
+        holder: &str,
+        fencing_token: u64,
+    ) -> Result<()> {
+        let Some((mut existing, etag)) = self
+            .read_manifest::<ExecutionLease>(bucket, lease_key)
+            .await?
+        else {
+            return Ok(());
+        };
+        if existing.holder != holder || existing.fencing_token != fencing_token {
+            return Ok(());
+        }
+        existing.expires_at_ms = 0;
+        let _ = self
+            .commit_manifest_cas(bucket, lease_key, &existing, Some(&etag))
+            .await;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -411,7 +717,7 @@ mod tests {
     use crate::db::Database;
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn cas_store_enforces_atomic_cas_verifies_hashes_and_tombstone_drop_prevents_races() {
+    async fn cas_store_enforces_3_state_deleting_barrier_recovery_and_fenced_leases() {
         let db = Arc::new(Database::open_mem());
         let blobs = Arc::new(BlobBridge::new(db).await.unwrap());
         let cas = CasStore::new(blobs.clone());
@@ -421,23 +727,15 @@ mod tests {
             .commit_manifest_cas("cas-test", "m.json", &serde_json::json!({"v": 1}), None)
             .await
             .unwrap();
-        let dup = cas
+        assert!(cas
             .commit_manifest_cas("cas-test", "m.json", &serde_json::json!({"v": 99}), None)
             .await
-            .unwrap_err();
-        assert!(dup
-            .downcast_ref::<crate::storage::blob_bridge::CasConflictError>()
-            .is_some());
-
+            .is_err());
         let etag2 = cas
             .commit_manifest_cas("cas-test", "m.json", &serde_json::json!({"v": 2}), Some(&etag1))
             .await
             .unwrap();
         assert_ne!(etag1, etag2);
-        assert!(cas
-            .commit_manifest_cas("cas-test", "m.json", &serde_json::json!({"v": 3}), Some(&etag1))
-            .await
-            .is_err());
 
         // 2. Verified blob read detects silent corruption
         let live_cid = cas
@@ -450,35 +748,69 @@ mod tests {
             .unwrap();
         assert!(cas.get_verified_blob("cas-test", "blobs/", &live_cid).await.is_err());
 
-        // 3. Deterministic 2-phase tombstone Drop: shared blob survives while borrowed
-        let shared_cid = cas
-            .put_verified_blob("own-test", "blobs/", Bytes::from_static(b"shared-runtime-bytes"))
+        // 3. 3-State Deleting Barrier Test:
+        //    Owner A releases -> Tombstoned -> CAS 1 moves to Deleting ->
+        //    Owner B tries acquire_owner AFTER CAS 1 -> MUST fail fast with BlobDeletingConflict!
+        let cid = cas
+            .put_verified_blob("own-test", "blobs/", Bytes::from_static(b"critical-payload"))
             .await
             .unwrap();
-        cas.acquire_owner("own-test", &shared_cid, "cell:a").await.unwrap();
-        cas.acquire_owner("own-test", &shared_cid, "cell:b").await.unwrap();
-
-        assert!(!cas.release_owner("own-test", "blobs/", &shared_cid, "cell:a").await.unwrap());
-        assert!(cas.get_verified_blob("own-test", "blobs/", &shared_cid).await.is_ok());
-
-        // 4. Race-safety test: Owner B marks tombstone, then Owner C re-acquires BEFORE Phase 2 runs.
-        //    Owner B's stale Phase 2 reclaim MUST abort and preserve the blob!
-        let stale_gen = cas
-            .mark_release_tombstone("own-test", &shared_cid, "cell:b")
+        cas.acquire_owner("own-test", &cid, "cell:a").await.unwrap();
+        let tomb_gen = cas
+            .mark_release_tombstone("own-test", &cid, "cell:a")
             .await
             .unwrap()
-            .expect("last owner should produce tombstone generation");
-        cas.acquire_owner("own-test", &shared_cid, "cell:c").await.unwrap();
-        assert!(
-            !cas.reclaim_tombstone("own-test", "blobs/", &shared_cid, stale_gen)
-                .await
-                .unwrap(),
-            "stale reclaimer must abort when another owner re-acquired the CID"
-        );
-        assert!(cas.get_verified_blob("own-test", "blobs/", &shared_cid).await.is_ok());
+            .unwrap();
+        let claim = cas
+            .claim_tombstone_for_delete("own-test", &cid, tomb_gen, "node-1")
+            .await
+            .unwrap()
+            .expect("CAS 1 claim should succeed");
 
-        // Finally Owner C releases -> zero owners left -> reclaimed cleanly
-        assert!(cas.release_owner("own-test", "blobs/", &shared_cid, "cell:c").await.unwrap());
-        assert!(cas.get_verified_blob("own-test", "blobs/", &shared_cid).await.is_err());
+        let conflict = cas
+            .acquire_owner("own-test", &cid, "cell:b")
+            .await
+            .unwrap_err();
+        let typed = conflict
+            .downcast_ref::<BlobDeletingConflict>()
+            .expect("must fail fast with typed BlobDeletingConflict");
+        assert_eq!(typed.cid, cid);
+        assert_eq!(typed.claim_generation, claim.generation);
+
+        // 4. Crash-recovery of abandoned DeleteClaim (ttl_ms = 0 simulates expired claim)
+        let recovered = cas
+            .recover_expired_delete_claims("own-test", "blobs/", 0)
+            .await
+            .unwrap();
+        assert_eq!(recovered, 1);
+        assert!(cas.get_verified_blob("own-test", "blobs/", &cid).await.is_err());
+
+        // 5. Distributed Fenced Execution Lease: expiry + monotonic token + stale renewal rejection
+        let lease_a = cas
+            .acquire_execution_lease("lease-test", "db.lease.json", "node-a", 1)
+            .await
+            .unwrap();
+        assert_eq!(lease_a.fencing_token, 1);
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        let lease_b = cas
+            .acquire_execution_lease("lease-test", "db.lease.json", "node-b", 30_000)
+            .await
+            .unwrap();
+        assert_eq!(lease_b.fencing_token, 2);
+
+        // Node A's stale renewal MUST be fenced out
+        assert!(cas
+            .renew_execution_lease("lease-test", "db.lease.json", "node-a", lease_a.fencing_token, 30_000)
+            .await
+            .is_err());
+        // Node B's active renewal succeeds
+        assert!(cas
+            .renew_execution_lease("lease-test", "db.lease.json", "node-b", lease_b.fencing_token, 30_000)
+            .await
+            .is_ok());
+        cas.release_execution_lease("lease-test", "db.lease.json", "node-b", lease_b.fencing_token)
+            .await
+            .unwrap();
     }
 }

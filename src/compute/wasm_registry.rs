@@ -309,7 +309,8 @@ impl WasmRuntimeRegistry {
             return Err(e);
         }
 
-        // Step 2: Reclaim name aliases and unreferenced CID blobs ONLY after durable commit succeeded
+        // Step 2: Reclaim name aliases and release CID ownership through CasStore's 3-state
+        // `Live -> Tombstoned -> Deleting` protocol (shared with WasmDbMount).
         let compat = current_aot_compat_key();
         let _ = self
             .blobs
@@ -320,17 +321,12 @@ impl WasmRuntimeRegistry {
             .delete_object(RUNTIMES_BUCKET, &format!("aot/{}/{}.cwasm", compat, norm))
             .await;
 
-        let cid_still_referenced = self
-            .index
-            .read()
-            .await
-            .values()
-            .any(|other| other.cid == rec.cid);
-        if !cid_still_referenced {
-            let _ = self
-                .blobs
-                .delete_object(RUNTIMES_BUCKET, &format!("cid/{}", rec.cid))
-                .await;
+        let owner_id = format!("runtime:{}", norm);
+        let dropped = self
+            .cas
+            .release_owner(RUNTIMES_BUCKET, "cid/", &rec.cid, &owner_id)
+            .await?;
+        if dropped {
             let _ = self
                 .blobs
                 .delete_object(RUNTIMES_BUCKET, &format!("aot-cid/{}/{}.cwasm", compat, rec.cid))
@@ -397,8 +393,13 @@ impl WasmRuntimeRegistry {
         self.blobs
             .put_object(RUNTIMES_BUCKET, &format!("raw/{}.wasm", norm), raw_bytes.clone())
             .await?;
-        self.blobs
-            .put_object(RUNTIMES_BUCKET, &format!("cid/{}", cid), raw_bytes)
+        let stored_cid = self
+            .cas
+            .put_verified_blob(RUNTIMES_BUCKET, "cid/", raw_bytes)
+            .await?;
+        debug_assert_eq!(stored_cid, cid);
+        self.cas
+            .acquire_owner(RUNTIMES_BUCKET, &cid, &format!("runtime:{}", norm))
             .await?;
 
         let compat = current_aot_compat_key();
@@ -1037,11 +1038,20 @@ mod tests {
         assert!(reg1.get_runtime("broken").await.is_none());
 
         // Simulate full process restart: brand-new WasmRuntimeRegistry over the same BlobBridge
-        let reg2 = WasmRuntimeRegistry::new(blobs);
+        let reg2 = WasmRuntimeRegistry::new(blobs.clone());
         let listed = reg2.list_runtimes().await;
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].name, "quickjs");
         assert_eq!(listed[0].cid, rec.cid);
+
+        // Shared CID ownership across aliases: installing a second alias for the same Wasm bytes
+        // keeps the shared CID alive when the first alias is uninstalled, and drops it when the last is uninstalled.
+        let alias = reg2.register_runtime("quickjs-alias", wat).await.unwrap();
+        assert_eq!(alias.cid, rec.cid);
+        assert!(reg2.uninstall_runtime("quickjs").await.unwrap());
+        assert!(blobs.get_object(RUNTIMES_BUCKET, &format!("cid/{}", rec.cid)).await.unwrap().is_some());
+        assert!(reg2.uninstall_runtime("quickjs-alias").await.unwrap());
+        assert!(blobs.get_object(RUNTIMES_BUCKET, &format!("cid/{}", rec.cid)).await.unwrap().is_none());
     }
 
     #[cfg(feature = "oci-registry")]
