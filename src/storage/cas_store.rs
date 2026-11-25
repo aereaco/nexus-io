@@ -29,16 +29,21 @@ pub struct ReconciliationState {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ReconciliationReport {
     pub skipped: bool,
+    pub tx_replayed: usize,
     pub expired_claims_recovered: usize,
     pub orphans_reclaimed: usize,
     pub completed_generation: u64,
 }
 
 /// Recoverable ownership transaction record persisted before publishing a manifest transition.
+/// Self-describing (`target_manifest_key`, `target_version`) so `reconcile_on_boot` can
+/// deterministically roll forward or roll back even if power failed before `gc_pending` was set.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OwnershipTx {
     pub tx_id: String,
     pub owner_id: String,
+    pub target_manifest_key: String,
+    pub target_version: u64,
     pub acquired_cids: Vec<String>,
     pub prev_cids: Vec<String>,
     pub created_at_ms: u64,
@@ -275,10 +280,14 @@ impl CasStore {
     }
 
     /// Boot/restart/maintenance reconciliation pass:
-    /// - If `gc_pending == false` and `!force`, returns immediately (`skipped: true`, zero scanning!).
-    /// - Otherwise marks `gc_running = true`, recovers expired `DeleteClaim`s, reconciles
-    ///   unreferenced crash-leftover blobs (never touching live/tombstoned/deleting CIDs),
-    ///   and clears `gc_pending = false` + increments `gc_completed_generation` ONLY on full success.
+    /// 1. Checks BOTH `gc_pending`/`gc_running` AND any incomplete `tx/*.json` ownership journal records.
+    ///    If clean and `!force`, returns immediately (`skipped: true`, O(1) no-op, zero scanning!).
+    /// 2. Replays every incomplete `OwnershipTx`:
+    ///    - If target manifest committed (`version >= tx.target_version`), finishes releasing `tx.prev_cids`.
+    ///    - If target manifest did NOT commit (`version < tx.target_version`), rolls back `tx.acquired_cids`.
+    ///    - Deletes `tx/<tx_id>.json` ONLY after the ownership transition succeeds durably.
+    /// 3. Recovers expired `DeleteClaim`s and performs optional orphan reconciliation.
+    /// 4. Clears `gc_pending = false` + increments `gc_completed_generation` ONLY on full success.
     pub async fn reconcile_on_boot(
         &self,
         bucket: &str,
@@ -295,27 +304,130 @@ impl CasStore {
             None => (ReconciliationState::default(), None),
         };
 
-        if !state.gc_pending && !state.gc_running && !force {
+        let pending_tx_objs = self
+            .blobs
+            .list_objects(bucket, Some("tx/"))
+            .await
+            .unwrap_or_default();
+
+        if !state.gc_pending && !state.gc_running && pending_tx_objs.is_empty() && !force {
             return Ok(ReconciliationReport {
                 skipped: true,
+                tx_replayed: 0,
                 expired_claims_recovered: 0,
                 orphans_reclaimed: 0,
                 completed_generation: state.gc_completed_generation,
             });
         }
 
+        let need_orphan_scan = state.gc_pending || state.gc_running || force;
         state.gc_pending = true;
         state.gc_running = true;
         let running_etag = self
             .commit_manifest_cas(bucket, RECONCILIATION_STATE_KEY, &state, etag.as_deref())
             .await?;
 
+        // Step 1: Replay incomplete OwnershipTx journal records.
+        // Invariant: `target_manifest_key` has a strictly monotonic per-record `version` guarded by
+        // single-writer fenced CAS leases, so any `current_version >= tx.target_version` necessarily
+        // supersedes `tx.prev_cids`. Replay is idempotent and NEVER deletes `tx/<tx_id>.json`
+        // before the ownership transition succeeds durably.
+        let mut tx_replayed = 0usize;
+        for obj in pending_tx_objs {
+            if !obj.key.ends_with(".json") {
+                continue;
+            }
+            let Some(tx_bytes) = self.blobs.get_object(bucket, &obj.key).await? else {
+                continue;
+            };
+            let tx: OwnershipTx = serde_json::from_slice(&tx_bytes)
+                .with_context(|| format!("Corrupted OwnershipTx '{}/{}'", bucket, obj.key))?;
+
+            if tx.target_manifest_key.trim().is_empty() || tx.owner_id.trim().is_empty() {
+                anyhow::bail!(
+                    "Invalid OwnershipTx '{}/{}': missing target_manifest_key or owner_id (journal preserved)",
+                    bucket,
+                    obj.key
+                );
+            }
+
+            // Validate transaction identity: confirm the target manifest key belongs to `tx.owner_id`
+            if let Some(cell_path) = tx.owner_id.strip_prefix("wasmdb:") {
+                let expected_key = format!("cells/{}/manifest.json", cell_path);
+                if tx.target_manifest_key != expected_key {
+                    anyhow::bail!(
+                        "OwnershipTx '{}' identity mismatch: owner '{}' expects manifest '{}', got '{}' (journal preserved)",
+                        tx.tx_id,
+                        tx.owner_id,
+                        expected_key,
+                        tx.target_manifest_key
+                    );
+                }
+            }
+
+            let current_version = match self
+                .blobs
+                .get_object(bucket, &tx.target_manifest_key)
+                .await?
+            {
+                Some(m_bytes) => {
+                    let v: serde_json::Value = serde_json::from_slice(&m_bytes).with_context(
+                        || {
+                            format!(
+                                "Corrupted target manifest '{}/{}' during OwnershipTx '{}' replay (journal preserved)",
+                                bucket, tx.target_manifest_key, tx.tx_id
+                            )
+                        },
+                    )?;
+                    // If the manifest embeds an explicit `owner_id`, verify it matches `tx.owner_id`
+                    if let Some(m_owner) = v
+                        .get("owner_id")
+                        .or_else(|| v.get("manifest").and_then(|m| m.get("owner_id")))
+                        .and_then(|s| s.as_str())
+                    {
+                        if m_owner != tx.owner_id {
+                            anyhow::bail!(
+                                "OwnershipTx '{}' manifest owner mismatch: expected '{}', found '{}' (journal preserved)",
+                                tx.tx_id,
+                                tx.owner_id,
+                                m_owner
+                            );
+                        }
+                    }
+                    v.get("manifest")
+                        .and_then(|m| m.get("version"))
+                        .or_else(|| v.get("version"))
+                        .and_then(|n| n.as_u64())
+                        .unwrap_or(0)
+                }
+                None => 0,
+            };
+
+            if current_version >= tx.target_version {
+                // Target manifest committed -> roll forward by idempotently releasing superseded prev_cids
+                self.release_owners_batch(bucket, prefix, &tx.owner_id, &tx.prev_cids)
+                    .await?;
+            } else {
+                // Target manifest did NOT commit -> roll back by idempotently releasing acquired_cids
+                self.release_owners_batch(bucket, prefix, &tx.owner_id, &tx.acquired_cids)
+                    .await?;
+            }
+            self.finalize_ownership_tx(bucket, &tx.tx_id).await?;
+            tx_replayed += 1;
+        }
+
+        // Step 2: Recover expired DeleteClaims
         let expired_claims_recovered = self
             .recover_expired_delete_claims(bucket, prefix, claim_ttl_ms)
             .await?;
-        let orphans_reclaimed = self
-            .gc_unreferenced_blobs(bucket, prefix, referenced_cids)
-            .await?;
+
+        // Step 3: Optional orphan reconciliation (only when flagged or forced)
+        let orphans_reclaimed = if need_orphan_scan {
+            self.gc_unreferenced_blobs(bucket, prefix, referenced_cids)
+                .await?
+        } else {
+            0
+        };
 
         state.gc_pending = false;
         state.gc_running = false;
@@ -326,6 +438,7 @@ impl CasStore {
 
         Ok(ReconciliationReport {
             skipped: false,
+            tx_replayed,
             expired_claims_recovered,
             orphans_reclaimed,
             completed_generation: state.gc_completed_generation,
@@ -1103,5 +1216,154 @@ mod tests {
             .await
             .unwrap();
         assert!(next_boot.skipped);
+
+        // 7. OwnershipTx Journal Replay (simulating fresh-process reconstruction at both crash boundaries):
+        //    (a) Crash BEFORE manifest commit -> rolls back acquired_cids and drops uncommitted blob
+        let old_cid = cas
+            .put_verified_blob("tx-rec", "blobs/", Bytes::from_static(b"v1-data"))
+            .await
+            .unwrap();
+        let new_cid_aborted = cas
+            .put_verified_blob("tx-rec", "blobs/", Bytes::from_static(b"v2-aborted"))
+            .await
+            .unwrap();
+        cas.acquire_owners_batch("tx-rec", "wasmdb:a/c", &[old_cid.clone()])
+            .await
+            .unwrap();
+        cas.commit_manifest_cas(
+            "tx-rec",
+            "cells/a/c/manifest.json",
+            &serde_json::json!({"manifest": {"version": 1}}),
+            None,
+        )
+        .await
+        .unwrap();
+        // Simulate crash after acquiring v2 + writing OwnershipTx, BEFORE committing manifest v2
+        cas.acquire_owners_batch("tx-rec", "wasmdb:a/c", &[new_cid_aborted.clone()])
+            .await
+            .unwrap();
+        cas.begin_ownership_tx(
+            "tx-rec",
+            &OwnershipTx {
+                tx_id: "tx-abort".into(),
+                owner_id: "wasmdb:a/c".into(),
+                target_manifest_key: "cells/a/c/manifest.json".into(),
+                target_version: 2,
+                acquired_cids: vec![new_cid_aborted.clone()],
+                prev_cids: vec![old_cid.clone()],
+                created_at_ms: now_ms(),
+            },
+        )
+        .await
+        .unwrap();
+
+        // Reconstruct a fresh CasStore as if a new process started after crash
+        let fresh_cas_1 = CasStore::new(blobs.clone());
+        let rep_abort = fresh_cas_1
+            .reconcile_on_boot("tx-rec", "blobs/", &HashSet::new(), 0, false)
+            .await
+            .unwrap();
+        assert!(!rep_abort.skipped);
+        assert_eq!(rep_abort.tx_replayed, 1);
+        assert!(fresh_cas_1.get_verified_blob("tx-rec", "blobs/", &old_cid).await.is_ok());
+        assert!(fresh_cas_1.get_verified_blob("tx-rec", "blobs/", &new_cid_aborted).await.is_err());
+        // Verify ownership ledger has old_cid owned and zero abandoned ownership for new_cid_aborted
+        let (ledger_after_abort, _) = fresh_cas_1
+            .read_manifest::<BlobOwnershipTable>("tx-rec", OWNERSHIP_LEDGER_KEY)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(ledger_after_abort.owners.get(&old_cid).map(|s| s.contains("wasmdb:a/c")).unwrap_or(false));
+        assert!(!ledger_after_abort.owners.contains_key(&new_cid_aborted));
+        assert!(blobs.list_objects("tx-rec", Some("tx/")).await.unwrap().is_empty());
+        // Idempotent re-run is a safe no-op
+        let rerun_1 = fresh_cas_1
+            .reconcile_on_boot("tx-rec", "blobs/", &HashSet::new(), 0, false)
+            .await
+            .unwrap();
+        assert!(rerun_1.skipped);
+
+        //    (b) Crash AFTER manifest commit -> rolls forward, releasing superseded old_cid
+        let new_cid_ok = fresh_cas_1
+            .put_verified_blob("tx-rec", "blobs/", Bytes::from_static(b"v2-committed"))
+            .await
+            .unwrap();
+        fresh_cas_1
+            .acquire_owners_batch("tx-rec", "wasmdb:a/c", &[new_cid_ok.clone()])
+            .await
+            .unwrap();
+        fresh_cas_1
+            .begin_ownership_tx(
+                "tx-rec",
+                &OwnershipTx {
+                    tx_id: "tx-commit".into(),
+                    owner_id: "wasmdb:a/c".into(),
+                    target_manifest_key: "cells/a/c/manifest.json".into(),
+                    target_version: 2,
+                    acquired_cids: vec![new_cid_ok.clone()],
+                    prev_cids: vec![old_cid.clone()],
+                    created_at_ms: now_ms(),
+                },
+            )
+            .await
+            .unwrap();
+        // Manifest v2 commits, then process crashes BEFORE releasing old_cid
+        let (_, m_etag) = fresh_cas_1
+            .read_manifest::<serde_json::Value>("tx-rec", "cells/a/c/manifest.json")
+            .await
+            .unwrap()
+            .unwrap();
+        fresh_cas_1
+            .commit_manifest_cas(
+                "tx-rec",
+                "cells/a/c/manifest.json",
+                &serde_json::json!({"manifest": {"version": 2}}),
+                Some(&m_etag),
+            )
+            .await
+            .unwrap();
+
+        let fresh_cas_2 = CasStore::new(blobs.clone());
+        let rep_commit = fresh_cas_2
+            .reconcile_on_boot("tx-rec", "blobs/", &HashSet::new(), 0, false)
+            .await
+            .unwrap();
+        assert_eq!(rep_commit.tx_replayed, 1);
+        assert!(fresh_cas_2.get_verified_blob("tx-rec", "blobs/", &new_cid_ok).await.is_ok());
+        assert!(fresh_cas_2.get_verified_blob("tx-rec", "blobs/", &old_cid).await.is_err());
+        let (ledger_after_commit, _) = fresh_cas_2
+            .read_manifest::<BlobOwnershipTable>("tx-rec", OWNERSHIP_LEDGER_KEY)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(ledger_after_commit.owners.get(&new_cid_ok).map(|s| s.contains("wasmdb:a/c")).unwrap_or(false));
+        assert!(!ledger_after_commit.owners.contains_key(&old_cid));
+        assert!(blobs.list_objects("tx-rec", Some("tx/")).await.unwrap().is_empty());
+
+        //    (c) Identity mismatch failure preserves journal (never deletes evidence on failure)
+        fresh_cas_2
+            .begin_ownership_tx(
+                "tx-rec",
+                &OwnershipTx {
+                    tx_id: "tx-bad-id".into(),
+                    owner_id: "wasmdb:a/c".into(),
+                    target_manifest_key: "cells/other/cell/manifest.json".into(),
+                    target_version: 2,
+                    acquired_cids: vec![],
+                    prev_cids: vec![],
+                    created_at_ms: now_ms(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(fresh_cas_2
+            .reconcile_on_boot("tx-rec", "blobs/", &HashSet::new(), 0, false)
+            .await
+            .is_err());
+        assert!(blobs
+            .get_object("tx-rec", "tx/tx-bad-id.json")
+            .await
+            .unwrap()
+            .is_some());
     }
 }

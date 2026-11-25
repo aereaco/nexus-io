@@ -17,16 +17,29 @@ Measured via `powershell -ExecutionPolicy Bypass -File scripts/check-footprint.p
 
 ---
 
-## 2. Historical Binary Size & Memory Reference (Pre-Wasmtime-Core Revision)
+## 2. Empirical Release Benchmarks — 422-Crate Pure-Wasmtime `profile-core` (Verified `2026-11-25`)
 
-> **Note:** The release binary measurements below were captured on Windows x86_64 (`opt-level = "z"`, `lto = "thin"`, `codegen-units = 1`, `strip = true`) *prior* to moving Wasmtime into `profile-core` and removing Nushell/OXC/QuickJS from `profile-core` (when `profile-core` was 849 crates). Fresh release binary, cold-start, and RSS measurements for the current **422-crate pure-Wasmtime `profile-core`** should be re-recorded with the exact command below on a runner with ≥ 6 GB free disk space.
+Measured across **5 fresh process launches** (isolated temporary data directory per run, 2-second idle settle window before memory sampling):
 
-| Historical Profile (`96a3513c`) | Release Binary (MB) | Idle RSS (MB) |
-| :--- | :---: | :---: |
-| `profile-core` (legacy 849-crate layout) | 68.78 MB | 5.41 MB |
-| `profile-app` | 83.25 MB | 3.20 MB |
-| `profile-full` | 86.36 MB | 14.28 MB |
-| `profile-windows,gui` | 85.79 MB | 14.66 MB |
+| Measurement | Value |
+| :--- | :--- |
+| **Release executable size (`nexus.exe`, stripped)** | **15.87 MB** (`16,642,560` bytes) — **76.9% smaller** than legacy 849-crate `profile-core` (`68.78 MB`) |
+| **Cold startup time (5 fresh launches, TCP port 8080 readiness)** | **Median: `1,036.27 ms`** (range: `1,019.78 ms – 1,889.85 ms`; runs 2–5: `1,019.78 – 1,044.02 ms`; run 1 includes OS cold page cache) |
+| **Idle Working Set (`WorkingSet64`, 2s settled)** | **Median: `12.02 MB`** (range: `11.93 MB – 25.14 MB`) |
+| **Idle Private Memory (`PrivateMemorySize64`, 2s settled)** | **Median: `4.43 MB`** (range: `4.18 MB – 4.70 MB`) |
+| **Rust / Cargo versions** | `rustc 1.100.0 (0ef1bc386 2026-11-09)` / `cargo 1.100.0 (3acc79c0c 2026-11-05)` |
+| **Build command & profile flags** | `cargo build --release --bin nexus --no-default-features --features profile-core` (`opt-level = "z"`, `lto = "thin"`, `codegen-units = 1`, `strip = true`) |
+| **OS & Architecture** | `Microsoft Windows NT 10.0.26300.0` (`AMD64` / `x86_64`) |
+| **Base revision** | `aerea-nexus@bd2adb25` + `OwnershipTx` boot replay & derived-cache AOT self-healing commit |
+
+### Historical Reference (Legacy Pre-Wasmtime-Core Layout)
+
+| Historical Profile (`96a3513c`) | Unique Crates | Release Binary (MB) | Idle RSS (MB) |
+| :--- | :---: | :---: | :---: |
+| `profile-core` (legacy layout with Nushell/OXC/QuickJS) | 849 | 68.78 MB | 5.41 MB |
+| `profile-app` | — | 83.25 MB | 3.20 MB |
+| `profile-full` | — | 86.36 MB | 14.28 MB |
+| `profile-windows,gui` | — | 85.79 MB | 14.66 MB |
 
 ---
 

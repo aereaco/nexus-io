@@ -424,12 +424,17 @@ impl WasmRuntimeRegistry {
         #[cfg(not(target_os = "ios"))]
         let (aot_cached, aot_compat) = {
             let aot_bytes = Bytes::from(compiled_aot);
-            self.blobs
-                .put_object(RUNTIMES_BUCKET, &format!("aot/{}/{}.cwasm", compat, norm), aot_bytes.clone())
-                .await?;
-            self.blobs
-                .put_object(RUNTIMES_BUCKET, &format!("aot-cid/{}/{}.cwasm", compat, cid), aot_bytes)
-                .await?;
+            // Publish derived AOT artifact atomically keyed by `(compat_key, cid)`
+            let _ = self
+                .blobs
+                .put_object_cas(
+                    RUNTIMES_BUCKET,
+                    &format!("aot-cid/{}/{}.cwasm", compat, cid),
+                    aot_bytes,
+                    None,
+                    true,
+                )
+                .await;
             (true, Some(compat))
         };
 
@@ -661,24 +666,63 @@ impl WasmRuntimeRegistry {
     }
 
     /// Resolve a runtime by logical name (e.g. `"quickjs"`, `"sqlite"`) or BLAKE3 CID.
-    /// Only loads AOT `.cwasm` artifacts matching `current_aot_compat_key()`.
+    ///
+    /// **Derived-cache contract:** The authoritative artifact is ALWAYS the owned content-addressed
+    /// `cid/<cid>` `.wasm` blob verified by BLAKE3. AOT `.cwasm` artifacts are reproducible derived
+    /// caches keyed strictly by `(compat_key, cid)` at `aot-cid/<compat>/<cid>.cwasm` and published
+    /// atomically via create-if-absent CAS (`put_object_if_match(..., None)`). Deleting every AOT
+    /// cache entry affects only warm-start latency, never correctness or availability.
     pub async fn resolve_runtime(&self, name_or_cid: &str) -> Result<ResolvedRuntime> {
         let key = name_or_cid.trim().to_ascii_lowercase();
         let compat = current_aot_compat_key();
 
-        for aot_key in [
-            format!("aot/{}/{}.cwasm", compat, key),
-            format!("aot-cid/{}/{}.cwasm", compat, key),
-        ] {
-            if let Some(bytes) = self.blobs.get_object(RUNTIMES_BUCKET, &aot_key).await? {
-                return Ok(ResolvedRuntime::Aot(bytes.to_vec()));
-            }
+        // 1. Resolve logical name -> authoritative CID when registered in catalog
+        let resolved_cid = self
+            .get_runtime(&key)
+            .await
+            .map(|rec| rec.cid)
+            .unwrap_or_else(|| key.clone());
+
+        // 2. Check derived AOT cache strictly keyed by `(compat_key, cid)`
+        let aot_cid_key = format!("aot-cid/{}/{}.cwasm", compat, resolved_cid);
+        if let Some(bytes) = self.blobs.get_object(RUNTIMES_BUCKET, &aot_cid_key).await? {
+            return Ok(ResolvedRuntime::Aot(bytes.to_vec()));
         }
 
-        for raw_key in [format!("raw/{}.wasm", key), format!("cid/{}", key)] {
-            if let Some(bytes) = self.blobs.get_object(RUNTIMES_BUCKET, &raw_key).await? {
-                return Ok(ResolvedRuntime::Wasm(bytes.to_vec()));
+        // 3. Derived AOT cache miss: load and BLAKE3-verify the authoritative owned `cid/<cid>`
+        //    `.wasm` blob BEFORE compiling, then atomically publish the derived `.cwasm` cache.
+        if let Ok(verified_wasm) = self
+            .cas
+            .get_verified_blob(RUNTIMES_BUCKET, "cid/", &resolved_cid)
+            .await
+        {
+            let wasm_bytes = verified_wasm.to_vec();
+            #[cfg(not(target_os = "ios"))]
+            {
+                let input = wasm_bytes.clone();
+                if let Ok(Ok(compiled)) = tokio::task::spawn_blocking(move || {
+                    let crystal = CrystalEngine::new()?;
+                    crystal.compile_aot(&input)
+                })
+                .await
+                {
+                    let aot_b = Bytes::from(compiled.clone());
+                    // Atomic create-if-absent publication: concurrent misses racing on the exact
+                    // same `(compat, cid)` key cannot produce partial or inconsistent artifacts.
+                    let _ = self
+                        .blobs
+                        .put_object_cas(RUNTIMES_BUCKET, &aot_cid_key, aot_b, None, true)
+                        .await;
+                    return Ok(ResolvedRuntime::Aot(compiled));
+                }
             }
+            return Ok(ResolvedRuntime::Wasm(wasm_bytes));
+        }
+
+        // Fallback for precompiled-only AOT runtimes registered via `register_aot_runtime`
+        let aot_name_key = format!("aot/{}/{}.cwasm", compat, key);
+        if let Some(bytes) = self.blobs.get_object(RUNTIMES_BUCKET, &aot_name_key).await? {
+            return Ok(ResolvedRuntime::Aot(bytes.to_vec()));
         }
 
         let base_dir = std::env::var("NEXUS_RUNTIMES_DIR")
@@ -1079,6 +1123,17 @@ mod tests {
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].name, "quickjs");
         assert_eq!(listed[0].cid, rec.cid);
+
+        // Derived AOT cache contract: deleting EVERY AOT `.cwasm` cache entry affects only
+        // latency, never correctness or availability — `resolve_runtime` transparently rebuilds
+        // from the verified owned `cid/<cid>` `.wasm` blob and atomically re-caches it.
+        let compat = current_aot_compat_key();
+        let aot_cid_key = format!("aot-cid/{}/{}.cwasm", compat, rec.cid);
+        blobs.delete_object(RUNTIMES_BUCKET, &aot_cid_key).await.unwrap();
+        assert!(blobs.get_object(RUNTIMES_BUCKET, &aot_cid_key).await.unwrap().is_none());
+        let resolved = reg2.resolve_runtime("quickjs").await.unwrap();
+        assert!(matches!(resolved, ResolvedRuntime::Aot(_)));
+        assert!(blobs.get_object(RUNTIMES_BUCKET, &aot_cid_key).await.unwrap().is_some());
 
         // Shared CID ownership across aliases: installing a second alias for the same Wasm bytes
         // keeps the shared CID alive when the first alias is uninstalled, and drops it when the last is uninstalled.

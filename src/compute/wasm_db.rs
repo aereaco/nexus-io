@@ -449,6 +449,8 @@ impl WasmDbMount {
             let tx = OwnershipTx {
                 tx_id: tx_id.clone(),
                 owner_id: owner_id.clone(),
+                target_manifest_key: record_key.to_string(),
+                target_version: prev_manifest.version + 1,
                 acquired_cids: newly_added.clone(),
                 prev_cids: superseded.clone(),
                 created_at_ms: now_ms(),
