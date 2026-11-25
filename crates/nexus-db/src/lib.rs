@@ -28,6 +28,8 @@ pub mod ml;
 pub mod gql;
 #[cfg(feature = "pgwire")]
 pub mod pgwire;
+#[cfg(feature = "mysqlwire")]
+pub mod mysqlwire;
 #[cfg(feature = "sqlite")]
 pub mod sqlite_compat;
 
@@ -154,6 +156,12 @@ impl NexusDb {
     #[cfg(feature = "pgwire")]
     pub fn pgwire_session(&self, ns: &str, db: &str) -> crate::pgwire::PgWireSession {
         crate::pgwire::PgWireSession::new(self.clone(), sanitize_ident(ns), sanitize_ident(db))
+    }
+
+    /// Create a MySQL v10 Wire Protocol session (`feature = "mysqlwire"`).
+    #[cfg(feature = "mysqlwire")]
+    pub fn mysqlwire_session(&self, ns: &str, db: &str) -> crate::mysqlwire::MySqlWireSession {
+        crate::mysqlwire::MySqlWireSession::new(self.clone(), sanitize_ident(ns), sanitize_ident(db))
     }
 
     /// Create a pure-Rust SQLite / LibSQL Hrana session (`feature = "sqlite"`).
@@ -1740,5 +1748,60 @@ mod tests {
             db.gql_with_auth("pgsec", "app", "MATCH (a:p)-[:knows]->(b:p) RETURN b.name", viewer_ctx).unwrap(),
             vec![Value::String("Grace".into())]
         );
+    }
+
+    #[cfg(all(feature = "mysqlwire", feature = "auth"))]
+    #[test]
+    fn mysqlwire_handshake_auth_framing_and_rbac() {
+        let db = NexusDb::open_mem();
+        db.query_scoped(
+            "mysec",
+            "shop",
+            "DEFINE USER my_viewer ON DATABASE PASSWORD 'mpass' ROLES VIEWER;
+             CREATE orders:1 SET item = 'keyboard';",
+            vec![],
+        )
+        .unwrap();
+
+        let mut my = crate::mysqlwire::MySqlWireSession::new_authenticated(
+            db.clone(),
+            "mysec",
+            "shop",
+            7,
+        );
+        let greet = my.handshake_greeting();
+        assert_eq!(greet[4], 10); // Protocol v10
+
+        // Bad password returns ERR packet (0xFF)
+        let mut bad_buf =
+            crate::mysqlwire::MySqlWireSession::encode_handshake_response("my_viewer", "nope", "shop");
+        let (seq, pay) = crate::mysqlwire::MySqlWireSession::extract_next_packet(&mut bad_buf)
+            .unwrap()
+            .unwrap();
+        let bad_resp = my.handle_handshake_response(seq, &pay).unwrap();
+        assert_eq!(bad_resp[4], 0xFF);
+        assert!(!my.authenticated);
+
+        // Valid password returns OK packet (0x00)
+        let mut ok_buf =
+            crate::mysqlwire::MySqlWireSession::encode_handshake_response("my_viewer", "mpass", "shop");
+        let (seq, pay) = crate::mysqlwire::MySqlWireSession::extract_next_packet(&mut ok_buf)
+            .unwrap()
+            .unwrap();
+        let ok_resp = my.handle_handshake_response(seq, &pay).unwrap();
+        assert_eq!(ok_resp[4], 0x00);
+        assert!(my.authenticated);
+
+        // VIEWER SELECT succeeds; VIEWER CREATE is rejected by RBAC (ERR 0xFF)
+        let mut q_read = crate::mysqlwire::MySqlWireSession::encode_query_packet("SELECT item FROM orders:1;");
+        let (s1, p1) = crate::mysqlwire::MySqlWireSession::extract_next_packet(&mut q_read).unwrap().unwrap();
+        let (close1, r1) = my.handle_command(s1, &p1).unwrap();
+        assert!(!close1);
+        assert!(r1.windows(8).any(|w| w == b"keyboard"));
+
+        let mut q_write = crate::mysqlwire::MySqlWireSession::encode_query_packet("CREATE orders:2 SET item = 'nope';");
+        let (s2, p2) = crate::mysqlwire::MySqlWireSession::extract_next_packet(&mut q_write).unwrap().unwrap();
+        let (_, r2) = my.handle_command(s2, &p2).unwrap();
+        assert_eq!(r2[4], 0xFF);
     }
 }

@@ -55,6 +55,7 @@ impl CapabilityRegistry {
 
         reg("database", true);
         reg("pgwire", cfg!(feature = "pgwire"));
+        reg("mysqlwire", cfg!(feature = "mysqlwire"));
         reg("sqlite-hrana", cfg!(feature = "sqlite-hrana"));
         reg("graphql", cfg!(feature = "graphql"));
         reg("gql", cfg!(feature = "gql"));

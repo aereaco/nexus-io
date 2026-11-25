@@ -12,6 +12,151 @@ use crate::db::sql_compiler::{compile_sql_to_surql, execute_unified_query, SqlDi
 use crate::db::StateEngine;
 use crate::storage::BlobBridge;
 
+/// Connection / transport methods allowed to reach a cell's database instance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CellDbTransport {
+    Internal,
+    HttpRest,
+    WebSocketRpc,
+    PgWire,
+    MySqlWire,
+    SqliteHrana,
+    MeshWal,
+}
+
+/// Replication role when a cell's DB binds into the multi-node scaling mesh.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MeshDbRole {
+    Leader,
+    Follower,
+    ReadReplica,
+}
+
+/// Declarative per-cell database topology: stateless, dedicated, cross-cell reference, or scaling mesh.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CellDbMode {
+    /// Stateless cell — zero DB allocation or exposure.
+    None,
+    /// Dedicated isolated `(app, cell_id)` `nexus-db` instance.
+    Dedicated,
+    /// Shared reference to another app cell's DB instance.
+    Reference {
+        target_app: String,
+        target_cell_id: String,
+        read_only: bool,
+    },
+    /// Bound into the multi-node database scaling mesh (`ReplicationLog` WAL).
+    Mesh {
+        cluster: String,
+        target_app: String,
+        target_cell_id: String,
+        role: MeshDbRole,
+    },
+}
+
+/// Unified per-cell declarative database configuration governing topology (`mode`),
+/// exposed query `flavors`, and allowed connection methods (`transports`).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CellDbConfig {
+    pub mode: CellDbMode,
+    pub flavors: Vec<String>,
+    pub transports: Vec<CellDbTransport>,
+}
+
+impl Default for CellDbConfig {
+    fn default() -> Self {
+        Self::dedicated_full()
+    }
+}
+
+impl CellDbConfig {
+    pub fn stateless() -> Self {
+        Self {
+            mode: CellDbMode::None,
+            flavors: Vec::new(),
+            transports: Vec::new(),
+        }
+    }
+
+    pub fn dedicated_minimal() -> Self {
+        Self {
+            mode: CellDbMode::Dedicated,
+            flavors: vec!["surql".into(), "kv".into()],
+            transports: vec![CellDbTransport::Internal],
+        }
+    }
+
+    pub fn dedicated_full() -> Self {
+        Self {
+            mode: CellDbMode::Dedicated,
+            flavors: vec![
+                "surql".into(),
+                "sqlite".into(),
+                "postgres".into(),
+                "mysql".into(),
+                "graphql".into(),
+                "gql".into(),
+                "kv".into(),
+            ],
+            transports: vec![
+                CellDbTransport::Internal,
+                CellDbTransport::HttpRest,
+                CellDbTransport::WebSocketRpc,
+                CellDbTransport::PgWire,
+                CellDbTransport::MySqlWire,
+                CellDbTransport::SqliteHrana,
+                CellDbTransport::MeshWal,
+            ],
+        }
+    }
+
+    pub fn reference(target_app: impl Into<String>, target_cell_id: impl Into<String>, read_only: bool) -> Self {
+        Self {
+            mode: CellDbMode::Reference {
+                target_app: target_app.into(),
+                target_cell_id: target_cell_id.into(),
+                read_only,
+            },
+            flavors: vec!["surql".into(), "sqlite".into(), "postgres".into(), "mysql".into(), "graphql".into(), "gql".into()],
+            transports: vec![CellDbTransport::Internal, CellDbTransport::HttpRest],
+        }
+    }
+
+    pub fn mesh(
+        cluster: impl Into<String>,
+        target_app: impl Into<String>,
+        target_cell_id: impl Into<String>,
+        role: MeshDbRole,
+    ) -> Self {
+        Self {
+            mode: CellDbMode::Mesh {
+                cluster: cluster.into(),
+                target_app: target_app.into(),
+                target_cell_id: target_cell_id.into(),
+                role,
+            },
+            flavors: vec!["surql".into(), "sqlite".into(), "postgres".into(), "mysql".into()],
+            transports: vec![
+                CellDbTransport::Internal,
+                CellDbTransport::HttpRest,
+                CellDbTransport::MeshWal,
+            ],
+        }
+    }
+}
+
+/// Resolved target `(ns, db)` and access constraints returned by `CellManager::resolve_db_binding`.
+#[derive(Debug, Clone)]
+pub struct ResolvedDbBinding {
+    pub target_ns: String,
+    pub target_db: String,
+    pub read_only: bool,
+    pub mesh_cluster: Option<String>,
+}
+
 /// Lifecycle policy governing a scoped `(Namespace, Database)` cell on the unified Nexus-IO kernel.
 #[derive(Debug, Clone)]
 pub enum CellPolicy {
@@ -58,6 +203,7 @@ struct CellScope {
     engine: Arc<dyn StateEngine>,
     app: String,
     cell_id: String,
+    db_config: CellDbConfig,
 }
 
 thread_local! {
@@ -65,12 +211,14 @@ thread_local! {
 }
 
 /// Unified `CellManager` actor pool supporting both `pinned` and `elastic` (`celld`) cells
-/// on top of `StateEngine` (SurrealDB) + `BlobBridge` (`s3s` + `iroh-blobs`) + `quickrs-core` + `oxc`.
+/// on top of `StateEngine` (`nexus-db`) + `BlobBridge` + `quickrs-core` + `oxc`, with
+/// declarative per-cell `CellDbConfig` (topology mode, query flavors, and connection transports).
 #[derive(Clone)]
 pub struct CellManager {
     engine: Arc<dyn StateEngine>,
     blobs: Arc<BlobBridge>,
     active: Arc<RwLock<HashMap<CellKey, ActiveCell>>>,
+    db_configs: Arc<RwLock<HashMap<CellKey, CellDbConfig>>>,
 }
 
 impl CellManager {
@@ -79,6 +227,107 @@ impl CellManager {
             engine,
             blobs,
             active: Arc::new(RwLock::new(HashMap::new())),
+            db_configs: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    /// Declare the modular `CellDbConfig` (mode, exposed flavors, and allowed connection transports)
+    /// for `(app, cell_id)`.
+    pub async fn set_db_config(&self, app: &str, cell_id: &str, config: CellDbConfig) {
+        self.db_configs.write().await.insert(
+            CellKey {
+                app: app.to_string(),
+                cell_id: cell_id.to_string(),
+            },
+            config,
+        );
+    }
+
+    pub async fn get_db_config(&self, app: &str, cell_id: &str) -> CellDbConfig {
+        self.db_configs
+            .read()
+            .await
+            .get(&CellKey {
+                app: app.to_string(),
+                cell_id: cell_id.to_string(),
+            })
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Single unified authorization & topology resolver for BOTH internal cells and external transports.
+    pub async fn resolve_db_binding(
+        &self,
+        app: &str,
+        cell_id: &str,
+        transport: CellDbTransport,
+        flavor: &str,
+    ) -> Result<ResolvedDbBinding> {
+        let cfg = self.get_db_config(app, cell_id).await;
+        Self::check_db_config(&cfg, app, cell_id, transport, flavor)
+    }
+
+    pub fn check_db_config(
+        cfg: &CellDbConfig,
+        app: &str,
+        cell_id: &str,
+        transport: CellDbTransport,
+        flavor: &str,
+    ) -> Result<ResolvedDbBinding> {
+        if matches!(cfg.mode, CellDbMode::None) {
+            anyhow::bail!("Cell {}/{} is declared stateless (CellDbMode::None)", app, cell_id);
+        }
+        if !cfg.transports.contains(&transport) {
+            anyhow::bail!(
+                "Transport {:?} is not enabled in CellDbConfig for {}/{}",
+                transport,
+                app,
+                cell_id
+            );
+        }
+        let norm_flavor = match flavor.trim().to_ascii_lowercase().as_str() {
+            "" | "surreal" | "surrealql" => "surql",
+            "pg" | "postgresql" => "postgres",
+            other => other,
+        }
+        .to_string();
+        if !cfg.flavors.iter().any(|f| f.eq_ignore_ascii_case(&norm_flavor)) {
+            anyhow::bail!(
+                "Query flavor '{}' is not enabled in CellDbConfig for {}/{}",
+                norm_flavor,
+                app,
+                cell_id
+            );
+        }
+        match &cfg.mode {
+            CellDbMode::None => unreachable!(),
+            CellDbMode::Dedicated => Ok(ResolvedDbBinding {
+                target_ns: app.to_string(),
+                target_db: cell_id.to_string(),
+                read_only: false,
+                mesh_cluster: None,
+            }),
+            CellDbMode::Reference {
+                target_app,
+                target_cell_id,
+                read_only,
+            } => Ok(ResolvedDbBinding {
+                target_ns: target_app.clone(),
+                target_db: target_cell_id.clone(),
+                read_only: *read_only,
+                mesh_cluster: None,
+            }),
+            CellDbMode::Mesh {
+                cluster,
+                target_app,
+                target_cell_id,
+                role,
+            } => Ok(ResolvedDbBinding {
+                target_ns: target_app.clone(),
+                target_db: target_cell_id.clone(),
+                read_only: !matches!(role, MeshDbRole::Leader),
+                mesh_cluster: Some(cluster.clone()),
+            }),
         }
     }
 
@@ -165,6 +414,7 @@ impl CellManager {
         };
 
         let engine = self.engine.clone();
+        let db_config = self.get_db_config(app, cell_id).await;
         let app_owned = app.to_string();
         let cell_owned = cell_id.to_string();
         let expr_owned = expr.to_string();
@@ -175,6 +425,7 @@ impl CellManager {
                     engine,
                     app: app_owned,
                     cell_id: cell_owned,
+                    db_config,
                 });
             });
 
@@ -363,22 +614,52 @@ fn cell_unified_query_cb(
         }
     }
 
-    // Fast unified path when backed directly by `NexusDb` (shares exact logic with external HTTP `/query`)
+    // Unified CellDbConfig gate + fast path when backed directly by `NexusDb`
     let scope = ACTIVE_CELL_SCOPE.with(|s| {
         s.borrow()
             .as_ref()
-            .map(|sc| (sc.engine.clone(), sc.app.clone(), sc.cell_id.clone()))
+            .map(|sc| (sc.engine.clone(), sc.app.clone(), sc.cell_id.clone(), sc.db_config.clone()))
     });
-    if let Some((ref engine, ref app, ref cell_id)) = scope {
+    if let Some((ref engine, ref app, ref cell_id, ref db_cfg)) = scope {
+        let binding = match CellManager::check_db_config(
+            db_cfg,
+            app,
+            cell_id,
+            CellDbTransport::Internal,
+            &flavor,
+        ) {
+            Ok(b) => b,
+            Err(e) => {
+                let err_obj = ctx.new_object();
+                let k = PropKey::from_string(&ctx.intern("error"));
+                let v = JsValue::Str(ctx.intern(&e.to_string()));
+                ctx.define_own(&err_obj, k, Property::data(v, PropFlags::C_W_E));
+                return Ok(JsValue::Object(err_obj));
+            }
+        };
         if let Some(nexus) = engine.as_nexus_db() {
+            let auth_opt = if binding.read_only {
+                Some(nexus_db::auth::AuthContext {
+                    level: nexus_db::auth::AuthLevel::Database(
+                        binding.target_ns.clone(),
+                        binding.target_db.clone(),
+                    ),
+                    roles: vec![nexus_db::auth::Role::Viewer],
+                    actor: Some(format!("cell:{}/{}", app, cell_id)),
+                    access_name: None,
+                    token_claims: None,
+                })
+            } else {
+                None
+            };
             let res_json = match execute_unified_query(
                 nexus,
-                app,
-                cell_id,
+                &binding.target_ns,
+                &binding.target_db,
                 &flavor,
                 &query,
                 bind_args,
-                None,
+                auth_opt,
             ) {
                 Ok(v) => v,
                 Err(e) => serde_json::json!({ "error": e.to_string() }),
@@ -575,5 +856,73 @@ mod tests {
             .unwrap()
             .join()
             .unwrap();
+    }
+
+    #[test]
+    fn cell_db_config_enforces_stateless_reference_mesh_flavors_and_transports() {
+        // 1. Stateless cell blocks all DB access
+        let stateless = CellDbConfig::stateless();
+        assert!(CellManager::check_db_config(
+            &stateless,
+            "edge",
+            "worker1",
+            CellDbTransport::Internal,
+            "surql"
+        )
+        .is_err());
+
+        // 2. Minimal dedicated cell allows Internal + surql, blocks HttpRest & mysql
+        let minimal = CellDbConfig::dedicated_minimal();
+        assert!(CellManager::check_db_config(
+            &minimal,
+            "billing",
+            "ledger",
+            CellDbTransport::Internal,
+            "surql"
+        )
+        .is_ok());
+        assert!(CellManager::check_db_config(
+            &minimal,
+            "billing",
+            "ledger",
+            CellDbTransport::HttpRest,
+            "surql"
+        )
+        .is_err());
+        assert!(CellManager::check_db_config(
+            &minimal,
+            "billing",
+            "ledger",
+            CellDbTransport::Internal,
+            "mysql"
+        )
+        .is_err());
+
+        // 3. Cross-cell Reference redirects to target cell with read_only flag
+        let ref_cfg = CellDbConfig::reference("billing", "ledger", true);
+        let bound = CellManager::check_db_config(
+            &ref_cfg,
+            "analytics",
+            "dash",
+            CellDbTransport::HttpRest,
+            "postgres",
+        )
+        .unwrap();
+        assert_eq!(bound.target_ns, "billing");
+        assert_eq!(bound.target_db, "ledger");
+        assert!(bound.read_only);
+
+        // 4. Mesh ReadReplica enforces read_only & carries cluster name
+        let mesh_cfg = CellDbConfig::mesh("us-east", "billing", "ledger", MeshDbRole::ReadReplica);
+        let m_bound = CellManager::check_db_config(
+            &mesh_cfg,
+            "edge",
+            "read1",
+            CellDbTransport::MeshWal,
+            "mysql",
+        )
+        .unwrap();
+        assert_eq!(m_bound.mesh_cluster.as_deref(), Some("us-east"));
+        assert!(m_bound.read_only);
     }
 }

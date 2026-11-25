@@ -19,6 +19,8 @@ pub struct GatewayConfig {
     pub enable_surreal_direct: bool, // Port 8000 (direct DB access)
     pub enable_pgwire: bool,         // Port 5432 (PostgreSQL v3 wire protocol)
     pub pgwire_port: u16,            // Default 5432
+    pub enable_mysqlwire: bool,      // Port 3306 (MySQL v10 wire protocol)
+    pub mysqlwire_port: u16,         // Default 3306
     pub enable_s3_direct: bool,      // Port 3900 (S3 API)
     pub enable_metrics: bool,        // Port 9090 (Prometheus)
     pub acme_domain: Option<String>, // Domain for ACME certs
@@ -36,6 +38,11 @@ impl Default for GatewayConfig {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(5432),
+            enable_mysqlwire: std::env::var("NEXUS_ENABLE_MYSQLWIRE").as_deref() == Ok("1"),
+            mysqlwire_port: std::env::var("NEXUS_MYSQLWIRE_PORT")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(3306),
             enable_s3_direct: false,
             enable_metrics: false,
             acme_domain: None,
@@ -87,6 +94,17 @@ impl UxGateway {
             handles.push(tokio::spawn(async move {
                 if let Err(e) = gateway.serve_pgwire().await {
                     eprintln!("❌ PgWire listener error: {}", e);
+                }
+            }));
+        }
+
+        // Port 3306: MySQL v10 Wire Protocol (`MySqlWireSession`) — disabled by default
+        #[cfg(feature = "mysqlwire")]
+        if self.config.enable_mysqlwire {
+            let gateway = self.clone();
+            handles.push(tokio::spawn(async move {
+                if let Err(e) = gateway.serve_mysqlwire().await {
+                    eprintln!("❌ MySQL wire listener error: {}", e);
                 }
             }));
         }
@@ -265,6 +283,88 @@ impl UxGateway {
                                         }
                                     }
                                     Err(_) => return,
+                                }
+                            }
+                            Ok(None) => break,
+                            Err(_) => return,
+                        }
+                    }
+
+                    let Ok(n) = socket.read(&mut chunk).await else { return; };
+                    if n == 0 {
+                        return;
+                    }
+                    stream_buf.extend_from_slice(&chunk[..n]);
+                }
+            });
+        }
+    }
+
+    /// Port 3306 (configurable): MySQL v10 Wire Protocol TCP listener (`mysql`, MySQL2, Prisma, Drizzle).
+    /// Binds loopback (`127.0.0.1`) by default, requires `HandshakeResponse41` auth backed by `nexus-db` RBAC,
+    /// and uses streaming 4-byte MySQL packet framing.
+    #[cfg(feature = "mysqlwire")]
+    async fn serve_mysqlwire(&self) -> Result<(), Box<dyn std::error::Error>> {
+        use nexus_db::mysqlwire::MySqlWireSession;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        static CONN_ID: AtomicU32 = AtomicU32::new(1);
+        let bind_host =
+            std::env::var("NEXUS_MYSQLWIRE_BIND").unwrap_or_else(|_| "127.0.0.1".to_string());
+        let addr = format!("{}:{}", bind_host, self.config.mysqlwire_port);
+        let trust_local = std::env::var("NEXUS_MYSQLWIRE_TRUST_LOCAL").as_deref() == Ok("1");
+        let listener = tokio::net::TcpListener::bind(&addr).await?;
+        println!(
+            "🐬 MySQL v10 Wire Protocol (MySqlWire) listening on {} (auth: {})",
+            addr,
+            if trust_local { "trust-local" } else { "password-required" }
+        );
+
+        loop {
+            let (mut socket, _) = listener.accept().await?;
+            let db = self.db.clone();
+            let cid = CONN_ID.fetch_add(1, Ordering::Relaxed);
+            tokio::spawn(async move {
+                let mut my = if trust_local {
+                    MySqlWireSession::new(db.inner.clone(), "nexus", "system")
+                } else {
+                    MySqlWireSession::new_authenticated(db.inner.clone(), "nexus", "system", cid)
+                };
+                if socket.write_all(&my.handshake_greeting()).await.is_err() {
+                    return;
+                }
+
+                let mut stream_buf: Vec<u8> = Vec::with_capacity(8192);
+                let mut chunk = [0u8; 4096];
+                let mut handshake_done = false;
+
+                loop {
+                    loop {
+                        match MySqlWireSession::extract_next_packet(&mut stream_buf) {
+                            Ok(Some((seq, payload))) => {
+                                if !handshake_done {
+                                    handshake_done = true;
+                                    match my.handle_handshake_response(seq, &payload) {
+                                        Ok(resp) => {
+                                            if socket.write_all(&resp).await.is_err() || !my.authenticated {
+                                                return;
+                                            }
+                                        }
+                                        Err(_) => return,
+                                    }
+                                } else {
+                                    match my.handle_command(seq, &payload) {
+                                        Ok((close, resp)) => {
+                                            if !resp.is_empty() && socket.write_all(&resp).await.is_err() {
+                                                return;
+                                            }
+                                            if close {
+                                                return;
+                                            }
+                                        }
+                                        Err(_) => return,
+                                    }
                                 }
                             }
                             Ok(None) => break,

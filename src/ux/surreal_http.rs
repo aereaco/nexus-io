@@ -461,23 +461,6 @@ pub struct UnifiedQueryHandler {
 #[async_trait]
 impl Handler for UnifiedQueryHandler {
     async fn handle(&self, req: &mut Request, _depot: &mut Depot, res: &mut Response, _ctrl: &mut FlowCtrl) {
-        let (ns, database) = match (req.param::<String>("app"), req.param::<String>("cell_id")) {
-            (Some(app), Some(cell_id)) => {
-                let _ = self.cells.ensure_awake(&app, &cell_id).await;
-                (app, cell_id)
-            }
-            _ => extract_ns_db(req),
-        };
-
-        let auth = match resolve_http_auth(req, &self.db, &ns, &database) {
-            Ok(a) => a,
-            Err(msg) => {
-                res.status_code(StatusCode::UNAUTHORIZED);
-                res.render(Json(json!({ "code": 401, "details": msg })));
-                return;
-            }
-        };
-
         let body: JsonValue = match req.parse_json().await {
             Ok(v) => v,
             Err(e) => {
@@ -491,6 +474,57 @@ impl Handler for UnifiedQueryHandler {
             .get("flavor")
             .and_then(|v| v.as_str())
             .unwrap_or(self.default_flavor);
+
+        let (ns, database, force_ro) = match (req.param::<String>("app"), req.param::<String>("cell_id")) {
+            (Some(app), Some(cell_id)) => {
+                let binding = match self
+                    .cells
+                    .resolve_db_binding(
+                        &app,
+                        &cell_id,
+                        crate::js::cell::CellDbTransport::HttpRest,
+                        flavor,
+                    )
+                    .await
+                {
+                    Ok(b) => b,
+                    Err(e) => {
+                        res.status_code(StatusCode::FORBIDDEN);
+                        res.render(Json(json!({ "code": 403, "details": e.to_string() })));
+                        return;
+                    }
+                };
+                if let Err(e) = self.cells.ensure_awake(&binding.target_ns, &binding.target_db).await {
+                    res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+                    res.render(Json(json!({ "code": 500, "details": e.to_string() })));
+                    return;
+                }
+                (binding.target_ns, binding.target_db, binding.read_only)
+            }
+            _ => {
+                let (n, d) = extract_ns_db(req);
+                (n, d, false)
+            }
+        };
+
+        let mut auth = match resolve_http_auth(req, &self.db, &ns, &database) {
+            Ok(a) => a,
+            Err(msg) => {
+                res.status_code(StatusCode::UNAUTHORIZED);
+                res.render(Json(json!({ "code": 401, "details": msg })));
+                return;
+            }
+        };
+        if force_ro {
+            auth = Some(AuthContext {
+                level: nexus_db::auth::AuthLevel::Database(ns.clone(), database.clone()),
+                roles: vec![nexus_db::auth::Role::Viewer],
+                actor: auth.and_then(|a| a.actor),
+                access_name: None,
+                token_claims: None,
+            });
+        }
+
         let query = body
             .get("query")
             .and_then(|v| v.as_str())

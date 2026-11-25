@@ -18,8 +18,9 @@ graphql = []
 ml = []
 gql = []
 pgwire = []
+mysqlwire = []
 sqlite = []
-full = ["fts", "vector", "files", "auth", "geo", "crypto", "cbor", "graphql", "ml", "gql", "pgwire", "sqlite"]
+full = ["fts", "vector", "files", "auth", "geo", "crypto", "cbor", "graphql", "ml", "gql", "pgwire", "mysqlwire", "sqlite"]
 
 [dependencies]
 anyhow = "1.0"

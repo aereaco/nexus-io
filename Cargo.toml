@@ -33,6 +33,7 @@ profile-app = [
     "graphql",
     "gql",
     "pgwire",
+    "mysqlwire",
     "salvo/acme",
     "salvo/quinn",
     "salvo/oapi",
@@ -103,6 +104,7 @@ sqlite-hrana = ["nexus-db/sqlite"]
 graphql = ["nexus-db/graphql"]
 gql = ["nexus-db/gql"]
 pgwire = ["nexus-db/pgwire"]
+mysqlwire = ["nexus-db/mysqlwire"]
 p2p-storage = ["dep:iroh", "dep:iroh-blobs"]
 s3-gateway = ["dep:s3s"]
 shell = ["dep:nu-cli", "dep:rustyline"]
