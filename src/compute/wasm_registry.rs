@@ -322,17 +322,35 @@ impl WasmRuntimeRegistry {
             .await;
 
         let owner_id = format!("runtime:{}", norm);
-        let dropped = self
+        match self
             .cas
             .release_owner(RUNTIMES_BUCKET, "cid/", &rec.cid, &owner_id)
-            .await?;
-        if dropped {
-            let _ = self
-                .blobs
-                .delete_object(RUNTIMES_BUCKET, &format!("aot-cid/{}/{}.cwasm", compat, rec.cid))
-                .await;
+            .await
+        {
+            Ok(dropped) => {
+                if dropped {
+                    let _ = self
+                        .blobs
+                        .delete_object(
+                            RUNTIMES_BUCKET,
+                            &format!("aot-cid/{}/{}.cwasm", compat, rec.cid),
+                        )
+                        .await;
+                }
+                Ok(true)
+            }
+            Err(e) => {
+                // Catalog was already committed; mark boot reconciliation pending so recovery completes cleanup
+                let _ = self
+                    .cas
+                    .mark_reconciliation_pending(
+                        RUNTIMES_BUCKET,
+                        &format!("runtime uninstall ownership release failed for '{}'", norm),
+                    )
+                    .await;
+                Err(e)
+            }
         }
-        Ok(true)
     }
 
     /// Register a `.wasm` or `.wat` guest runtime under `name` (e.g. `"quickjs"`, `"php-cgi"`, `"sqlite"`),
@@ -428,8 +446,26 @@ impl WasmRuntimeRegistry {
             sha256_digest,
             requested_policy,
         };
-        self.index.write().await.insert(norm, rec.clone());
-        self.persist_index().await?;
+        self.index.write().await.insert(norm.clone(), rec.clone());
+        if let Err(e) = self.persist_index().await {
+            // Roll back in-memory catalog and release newly acquired ownership on CAS failure
+            self.index.write().await.remove(&norm);
+            if self
+                .cas
+                .release_owner(RUNTIMES_BUCKET, "cid/", &rec.cid, &format!("runtime:{}", norm))
+                .await
+                .is_err()
+            {
+                let _ = self
+                    .cas
+                    .mark_reconciliation_pending(
+                        RUNTIMES_BUCKET,
+                        &format!("runtime registration rollback failed for '{}'", norm),
+                    )
+                    .await;
+            }
+            return Err(e);
+        }
         global_metrics().inc_registry_register();
         Ok(rec)
     }

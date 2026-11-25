@@ -2,38 +2,58 @@ use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, RwLock};
 
 use crate::compute::crystal::{CrystalEngine, WasiRunConfig};
 use crate::compute::wasm_registry::{ResolvedRuntime, WasmRuntimeRegistry};
-use crate::storage::cas_store::DEFAULT_EXECUTION_LEASE_TTL_MS;
+use crate::storage::cas_store::{ExecutionLease, OwnershipTx, DEFAULT_EXECUTION_LEASE_TTL_MS};
 use crate::storage::{BlobBridge, CasStore};
 
 pub const WASM_DB_BUCKET: &str = "nexus-wasm-db";
 
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
 /// Multi-file virtual filesystem manifest persisted per `(app, cell_id)` in `BlobBridge`.
-/// Carries a monotonic `fencing_token` from the distributed `ExecutionLease` so stale writers
-/// that paused past lease expiry are strictly rejected at commit time.
+/// Carries a monotonic `fencing_token` from the unified `WasmDbCellRecord` lease.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct WasmDbFsManifest {
     pub version: u64,
     #[serde(default)]
     pub fencing_token: u64,
-    /// Relative POSIX path inside `mount_path` (e.g. `"main.db"`, `"main.db-wal"`, `"pgdata/PG_VERSION"`)
-    /// mapped to its content-addressed BLAKE3 CID in `BlobBridge`.
     pub files: BTreeMap<String, String>,
 }
 
-/// Production-grade Wasmtime-hosted database mount for `CellDbMode::WasmEngine`
-/// (`sqlite.wasm`, `pglite.wasm`, `duckdb.wasm`, `nexus-db.wasm`):
-/// - Reuses a single shared `Arc<CrystalEngine>` (with compiled `Module` caching) — never recreates
-///   a Wasmtime `Engine` per query.
-/// - Serializes concurrent read/modify/write queries per `(app, cell_id)` via an async mutex.
-/// - Hydrates and atomically commits the entire multi-file virtual directory tree (DB + WAL + journals)
-///   to `BlobBridge`, strictly propagating all persistence errors (never silently dropping writes).
+/// Single-object atomic record combining BOTH the distributed `ExecutionLease` AND the
+/// `WasmDbFsManifest` in ONE CAS-committed object (`cells/<app>/<cell_id>/manifest.json`).
+///
+/// WHY THIS CLOSES THE STALE-WRITER WINDOW 100%:
+/// When Node B acquires a newer lease (token 2) after Node A's lease (token 1) expires,
+/// Node B atomically updates this exact object's ETag. Even BEFORE Node B commits its query,
+/// Node A's stale commit using its old ETag is mathematically impossible to succeed!
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WasmDbCellRecord {
+    #[serde(default)]
+    pub lease: Option<ExecutionLease>,
+    #[serde(default)]
+    pub manifest: WasmDbFsManifest,
+}
+
+/// Production-grade Wasmtime-hosted database mount for `CellDbMode::WasmEngine`:
+/// - Single-object atomic fencing (`WasmDbCellRecord` combines lease + manifest in ONE CAS).
+/// - Background heartbeat renewal that signals `lease_lost` immediately if renewal fails.
+/// - Acquire-before-commit `OwnershipTx`: establishes durable ownership of all NEW CIDs BEFORE
+///   publishing the manifest, then releases superseded OLD CIDs via 3-state `Live -> Tombstoned -> Deleting`.
+/// - Shared `Arc<CrystalEngine>` with compiled `Module` caching + bounded per-cell lock map.
 #[derive(Clone)]
 pub struct WasmDbMount {
     crystal: Arc<CrystalEngine>,
@@ -54,7 +74,6 @@ impl WasmDbMount {
             return lock;
         }
         let mut guard = self.cell_locks.write().await;
-        // Bounded lock map hygiene: evict uncontended locks when map exceeds 256 entries
         if guard.len() >= 256 {
             guard.retain(|_, v| Arc::strong_count(v) > 1);
         }
@@ -78,19 +97,76 @@ impl WasmDbMount {
         app: &str,
         cell_id: &str,
     ) -> Result<WasmDbFsManifest> {
-        let manifest_key = format!("cells/{}/{}/manifest.json", app, cell_id);
-        match blobs.get_object(WASM_DB_BUCKET, &manifest_key).await? {
-            Some(bytes) => serde_json::from_slice(&bytes)
-                .with_context(|| format!("Corrupted WasmDbFsManifest for {}/{}", app, cell_id)),
+        let cas = CasStore::new(blobs.clone());
+        let key = format!("cells/{}/{}/manifest.json", app, cell_id);
+        match cas.read_manifest::<WasmDbCellRecord>(WASM_DB_BUCKET, &key).await? {
+            Some((rec, _)) => Ok(rec.manifest),
             None => Ok(WasmDbFsManifest::default()),
         }
     }
 
-    /// Execute a query against a Wasm-hosted DB engine for `(app, cell_id)` with:
-    /// 1. Per-cell serialization lock (preventing concurrent read/modify/write races),
-    /// 2. Full multi-file directory hydration from `BlobBridge`,
-    /// 3. Shared `CrystalEngine` execution with fuel metering,
-    /// 4. Strict multi-file flush & atomic manifest commit back to `BlobBridge`.
+    /// Atomically acquire a fenced single-writer lease inside `WasmDbCellRecord` via CAS.
+    /// Returns `(record, new_etag, fencing_token)`.
+    async fn acquire_record_lease(
+        cas: &CasStore,
+        record_key: &str,
+        holder: &str,
+        ttl_ms: u64,
+    ) -> Result<(WasmDbCellRecord, String, u64)> {
+        for _ in 0..8 {
+            let now = now_ms();
+            let (mut record, expected_etag) = match cas
+                .read_manifest::<WasmDbCellRecord>(WASM_DB_BUCKET, record_key)
+                .await?
+            {
+                Some((r, etag)) => {
+                    if let Some(ref existing) = r.lease {
+                        if existing.expires_at_ms > now && existing.holder != holder {
+                            anyhow::bail!(
+                                "WasmDb record '{}' lease held by '{}' (fencing_token={})",
+                                record_key,
+                                existing.holder,
+                                existing.fencing_token
+                            );
+                        }
+                    }
+                    (r, Some(etag))
+                }
+                None => (WasmDbCellRecord::default(), None),
+            };
+            let prev_token = record
+                .lease
+                .as_ref()
+                .map(|l| l.fencing_token)
+                .unwrap_or(0)
+                .max(record.manifest.fencing_token);
+            let next_token = prev_token + 1;
+            record.lease = Some(ExecutionLease {
+                holder: holder.to_string(),
+                fencing_token: next_token,
+                acquired_at_ms: now,
+                expires_at_ms: now.saturating_add(ttl_ms),
+            });
+            match cas
+                .commit_manifest_cas(WASM_DB_BUCKET, record_key, &record, expected_etag.as_deref())
+                .await
+            {
+                Ok(new_etag) => return Ok((record, new_etag, next_token)),
+                Err(e)
+                    if e.downcast_ref::<crate::storage::blob_bridge::CasConflictError>()
+                        .is_some() =>
+                {
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        anyhow::bail!("CAS contention acquiring WasmDbCellRecord lease '{}'", record_key)
+    }
+
+    /// Execute a query against a Wasm-hosted DB engine for `(app, cell_id)` with single-object
+    /// atomic fencing (`WasmDbCellRecord`), heartbeat loss detection, and acquire-before-commit
+    /// recoverable ownership transactions (`OwnershipTx`).
     #[allow(clippy::too_many_arguments)]
     pub async fn execute_query(
         &self,
@@ -105,28 +181,30 @@ impl WasmDbMount {
         query: &str,
         fuel_limit: u64,
     ) -> Result<JsonValue> {
-        // 1. Serialize in-process concurrency AND acquire distributed fenced ExecutionLease
-        //    covering the entire hydrate -> execute -> persist cycle across processes/nodes.
         let lock = self.cell_lock(app, cell_id).await;
         let _guard = lock.lock().await;
 
         let cas = CasStore::new(blobs.clone());
-        let lease_key = format!("leases/wasmdb/{}/{}.lease.json", app, cell_id);
+        let record_key = format!("cells/{}/{}/manifest.json", app, cell_id);
         let holder = format!("{}:{}", blobs.node_id(), uuid::Uuid::new_v4().simple());
-        let lease = cas
-            .acquire_execution_lease(
-                WASM_DB_BUCKET,
-                &lease_key,
-                &holder,
-                DEFAULT_EXECUTION_LEASE_TTL_MS,
-            )
-            .await?;
 
-        // Background lease heartbeat renewal (every ttl / 3) for long-running queries
+        // 1. Acquire single-object fenced lease inside WasmDbCellRecord via CAS
+        let (record, initial_etag, fencing_token) = Self::acquire_record_lease(
+            &cas,
+            &record_key,
+            &holder,
+            DEFAULT_EXECUTION_LEASE_TTL_MS,
+        )
+        .await?;
+
+        // Track live ETag & lease-loss flag shared with the background heartbeat renewal task
+        let live_etag = Arc::new(Mutex::new(initial_etag));
+        let lease_lost = Arc::new(AtomicBool::new(false));
         let hb_cas = cas.clone();
-        let hb_key = lease_key.clone();
+        let hb_key = record_key.clone();
         let hb_holder = holder.clone();
-        let hb_token = lease.fencing_token;
+        let hb_etag = live_etag.clone();
+        let hb_lost = lease_lost.clone();
         let hb_task = tokio::spawn(async move {
             let mut ticker = tokio::time::interval(std::time::Duration::from_millis(
                 DEFAULT_EXECUTION_LEASE_TTL_MS / 3,
@@ -134,82 +212,115 @@ impl WasmDbMount {
             ticker.tick().await;
             loop {
                 ticker.tick().await;
-                if hb_cas
-                    .renew_execution_lease(
-                        WASM_DB_BUCKET,
-                        &hb_key,
-                        &hb_holder,
-                        hb_token,
-                        DEFAULT_EXECUTION_LEASE_TTL_MS,
-                    )
+                let mut etag_guard = hb_etag.lock().await;
+                let Ok(Some((mut rec, cur_etag))) = hb_cas
+                    .read_manifest::<WasmDbCellRecord>(WASM_DB_BUCKET, &hb_key)
                     .await
-                    .is_err()
-                {
+                else {
+                    hb_lost.store(true, Ordering::SeqCst);
                     break;
+                };
+                let valid = cur_etag == *etag_guard
+                    && rec
+                        .lease
+                        .as_ref()
+                        .map(|l| l.holder == hb_holder && l.fencing_token == fencing_token)
+                        .unwrap_or(false);
+                if !valid {
+                    hb_lost.store(true, Ordering::SeqCst);
+                    break;
+                }
+                if let Some(ref mut l) = rec.lease {
+                    l.expires_at_ms = now_ms().saturating_add(DEFAULT_EXECUTION_LEASE_TTL_MS);
+                }
+                match hb_cas
+                    .commit_manifest_cas(WASM_DB_BUCKET, &hb_key, &rec, Some(&cur_etag))
+                    .await
+                {
+                    Ok(next_etag) => *etag_guard = next_etag,
+                    Err(_) => {
+                        hb_lost.store(true, Ordering::SeqCst);
+                        break;
+                    }
                 }
             }
         });
 
-        let exec_result = self
-            .execute_query_under_lease(
+        let exec_res = self
+            .execute_under_fenced_record(
                 &cas,
                 registry,
                 app,
                 cell_id,
+                &record_key,
+                &holder,
+                record.manifest,
+                &live_etag,
+                &lease_lost,
+                fencing_token,
                 engine_name,
                 module_cid,
                 mount_path,
                 flavor,
                 query,
                 fuel_limit,
-                lease.fencing_token,
             )
             .await;
 
         hb_task.abort();
-        let _ = cas
-            .release_execution_lease(WASM_DB_BUCKET, &lease_key, &holder, lease.fencing_token)
-            .await;
-        exec_result
+
+        // If execution failed before commit released the lease, explicitly expire our lease via CAS
+        if exec_res.is_err() {
+            let etag_guard = live_etag.lock().await;
+            if let Ok(Some((mut rec, cur_etag))) = cas
+                .read_manifest::<WasmDbCellRecord>(WASM_DB_BUCKET, &record_key)
+                .await
+            {
+                if cur_etag == *etag_guard
+                    && rec
+                        .lease
+                        .as_ref()
+                        .map(|l| l.holder == holder && l.fencing_token == fencing_token)
+                        .unwrap_or(false)
+                {
+                    if let Some(ref mut l) = rec.lease {
+                        l.expires_at_ms = 0;
+                    }
+                    let _ = cas
+                        .commit_manifest_cas(WASM_DB_BUCKET, &record_key, &rec, Some(&cur_etag))
+                        .await;
+                }
+            }
+        }
+
+        exec_res
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn execute_query_under_lease(
+    async fn execute_under_fenced_record(
         &self,
         cas: &CasStore,
         registry: &WasmRuntimeRegistry,
         app: &str,
         cell_id: &str,
+        record_key: &str,
+        holder: &str,
+        prev_manifest: WasmDbFsManifest,
+        live_etag: &Arc<Mutex<String>>,
+        lease_lost: &Arc<AtomicBool>,
+        fencing_token: u64,
         engine_name: &str,
         module_cid: &str,
         mount_path: &str,
         flavor: &str,
         query: &str,
         fuel_limit: u64,
-        fencing_token: u64,
     ) -> Result<JsonValue> {
-        // 2. Resolve Wasm/AOT DB engine module
         let resolved = match registry.resolve_runtime(module_cid).await {
             Ok(r) => r,
             Err(_) => registry.resolve_runtime(engine_name).await?,
         };
 
-        // 3. Hydrate entire multi-file virtual directory tree via shared CasStore (BLAKE3 verified)
-        let manifest_key = format!("cells/{}/{}/manifest.json", app, cell_id);
-        let (prev_manifest, prev_etag) = match cas.read_manifest::<WasmDbFsManifest>(WASM_DB_BUCKET, &manifest_key).await? {
-            Some((m, etag)) => (m, Some(etag)),
-            None => (WasmDbFsManifest::default(), None),
-        };
-        // Reject stale fenced writers immediately
-        if fencing_token < prev_manifest.fencing_token {
-            anyhow::bail!(
-                "Fenced out: lease fencing_token {} < manifest fencing_token {} for {}/{}",
-                fencing_token,
-                prev_manifest.fencing_token,
-                app,
-                cell_id
-            );
-        }
         let work_dir = std::env::temp_dir().join(format!(
             "nexus_wasmdb_{}_{}_{}",
             sanitize(app),
@@ -235,7 +346,6 @@ impl WasmDbMount {
             tokio::fs::write(&dest, &data).await?;
         }
 
-        // 4. Execute WASI DB engine on the shared `CrystalEngine` (with Module cache)
         let mount = if mount_path.is_empty() {
             "/data".to_string()
         } else {
@@ -293,8 +403,23 @@ impl WasmDbMount {
             );
         }
 
-        // 5. Walk workspace, store verified immutable blobs, and atomically commit manifest via CAS.
-        // Coordinates safely across processes/nodes; every persistence error is strictly propagated.
+        // Abort immediately if the background heartbeat lost our lease
+        if lease_lost.load(Ordering::SeqCst) {
+            let _ = tokio::fs::remove_dir_all(&work_dir).await;
+            anyhow::bail!(
+                "Aborted commit for {}/{}: execution lease (fencing_token={}) was lost during execution",
+                app,
+                cell_id,
+                fencing_token
+            );
+        }
+
+        // Recoverable Acquire-Before-Commit Ownership Transaction:
+        // 1. Write new content-addressed blobs
+        // 2. Acquire ownership of all NEW CIDs FIRST (invariant: manifest NEVER references unowned blobs)
+        // 3. Persist OwnershipTx record
+        // 4. Atomically commit WasmDbCellRecord (manifest + expired/released lease) using live ETag
+        // 5. Release superseded OLD CIDs via 3-state Drop & finalize OwnershipTx
         let commit_res: Result<()> = async {
             let walked = collect_dir_files(&work_dir, &work_dir).await?;
             let mut next_files = BTreeMap::new();
@@ -304,53 +429,95 @@ impl WasmDbMount {
                     .put_verified_blob(WASM_DB_BUCKET, "blobs/", Bytes::from(bytes))
                     .await
                     .with_context(|| {
-                        format!(
-                            "Failed to persist Wasm DB file '{}' for {}/{}",
-                            rel_path, app, cell_id
-                        )
+                        format!("Failed to persist Wasm DB file '{}' for {}/{}", rel_path, app, cell_id)
                     })?;
                 next_files.insert(rel_path, cid);
             }
 
-            let next_manifest = WasmDbFsManifest {
-                version: prev_manifest.version + 1,
-                fencing_token,
-                files: next_files,
-            };
-            cas.commit_manifest_cas(
-                WASM_DB_BUCKET,
-                &manifest_key,
-                &next_manifest,
-                prev_etag.as_deref(),
-            )
-            .await
-            .with_context(|| {
-                format!(
-                    "Atomic CAS commit failed for WasmDbFsManifest v{} ({}/{})",
-                    next_manifest.version, app, cell_id
-                )
-            })?;
-
-            // Single-CAS atomic ownership transfer: propagate errors (never ignore bookkeeping failures)
             let owner_id = format!("wasmdb:{}/{}", app, cell_id);
-            let prev_cids: std::collections::HashSet<String> =
-                prev_manifest.files.values().cloned().collect();
-            let next_cids: std::collections::HashSet<String> =
-                next_manifest.files.values().cloned().collect();
-            cas.transfer_manifest_ownership(
-                WASM_DB_BUCKET,
-                "blobs/",
-                &owner_id,
-                &prev_cids,
-                &next_cids,
-            )
-            .await
-            .with_context(|| {
-                format!(
-                    "Atomic ownership transfer failed for WasmDbFsManifest v{} ({}/{})",
-                    next_manifest.version, app, cell_id
+            let prev_cids: HashSet<String> = prev_manifest.files.values().cloned().collect();
+            let next_cids: HashSet<String> = next_files.values().cloned().collect();
+            let newly_added: Vec<String> = next_cids.difference(&prev_cids).cloned().collect();
+            let superseded: Vec<String> = prev_cids.difference(&next_cids).cloned().collect();
+
+            // Step 2: Acquire ownership of NEW CIDs BEFORE committing manifest
+            cas.acquire_owners_batch(WASM_DB_BUCKET, &owner_id, &newly_added)
+                .await?;
+
+            // Step 3: Persist recoverable OwnershipTx record
+            let tx_id = uuid::Uuid::new_v4().simple().to_string();
+            let tx = OwnershipTx {
+                tx_id: tx_id.clone(),
+                owner_id: owner_id.clone(),
+                acquired_cids: newly_added.clone(),
+                prev_cids: superseded.clone(),
+                created_at_ms: now_ms(),
+            };
+            if let Err(e) = cas.begin_ownership_tx(WASM_DB_BUCKET, &tx).await {
+                let _ = cas
+                    .release_owners_batch(WASM_DB_BUCKET, "blobs/", &owner_id, &newly_added)
+                    .await;
+                return Err(e);
+            }
+
+            // Step 4: Single-object atomic fenced commit (manifest + lease release in ONE CAS!)
+            let next_record = WasmDbCellRecord {
+                lease: Some(ExecutionLease {
+                    holder: holder.to_string(),
+                    fencing_token,
+                    acquired_at_ms: now_ms(),
+                    expires_at_ms: 0, // cleanly released atomically with the commit
+                }),
+                manifest: WasmDbFsManifest {
+                    version: prev_manifest.version + 1,
+                    fencing_token,
+                    files: next_files,
+                },
+            };
+            let etag_guard = live_etag.lock().await;
+            if let Err(e) = cas
+                .commit_manifest_cas(
+                    WASM_DB_BUCKET,
+                    record_key,
+                    &next_record,
+                    Some(etag_guard.as_str()),
                 )
-            })?;
+                .await
+            {
+                // Roll back newly acquired ownership cleanly on CAS/fencing conflict
+                if cas
+                    .release_owners_batch(WASM_DB_BUCKET, "blobs/", &owner_id, &newly_added)
+                    .await
+                    .is_err()
+                {
+                    let _ = cas
+                        .mark_reconciliation_pending(WASM_DB_BUCKET, "rollback after fenced CAS conflict")
+                        .await;
+                }
+                let _ = cas.finalize_ownership_tx(WASM_DB_BUCKET, &tx_id).await;
+                return Err(e).with_context(|| {
+                    format!(
+                        "Atomic fenced CAS commit failed for WasmDbCellRecord v{} ({}/{})",
+                        next_record.manifest.version, app, cell_id
+                    )
+                });
+            }
+            drop(etag_guard);
+
+            // Step 5: Release superseded OLD CIDs (3-state Drop) & finalize OwnershipTx
+            if let Err(e) = cas
+                .release_owners_batch(WASM_DB_BUCKET, "blobs/", &owner_id, &superseded)
+                .await
+            {
+                let _ = cas
+                    .mark_reconciliation_pending(
+                        WASM_DB_BUCKET,
+                        &format!("superseded CID release failed for {}/{}", app, cell_id),
+                    )
+                    .await;
+                return Err(e);
+            }
+            let _ = cas.finalize_ownership_tx(WASM_DB_BUCKET, &tx_id).await;
             Ok(())
         }
         .await;
@@ -460,17 +627,45 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn stale_fenced_writer_cannot_commit_after_newer_lease_acquired() {
+        let db = Arc::new(Database::open_mem());
+        let blobs = Arc::new(BlobBridge::new(db).await.unwrap());
+        let cas = CasStore::new(blobs);
+        let key = "cells/fence_app/c1/manifest.json";
+
+        // Node A acquires token 1 with 1ms TTL
+        let (mut rec_a, etag_a, token_a) =
+            WasmDbMount::acquire_record_lease(&cas, key, "node-a", 1)
+                .await
+                .unwrap();
+        assert_eq!(token_a, 1);
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        // Node B acquires token 2 after A's lease expired (atomically advancing record ETag!)
+        let (_rec_b, _etag_b, token_b) =
+            WasmDbMount::acquire_record_lease(&cas, key, "node-b", 30_000)
+                .await
+                .unwrap();
+        assert_eq!(token_b, 2);
+
+        // Even BEFORE Node B commits its query, Node A's stale commit using etag_a MUST fail atomically!
+        rec_a.manifest.version += 1;
+        let stale_commit = cas
+            .commit_manifest_cas(WASM_DB_BUCKET, key, &rec_a, Some(&etag_a))
+            .await;
+        assert!(
+            stale_commit.is_err(),
+            "stale writer holding token 1 must be rejected atomically once Node B holds token 2"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn wasm_db_mount_survives_concurrent_queries_multi_file_wal_and_restart_recovery() {
         let db = Arc::new(Database::open_mem());
         let blobs = Arc::new(BlobBridge::new(db).await.unwrap());
         let registry = WasmRuntimeRegistry::new(blobs.clone());
         let mount = WasmDbMount::new(Arc::new(CrystalEngine::new().unwrap()));
 
-        // Real WASI Preview 1 multi-file stateful DB guest:
-        // 1. Opens `counter.db` in preopened dir fd=3 (O_CREAT), reads 1-byte counter (default 0),
-        //    increments it by 1, rewrites `counter.db` (O_TRUNC).
-        // 2. Opens `wal.log` in preopened dir fd=3 (O_CREAT | FD_APPEND), appends 1 byte ('W').
-        // 3. Writes the ASCII digit of the new counter value to stdout.
         let stateful_db_wat = br#"
             (module
                 (import "wasi_snapshot_preview1" "path_open"
@@ -488,14 +683,12 @@ mod tests {
                 (func (export "_start")
                     (local $fd i32)
                     (local $cnt i32)
-                    ;; 1. Open counter.db for read (oflags=1 O_CREAT, rights_base=0x42 READ|WRITE)
                     (drop (call $path_open
                         (i32.const 3) (i32.const 0)
                         (i32.const 100) (i32.const 10)
                         (i32.const 1) (i64.const 66) (i64.const 66) (i32.const 0)
                         (i32.const 200)))
                     (local.set $fd (i32.load (i32.const 200)))
-                    ;; Read 1 byte into offset 210
                     (i32.store8 (i32.const 210) (i32.const 0))
                     (i32.store (i32.const 0) (i32.const 210))
                     (i32.store (i32.const 4) (i32.const 1))
@@ -503,7 +696,6 @@ mod tests {
                     (drop (call $fd_close (local.get $fd)))
                     (local.set $cnt (i32.add (i32.load8_u (i32.const 210)) (i32.const 1)))
 
-                    ;; 2. Re-open counter.db with O_CREAT|O_TRUNC (oflags=9) and write new count byte
                     (drop (call $path_open
                         (i32.const 3) (i32.const 0)
                         (i32.const 100) (i32.const 10)
@@ -516,7 +708,6 @@ mod tests {
                     (drop (call $fd_write (local.get $fd) (i32.const 0) (i32.const 1) (i32.const 204)))
                     (drop (call $fd_close (local.get $fd)))
 
-                    ;; 3. Open wal.log with O_CREAT (oflags=1) and FD_APPEND (fdflags=1), append 'W'
                     (drop (call $path_open
                         (i32.const 3) (i32.const 0)
                         (i32.const 120) (i32.const 7)
@@ -528,7 +719,6 @@ mod tests {
                     (drop (call $fd_write (local.get $fd) (i32.const 0) (i32.const 1) (i32.const 204)))
                     (drop (call $fd_close (local.get $fd)))
 
-                    ;; 4. Write ASCII count digit ('0' + cnt) to stdout
                     (i32.store8 (i32.const 220) (i32.add (i32.const 48) (local.get $cnt)))
                     (i32.store (i32.const 0) (i32.const 220))
                     (i32.store (i32.const 4) (i32.const 1))
@@ -542,7 +732,6 @@ mod tests {
             .await
             .unwrap();
 
-        // Fire 8 concurrent queries against the exact same cell DB
         let mut handles = Vec::new();
         for _ in 0..8 {
             let m = mount.clone();
@@ -572,14 +761,13 @@ mod tests {
             seen.push(v.as_i64().unwrap());
         }
         seen.sort();
-        // Per-cell mutex guarantees strictly serialized 1..=8 with zero lost updates
         assert_eq!(seen, vec![1, 2, 3, 4, 5, 6, 7, 8]);
 
-        // Verify multi-file manifest persisted BOTH counter.db AND wal.log (with 8 WAL entries)
         let manifest = WasmDbMount::read_manifest(&blobs, "ledger", "acct_1")
             .await
             .unwrap();
         assert_eq!(manifest.version, 8);
+        assert_eq!(manifest.fencing_token, 8);
         assert!(manifest.files.contains_key("counter.db"));
         let wal_cid = manifest.files.get("wal.log").expect("wal.log persisted");
         let wal_bytes = blobs
@@ -589,7 +777,6 @@ mod tests {
             .unwrap();
         assert_eq!(wal_bytes.len(), 8);
 
-        // Simulate full node restart: brand-new WasmDbMount & WasmRuntimeRegistry over same BlobBridge
         let fresh_registry = WasmRuntimeRegistry::new(blobs.clone());
         let fresh_mount = WasmDbMount::new(Arc::new(CrystalEngine::new().unwrap()));
         let after_restart = fresh_mount

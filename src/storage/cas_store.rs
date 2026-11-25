@@ -10,7 +10,39 @@ use crate::observability::global_metrics;
 use crate::storage::BlobBridge;
 
 const OWNERSHIP_LEDGER_KEY: &str = "ownership.json";
+const RECONCILIATION_STATE_KEY: &str = "reconciliation.json";
 const MAX_CAS_RETRIES: usize = 8;
+
+/// Durable boot/restart reconciliation flag persisted in `BlobBridge`.
+/// Normal runtime operation uses deterministic 3-state ownership `Drop` (zero GC).
+/// On startup, if `gc_pending == false`, reconciliation is an instant O(1) no-op.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReconciliationState {
+    pub gc_pending: bool,
+    pub gc_running: bool,
+    pub gc_completed_generation: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// Summary returned by `CasStore::reconcile_on_boot`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReconciliationReport {
+    pub skipped: bool,
+    pub expired_claims_recovered: usize,
+    pub orphans_reclaimed: usize,
+    pub completed_generation: u64,
+}
+
+/// Recoverable ownership transaction record persisted before publishing a manifest transition.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OwnershipTx {
+    pub tx_id: String,
+    pub owner_id: String,
+    pub acquired_cids: Vec<String>,
+    pub prev_cids: Vec<String>,
+    pub created_at_ms: u64,
+}
 
 /// Default crash-recovery TTL for stale `DeleteClaim`s (30 seconds).
 pub const DEFAULT_DELETE_CLAIM_TTL_MS: u64 = 30_000;
@@ -201,6 +233,233 @@ impl CasStore {
             );
         }
         Ok(data)
+    }
+
+    /// Mark durable `gc_pending = true` in `BlobBridge` when an interrupted transaction or
+    /// uncertain storage state requires boot/restart reconciliation.
+    pub async fn mark_reconciliation_pending(&self, bucket: &str, reason: &str) -> Result<()> {
+        for _ in 0..MAX_CAS_RETRIES {
+            let (mut state, etag) = match self
+                .read_manifest::<ReconciliationState>(bucket, RECONCILIATION_STATE_KEY)
+                .await?
+            {
+                Some((s, e)) => (s, Some(e)),
+                None => (ReconciliationState::default(), None),
+            };
+            state.gc_pending = true;
+            state.reason = Some(reason.to_string());
+            match self
+                .commit_manifest_cas(bucket, RECONCILIATION_STATE_KEY, &state, etag.as_deref())
+                .await
+            {
+                Ok(_) => return Ok(()),
+                Err(e)
+                    if e.downcast_ref::<crate::storage::blob_bridge::CasConflictError>()
+                        .is_some() =>
+                {
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        anyhow::bail!("CAS contention marking reconciliation pending in '{}'", bucket)
+    }
+
+    /// Read current durable `ReconciliationState` for `bucket`.
+    pub async fn read_reconciliation_state(&self, bucket: &str) -> Result<ReconciliationState> {
+        Ok(self
+            .read_manifest::<ReconciliationState>(bucket, RECONCILIATION_STATE_KEY)
+            .await?
+            .map(|(s, _)| s)
+            .unwrap_or_default())
+    }
+
+    /// Boot/restart/maintenance reconciliation pass:
+    /// - If `gc_pending == false` and `!force`, returns immediately (`skipped: true`, zero scanning!).
+    /// - Otherwise marks `gc_running = true`, recovers expired `DeleteClaim`s, reconciles
+    ///   unreferenced crash-leftover blobs (never touching live/tombstoned/deleting CIDs),
+    ///   and clears `gc_pending = false` + increments `gc_completed_generation` ONLY on full success.
+    pub async fn reconcile_on_boot(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        referenced_cids: &HashSet<String>,
+        claim_ttl_ms: u64,
+        force: bool,
+    ) -> Result<ReconciliationReport> {
+        let (mut state, etag) = match self
+            .read_manifest::<ReconciliationState>(bucket, RECONCILIATION_STATE_KEY)
+            .await?
+        {
+            Some((s, e)) => (s, Some(e)),
+            None => (ReconciliationState::default(), None),
+        };
+
+        if !state.gc_pending && !state.gc_running && !force {
+            return Ok(ReconciliationReport {
+                skipped: true,
+                expired_claims_recovered: 0,
+                orphans_reclaimed: 0,
+                completed_generation: state.gc_completed_generation,
+            });
+        }
+
+        state.gc_pending = true;
+        state.gc_running = true;
+        let running_etag = self
+            .commit_manifest_cas(bucket, RECONCILIATION_STATE_KEY, &state, etag.as_deref())
+            .await?;
+
+        let expired_claims_recovered = self
+            .recover_expired_delete_claims(bucket, prefix, claim_ttl_ms)
+            .await?;
+        let orphans_reclaimed = self
+            .gc_unreferenced_blobs(bucket, prefix, referenced_cids)
+            .await?;
+
+        state.gc_pending = false;
+        state.gc_running = false;
+        state.gc_completed_generation += 1;
+        state.reason = None;
+        self.commit_manifest_cas(bucket, RECONCILIATION_STATE_KEY, &state, Some(&running_etag))
+            .await?;
+
+        Ok(ReconciliationReport {
+            skipped: false,
+            expired_claims_recovered,
+            orphans_reclaimed,
+            completed_generation: state.gc_completed_generation,
+        })
+    }
+
+    /// Atomically acquire ownership of a batch of new CIDs in ONE CAS commit BEFORE publishing
+    /// a manifest (invariant: a committed manifest never references an unowned/reclaimable blob).
+    /// Fails fast with `BlobDeletingConflict` if any CID is under a `Deleting` claim.
+    pub async fn acquire_owners_batch(
+        &self,
+        bucket: &str,
+        owner_id: &str,
+        cids: &[String],
+    ) -> Result<()> {
+        if cids.is_empty() {
+            return Ok(());
+        }
+        for _ in 0..MAX_CAS_RETRIES {
+            let (mut table, etag) = match self
+                .read_manifest::<BlobOwnershipTable>(bucket, OWNERSHIP_LEDGER_KEY)
+                .await?
+            {
+                Some((t, e)) => (t, Some(e)),
+                None => (BlobOwnershipTable::default(), None),
+            };
+            for cid in cids {
+                if let Some(claim) = table.deleting.get(cid) {
+                    return Err(anyhow::Error::new(BlobDeletingConflict {
+                        cid: cid.clone(),
+                        claim_generation: claim.generation,
+                    }));
+                }
+            }
+            for cid in cids {
+                table.generation += 1;
+                table.pending_delete.remove(cid);
+                table
+                    .owners
+                    .entry(cid.clone())
+                    .or_default()
+                    .insert(owner_id.to_string());
+            }
+            match self
+                .commit_manifest_cas(bucket, OWNERSHIP_LEDGER_KEY, &table, etag.as_deref())
+                .await
+            {
+                Ok(_) => return Ok(()),
+                Err(e)
+                    if e.downcast_ref::<crate::storage::blob_bridge::CasConflictError>()
+                        .is_some() =>
+                {
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        anyhow::bail!("CAS contention acquiring batch ownership for '{}'", owner_id)
+    }
+
+    /// Atomically release ownership of a batch of superseded CIDs in ONE CAS commit AFTER
+    /// publishing a manifest, then deterministically reclaim any newly tombstoned CIDs via 3-state Drop.
+    pub async fn release_owners_batch(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        owner_id: &str,
+        cids: &[String],
+    ) -> Result<usize> {
+        if cids.is_empty() {
+            return Ok(0);
+        }
+        let mut tombstones: Vec<(String, u64)> = Vec::new();
+        let mut committed = false;
+        for _ in 0..MAX_CAS_RETRIES {
+            let Some((mut table, etag)) = self
+                .read_manifest::<BlobOwnershipTable>(bucket, OWNERSHIP_LEDGER_KEY)
+                .await?
+            else {
+                return Ok(0);
+            };
+            tombstones.clear();
+            for cid in cids {
+                if let Some(set) = table.owners.get_mut(cid) {
+                    set.remove(owner_id);
+                    if set.is_empty() {
+                        table.owners.remove(cid);
+                        table.generation += 1;
+                        let g = table.generation;
+                        table.pending_delete.insert(cid.clone(), g);
+                        tombstones.push((cid.clone(), g));
+                    }
+                }
+            }
+            match self
+                .commit_manifest_cas(bucket, OWNERSHIP_LEDGER_KEY, &table, Some(&etag))
+                .await
+            {
+                Ok(_) => {
+                    committed = true;
+                    break;
+                }
+                Err(e)
+                    if e.downcast_ref::<crate::storage::blob_bridge::CasConflictError>()
+                        .is_some() =>
+                {
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        if !committed {
+            anyhow::bail!("CAS contention releasing batch ownership for '{}'", owner_id);
+        }
+        let mut dropped = 0usize;
+        for (cid, gen_token) in tombstones {
+            if self.reclaim_tombstone(bucket, prefix, &cid, gen_token).await? {
+                dropped += 1;
+            }
+        }
+        Ok(dropped)
+    }
+
+    /// Persist a recoverable `OwnershipTx` record before committing a manifest transition.
+    pub async fn begin_ownership_tx(&self, bucket: &str, tx: &OwnershipTx) -> Result<String> {
+        let key = format!("tx/{}.json", tx.tx_id);
+        self.commit_manifest_cas(bucket, &key, tx, None).await
+    }
+
+    /// Finalize (remove) a completed `OwnershipTx` record after old CIDs are released.
+    pub async fn finalize_ownership_tx(&self, bucket: &str, tx_id: &str) -> Result<()> {
+        let key = format!("tx/{}.json", tx_id);
+        self.blobs.delete_object(bucket, &key).await?;
+        Ok(())
     }
 
     /// Safe startup reconciliation for crash-leftover blobs: NEVER deletes any CID that is
@@ -686,28 +945,29 @@ impl CasStore {
     }
 
     /// Release an active execution lease via CAS by expiring it immediately while preserving
-    /// `fencing_token` so the monotonic counter never resets backwards.
+    /// `fencing_token`. Distinguishes an already-replaced lease (`Ok(false)`) from a real storage/CAS
+    /// failure (`Err(...)`) instead of silently hiding errors.
     pub async fn release_execution_lease(
         &self,
         bucket: &str,
         lease_key: &str,
         holder: &str,
         fencing_token: u64,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let Some((mut existing, etag)) = self
             .read_manifest::<ExecutionLease>(bucket, lease_key)
             .await?
         else {
-            return Ok(());
+            return Ok(false);
         };
         if existing.holder != holder || existing.fencing_token != fencing_token {
-            return Ok(());
+            // Lease was already superseded by a newer fencing token; do not overwrite it
+            return Ok(false);
         }
         existing.expires_at_ms = 0;
-        let _ = self
-            .commit_manifest_cas(bucket, lease_key, &existing, Some(&etag))
-            .await;
-        Ok(())
+        self.commit_manifest_cas(bucket, lease_key, &existing, Some(&etag))
+            .await?;
+        Ok(true)
     }
 }
 
@@ -809,8 +1069,39 @@ mod tests {
             .renew_execution_lease("lease-test", "db.lease.json", "node-b", lease_b.fencing_token, 30_000)
             .await
             .is_ok());
-        cas.release_execution_lease("lease-test", "db.lease.json", "node-b", lease_b.fencing_token)
+        assert!(cas
+            .release_execution_lease("lease-test", "db.lease.json", "node-b", lease_b.fencing_token)
+            .await
+            .unwrap());
+
+        // 6. Boot Reconciliation Flag: O(1) skip when clean; full recovery + clear when gc_pending=true
+        let clean_rep = cas
+            .reconcile_on_boot("rec-test", "blobs/", &HashSet::new(), 0, false)
             .await
             .unwrap();
+        assert!(clean_rep.skipped);
+
+        let orphan = cas
+            .put_verified_blob("rec-test", "blobs/", Bytes::from_static(b"unowned-crash-blob"))
+            .await
+            .unwrap();
+        cas.mark_reconciliation_pending("rec-test", "simulated crash")
+            .await
+            .unwrap();
+        let dirty_rep = cas
+            .reconcile_on_boot("rec-test", "blobs/", &HashSet::new(), 0, false)
+            .await
+            .unwrap();
+        assert!(!dirty_rep.skipped);
+        assert_eq!(dirty_rep.orphans_reclaimed, 1);
+        assert_eq!(dirty_rep.completed_generation, 1);
+        assert!(cas.get_verified_blob("rec-test", "blobs/", &orphan).await.is_err());
+
+        // Next boot skips reconciliation automatically
+        let next_boot = cas
+            .reconcile_on_boot("rec-test", "blobs/", &HashSet::new(), 0, false)
+            .await
+            .unwrap();
+        assert!(next_boot.skipped);
     }
 }
