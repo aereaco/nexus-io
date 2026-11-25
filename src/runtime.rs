@@ -53,36 +53,57 @@ impl CapabilityRegistry {
             );
         };
 
+        // Core microkernel primitives (always compiled)
         reg("database", true);
-        reg("pgwire", cfg!(feature = "pgwire"));
-        reg("mysqlwire", cfg!(feature = "mysqlwire"));
-        reg("sqlite-hrana", cfg!(feature = "sqlite-hrana"));
-        reg("graphql", cfg!(feature = "graphql"));
-        reg("gql", cfg!(feature = "gql"));
-        reg("unified-multi-flavor-query", true);
         reg("gateway", true);
-        reg("wasm-runtime", cfg!(feature = "wasm-runtime"));
-        reg("oci-registry", cfg!(feature = "oci-registry"));
-        reg("sql-compat", cfg!(feature = "sql-compat"));
-        reg("js-wasm", cfg!(feature = "wasm-runtime"));
-        reg("js-native", cfg!(feature = "js-native"));
-        reg("ts-compiler", cfg!(feature = "ts-compiler"));
         reg("cells", true);
         reg("iam", true);
         reg("object-storage", true);
-        reg("p2p-storage", cfg!(feature = "p2p-storage"));
-        reg("s3-gateway", cfg!(feature = "s3-gateway"));
-        reg("shell", cfg!(feature = "shell"));
-        reg("k8s-bridge", cfg!(feature = "k8s-bridge"));
-        reg("vpn", cfg!(feature = "vpn"));
-        reg("hardware-monitoring", cfg!(feature = "hardware-monitoring"));
-        reg("surrealdb-ref", cfg!(feature = "surrealdb-ref"));
 
+        // Domain 1: Runtime
+        reg("runtime-wasm", cfg!(feature = "runtime-wasm"));
+        reg("runtime-oci", cfg!(feature = "runtime-oci"));
+
+        // Domain 2: Database (Nexus-DB granular capabilities)
+        reg("db-auth", cfg!(feature = "db-auth"));
+        reg("db-cbor", cfg!(feature = "db-cbor"));
+        reg("db-fts", cfg!(feature = "db-fts"));
+        reg("db-vector", cfg!(feature = "db-vector"));
+        reg("db-files", cfg!(feature = "db-files"));
+        reg("db-geo", cfg!(feature = "db-geo"));
+        reg("db-crypto", cfg!(feature = "db-crypto"));
+        reg("db-ml", cfg!(feature = "db-ml"));
+        reg("db-graphql", cfg!(feature = "db-graphql"));
+        reg("db-gql", cfg!(feature = "db-gql"));
+        reg("db-pgwire", cfg!(feature = "db-pgwire"));
+        reg("db-mysqlwire", cfg!(feature = "db-mysqlwire"));
+        reg("db-sqlite", cfg!(feature = "db-sqlite"));
+
+        // Domain 3: Network
+        reg("net-http3", cfg!(feature = "net-http3"));
+        reg("net-acme", cfg!(feature = "net-acme"));
+        reg("net-openapi", cfg!(feature = "net-openapi"));
+        reg("net-vpn", cfg!(feature = "net-vpn"));
+
+        // Domain 4: Storage
+        reg("storage-p2p", cfg!(feature = "storage-p2p"));
+        reg("storage-s3", cfg!(feature = "storage-s3"));
+
+        // Domain 5: Serve
+        reg("serve-web", cfg!(feature = "serve-web"));
+        reg("serve-proxy", cfg!(feature = "serve-proxy"));
+
+        // Domain 6: Operations
+        reg("ops-shell", cfg!(feature = "ops-shell"));
+        reg("ops-k8s", cfg!(feature = "ops-k8s"));
+        reg("ops-gpu", cfg!(feature = "ops-gpu"));
+
+        // Domain 7: GUI (OS-autodetected native WebView)
         let gui_desc = crate::ux::native_gui::NativeGuiDescriptor::current();
         map.insert(
-            "gui".to_string(),
+            "gui-webview".to_string(),
             CapabilityInfo {
-                name: "gui".to_string(),
+                name: "gui-webview".to_string(),
                 state: if gui_desc.compiled {
                     CapabilityState::Compiled
                 } else {
@@ -119,31 +140,15 @@ impl CapabilityRegistry {
     }
 
     pub fn active_profile() -> &'static str {
-        if cfg!(feature = "profile-dev") {
-            "profile-dev"
-        } else if cfg!(feature = "profile-full") {
-            "profile-full"
-        } else if cfg!(feature = "profile-app") {
-            "profile-app"
+        if cfg!(feature = "full") {
+            "full"
         } else {
-            "profile-core"
+            "core"
         }
     }
 
     pub fn active_os_profile() -> &'static str {
-        if cfg!(feature = "profile-windows") {
-            "profile-windows"
-        } else if cfg!(feature = "profile-linux") {
-            "profile-linux"
-        } else if cfg!(feature = "profile-macos") {
-            "profile-macos"
-        } else if cfg!(feature = "profile-android") {
-            "profile-android"
-        } else if cfg!(feature = "profile-ios") {
-            "profile-ios"
-        } else {
-            "generic"
-        }
+        std::env::consts::OS
     }
 
     pub fn snapshot_json(&self) -> serde_json::Value {

@@ -37,7 +37,7 @@ impl Command for SqlCommand {
         let query = if let Some(q) = query {
             q
         } else {
-            #[cfg(all(feature = "shell", not(any(target_os = "android", target_os = "ios"))))]
+            #[cfg(all(feature = "ops-shell", not(any(target_os = "android", target_os = "ios"))))]
             {
                 // Interactive Sub-REPL
                 use rustyline::error::ReadlineError;
@@ -93,7 +93,7 @@ impl Command for SqlCommand {
                                         println!("[]");
                                     }
                                 },
-                                Err(e) => eprintln!("❌ System Error: {}", e),
+                                Err(e) => eprintln!("âŒ System Error: {}", e),
                             }
                         },
                         Err(ReadlineError::Interrupted) => {
@@ -111,7 +111,7 @@ impl Command for SqlCommand {
                 }
                 return Ok(PipelineData::empty());
             }
-            #[cfg(not(all(feature = "shell", not(any(target_os = "android", target_os = "ios")))))]
+            #[cfg(not(all(feature = "ops-shell", not(any(target_os = "android", target_os = "ios")))))]
             {
                 return Err(crate::shell_err(
                     "Interactive SQL REPL not compiled",

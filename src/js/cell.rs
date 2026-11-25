@@ -1,18 +1,10 @@
 use anyhow::Result;
-#[cfg(feature = "js-native")]
-use quickrs_core::context::Context;
-#[cfg(feature = "js-native")]
-use quickrs_core::object::{PropFlags, Property};
-#[cfg(feature = "js-native")]
-use quickrs_core::value::{JsResult, PropKey, Value as JsValue};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use nexus_db::Value as DbValue;
 use tokio::sync::RwLock;
 
-#[cfg(feature = "js-native")]
-use crate::db::sql_compiler::{compile_sql_to_surql, SqlDialect};
 use crate::db::sql_compiler::execute_unified_query;
 use crate::db::StateEngine;
 use crate::storage::BlobBridge;
@@ -43,7 +35,7 @@ pub enum MeshDbRole {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CellDbMode {
-    /// Stateless cell — zero DB allocation or exposure.
+    /// Stateless cell â€” zero DB allocation or exposure.
     None,
     /// Dedicated isolated `(app, cell_id)` `nexus-db` instance.
     Dedicated,
@@ -300,19 +292,6 @@ struct ActiveCell {
     last_active: Instant,
 }
 
-#[cfg(feature = "js-native")]
-struct CellScope {
-    engine: Arc<dyn StateEngine>,
-    app: String,
-    cell_id: String,
-    db_config: CellDbConfig,
-}
-
-#[cfg(feature = "js-native")]
-thread_local! {
-    static ACTIVE_CELL_SCOPE: std::cell::RefCell<Option<CellScope>> = std::cell::RefCell::new(None);
-}
-
 /// Unified `CellManager` actor pool supporting both `pinned` and `elastic` (`celld`) cells
 /// on top of Wasmtime (`CrystalEngine`, `WasmRuntimeRegistry`, `WasmDbMount`), `StateEngine` (`nexus-db`),
 /// and `BlobBridge`, with declarative per-cell `CellDbConfig` (topology mode, query flavors, transports).
@@ -320,11 +299,11 @@ thread_local! {
 pub struct CellManager {
     engine: Arc<dyn StateEngine>,
     blobs: Arc<BlobBridge>,
-    #[cfg(feature = "wasm-runtime")]
+    #[cfg(feature = "runtime-wasm")]
     crystal: Arc<crate::compute::crystal::CrystalEngine>,
-    #[cfg(feature = "wasm-runtime")]
+    #[cfg(feature = "runtime-wasm")]
     runtimes: crate::compute::wasm_registry::WasmRuntimeRegistry,
-    #[cfg(feature = "wasm-runtime")]
+    #[cfg(feature = "runtime-wasm")]
     wasm_db: crate::compute::wasm_db::WasmDbMount,
     active: Arc<RwLock<HashMap<CellKey, ActiveCell>>>,
     states: Arc<RwLock<HashMap<CellKey, CellLifecycleState>>>,
@@ -333,23 +312,23 @@ pub struct CellManager {
 
 impl CellManager {
     pub fn new(engine: Arc<dyn StateEngine>, blobs: Arc<BlobBridge>) -> Self {
-        #[cfg(feature = "wasm-runtime")]
+        #[cfg(feature = "runtime-wasm")]
         let crystal = Arc::new(
             crate::compute::crystal::CrystalEngine::new()
                 .expect("failed to initialize shared Wasmtime CrystalEngine"),
         );
-        #[cfg(feature = "wasm-runtime")]
+        #[cfg(feature = "runtime-wasm")]
         let runtimes = crate::compute::wasm_registry::WasmRuntimeRegistry::new(blobs.clone());
-        #[cfg(feature = "wasm-runtime")]
+        #[cfg(feature = "runtime-wasm")]
         let wasm_db = crate::compute::wasm_db::WasmDbMount::new(crystal.clone());
         Self {
             engine,
             blobs,
-            #[cfg(feature = "wasm-runtime")]
+            #[cfg(feature = "runtime-wasm")]
             crystal,
-            #[cfg(feature = "wasm-runtime")]
+            #[cfg(feature = "runtime-wasm")]
             runtimes,
-            #[cfg(feature = "wasm-runtime")]
+            #[cfg(feature = "runtime-wasm")]
             wasm_db,
             active: Arc::new(RwLock::new(HashMap::new())),
             states: Arc::new(RwLock::new(HashMap::new())),
@@ -370,7 +349,7 @@ impl CellManager {
             .unwrap_or(CellLifecycleState::Declared)
     }
 
-    #[cfg(feature = "wasm-runtime")]
+    #[cfg(feature = "runtime-wasm")]
     pub fn runtimes(&self) -> &crate::compute::wasm_registry::WasmRuntimeRegistry {
         &self.runtimes
     }
@@ -588,7 +567,7 @@ impl CellManager {
 
     /// Wake a JS/TS cell backed by a registered WASI JavaScript engine (`quickjs.wasm` / Javy)
     /// resolved from `WasmRuntimeRegistry` (preferring pre-compiled AOT `.cwasm`).
-    #[cfg(feature = "wasm-runtime")]
+    #[cfg(feature = "runtime-wasm")]
     pub async fn wake_js_wasm(
         &self,
         app: &str,
@@ -634,7 +613,7 @@ impl CellManager {
         let cfg = self.get_db_config(app, cell_id).await;
         let binding = Self::check_db_config(&cfg, app, cell_id, transport, flavor)?;
 
-        #[cfg(feature = "wasm-runtime")]
+        #[cfg(feature = "runtime-wasm")]
         if let CellDbMode::WasmEngine {
             engine,
             module_cid,
@@ -705,7 +684,7 @@ impl CellManager {
 
     /// Invoke an HTTP request against a Wasmtime cell (`WasiCgi`, `WasiModule`, or `JsOnWasm`)
     /// with its `NexusHostContext` (`CellDbConfig`, `StateEngine`, `BlobBridge`) automatically attached.
-    #[cfg(all(feature = "wasm-runtime", not(target_os = "ios")))]
+    #[cfg(all(feature = "runtime-wasm", not(target_os = "ios")))]
     pub async fn invoke_http(
         &self,
         app: &str,
@@ -721,7 +700,7 @@ impl CellManager {
 
     /// Same as `invoke_http`, propagating an end-to-end correlation `request_id` (`X-Request-Id`)
     /// into `NexusHostContext` for structured host logs & diagnostics.
-    #[cfg(all(feature = "wasm-runtime", not(target_os = "ios")))]
+    #[cfg(all(feature = "runtime-wasm", not(target_os = "ios")))]
     #[allow(clippy::too_many_arguments)]
     pub async fn invoke_http_with_request_id(
         &self,
@@ -898,75 +877,11 @@ impl CellManager {
             .await
     }
 
-    /// Execute a request/expression inside the scoped cell (requires `js-native` compatibility feature;
-    /// for Wasmtime cells use `wake_js_wasm` / `wake_workload` + `invoke_http`).
-    #[cfg(feature = "js-native")]
-    pub async fn eval_in_cell(&self, app: &str, cell_id: &str, expr: &str) -> Result<String> {
-        let key = CellKey {
-            app: app.to_string(),
-            cell_id: cell_id.to_string(),
-        };
-
-        let script = {
-            let mut map = self.active.write().await;
-            let cell = map
-                .get_mut(&key)
-                .ok_or_else(|| anyhow::anyhow!("Cell {}/{} is not awake", app, cell_id))?;
-            cell.last_active = Instant::now();
-            match &cell.workload {
-                CellWorkload::NativeJs { script } | CellWorkload::JsOnWasm { script, .. } => {
-                    script.clone()
-                }
-                _ => anyhow::bail!(
-                    "Cell {}/{} is a Wasmtime binary workload; invoke it via CellManager::invoke_http",
-                    app,
-                    cell_id
-                ),
-            }
-        };
-
-        let engine = self.engine.clone();
-        let db_config = self.get_db_config(app, cell_id).await;
-        let app_owned = app.to_string();
-        let cell_owned = cell_id.to_string();
-        let expr_owned = expr.to_string();
-
-        tokio::task::block_in_place(move || {
-            ACTIVE_CELL_SCOPE.with(|s| {
-                *s.borrow_mut() = Some(CellScope {
-                    engine,
-                    app: app_owned,
-                    cell_id: cell_owned,
-                    db_config,
-                });
-            });
-
-            let mut ctx = create_cell_context();
-
-            // Transpile TypeScript cell script if needed
-            let js_script = if super::transformer::is_likely_ts(&script) {
-                super::transformer::transform_ts_to_js(&script).unwrap_or(script)
-            } else {
-                script
-            };
-
-            let res = ctx
-                .eval_and_run_jobs(&js_script)
-                .and_then(|_| ctx.eval_and_run_jobs(&expr_owned));
-
-            ACTIVE_CELL_SCOPE.with(|s| *s.borrow_mut() = None);
-
-            match res {
-                Ok(val) => Ok(js_val_to_string(&val)),
-                Err(e) => Err(anyhow::anyhow!("Cell execution error: {:?}", e)),
-            }
-        })
-    }
-
-    #[cfg(not(feature = "js-native"))]
+    /// Direct native QuickJS eval has been removed in favor of Wasmtime guest cells.
+    /// Run JS/TS cells via `wake_js_wasm` / `wake_workload` + `invoke_http`.
     pub async fn eval_in_cell(&self, app: &str, cell_id: &str, _expr: &str) -> Result<String> {
         anyhow::bail!(
-            "Native QuickJS (`js-native`) is disabled in `profile-core`. Run cell {}/{} via Wasmtime (`wake_js_wasm` / `wake_workload` + `invoke_http`) or enable `--features js-native`.",
+            "Nexus-IO uses Wasmtime as its sole guest runtime. Run cell {}/{} via `wake_js_wasm` / `wake_workload` + `invoke_http`.",
             app,
             cell_id
         )
@@ -1015,7 +930,7 @@ impl CellManager {
             .write()
             .await
             .insert(key, CellLifecycleState::Hibernated);
-        #[cfg(feature = "wasm-runtime")]
+        #[cfg(feature = "runtime-wasm")]
         let _ = self.wasm_db.evict_idle_locks().await;
         crate::observability::global_metrics().inc_cell_hibernate();
         Ok(())
@@ -1045,358 +960,11 @@ impl CellManager {
     }
 }
 
-#[cfg(feature = "js-native")]
-use native_js::{create_cell_context, js_val_to_string};
-
-#[cfg(feature = "js-native")]
-mod native_js {
-use super::*;
-
-pub(super) fn create_cell_context() -> Context {
-    let mut ctx = Context::new();
-    let global = ctx.global();
-
-    let register = |c: &mut Context, name: &str, arity: u32, func: quickrs_core::object::NativeFn| {
-        let f = c.new_native_function(func, name, arity, 0);
-        let key = PropKey::from_string(&c.intern(name));
-        c.define_own(&global, key, Property::data(JsValue::Object(f), PropFlags::C_W_E));
-    };
-
-    register(&mut ctx, "__cell_query", 3, cell_unified_query_cb);
-    register(&mut ctx, "__cell_kv_get", 1, cell_kv_get_cb);
-    register(&mut ctx, "__cell_kv_put", 2, cell_kv_put_cb);
-    register(&mut ctx, "__cell_kv_delete", 1, cell_kv_delete_cb);
-
-    // Unified multi-flavor `ctx.db.query(q, { flavor, params })` ('surql'|'sqlite'|'postgres'|'mysql'|'graphql'|'gql')
-    // plus ergonomic Cloudflare Durable Objects / celld compatible `ctx.storage` aliases.
-    let _ = ctx.eval(
-        r#"
-        const __query = (query, opts = {}) => {
-            const flavor = typeof opts === 'string' ? opts : (opts.flavor || 'surql');
-            const params = Array.isArray(opts) ? opts : (opts.params || []);
-            return __cell_query(flavor, query, params);
-        };
-        globalThis.ctx = {
-            db: {
-                query: __query,
-            },
-            storage: {
-                query: __query,
-                sql: {
-                    exec(query, ...bindings) {
-                        const rows = __cell_query('sqlite', query, bindings);
-                        return {
-                            toArray() { return rows; },
-                            one() { return rows[0] ?? null; },
-                        };
-                    }
-                },
-                surreal: {
-                    query(surql) { return __cell_query('surql', surql, []); }
-                },
-                get(key) { return __cell_kv_get(String(key)); },
-                put(key, val) { return __cell_kv_put(String(key), val); },
-                delete(key) { return __cell_kv_delete(String(key)); },
-            }
-        };
-        "#,
-    );
-
-    // Install WinterCG Web Standard globals (`Request`, `Response`, `Headers`, `URL`, `crypto`, `TextEncoder`/`TextDecoder`, `Deno.openKv`)
-    super::super::wintercg::install_wintercg_globals(&mut ctx);
-
-    ctx
-}
-
-fn js_to_db(val: &JsValue) -> DbValue {
-    match val {
-        JsValue::Undefined | JsValue::Uninitialized | JsValue::Null => DbValue::Null,
-        JsValue::Bool(b) => DbValue::Bool(*b),
-        JsValue::Int(i) => DbValue::Int(*i as i64),
-        JsValue::Float(f) => DbValue::Float(*f),
-        JsValue::Str(s) => DbValue::String(s.to_string()),
-        other => DbValue::String(format!("{:?}", other)),
-    }
-}
-
-pub(super) fn js_val_to_string(val: &JsValue) -> String {
-    match val {
-        JsValue::Undefined | JsValue::Uninitialized => "undefined".to_string(),
-        JsValue::Null => "null".to_string(),
-        JsValue::Bool(b) => b.to_string(),
-        JsValue::Int(i) => i.to_string(),
-        JsValue::Float(f) => f.to_string(),
-        JsValue::Str(s) => s.to_string(),
-        other => format!("{:?}", other),
-    }
-}
-
-fn cell_unified_query_cb(
-    ctx: &mut Context,
-    _this: &JsValue,
-    args: &[JsValue],
-    _magic: i32,
-) -> JsResult<JsValue> {
-    let flavor = args
-        .first()
-        .map(js_val_to_string)
-        .unwrap_or_else(|| "surql".into())
-        .to_ascii_lowercase();
-    let query = args.get(1).map(js_val_to_string).unwrap_or_default();
-    let mut bind_args = Vec::new();
-    if let Some(JsValue::Object(arr_obj)) = args.get(2) {
-        let borrowed = arr_obj.borrow();
-        if let quickrs_core::object::ObjectData::Array(arr) = &borrowed.data {
-            for elem in &arr.elements {
-                bind_args.push(js_to_db(elem));
-            }
-        }
-    }
-
-    // Unified CellDbConfig gate + fast path when backed directly by `NexusDb`
-    let scope = ACTIVE_CELL_SCOPE.with(|s| {
-        s.borrow()
-            .as_ref()
-            .map(|sc| (sc.engine.clone(), sc.app.clone(), sc.cell_id.clone(), sc.db_config.clone()))
-    });
-    if let Some((ref engine, ref app, ref cell_id, ref db_cfg)) = scope {
-        let binding = match CellManager::check_db_config(
-            db_cfg,
-            app,
-            cell_id,
-            CellDbTransport::Internal,
-            &flavor,
-        ) {
-            Ok(b) => b,
-            Err(e) => {
-                let err_obj = ctx.new_object();
-                let k = PropKey::from_string(&ctx.intern("error"));
-                let v = JsValue::Str(ctx.intern(&e.to_string()));
-                ctx.define_own(&err_obj, k, Property::data(v, PropFlags::C_W_E));
-                return Ok(JsValue::Object(err_obj));
-            }
-        };
-        if let Some(nexus) = engine.as_nexus_db() {
-            let auth_opt = if binding.read_only {
-                Some(nexus_db::auth::AuthContext {
-                    level: nexus_db::auth::AuthLevel::Database(
-                        binding.target_ns.clone(),
-                        binding.target_db.clone(),
-                    ),
-                    roles: vec![nexus_db::auth::Role::Viewer],
-                    actor: Some(format!("cell:{}/{}", app, cell_id)),
-                    access_name: None,
-                    token_claims: None,
-                })
-            } else {
-                None
-            };
-            let res_json = match execute_unified_query(
-                nexus,
-                &binding.target_ns,
-                &binding.target_db,
-                &flavor,
-                &query,
-                bind_args,
-                auth_opt,
-            ) {
-                Ok(v) => v,
-                Err(e) => serde_json::json!({ "error": e.to_string() }),
-            };
-            let json_str = serde_json::to_string(&res_json).unwrap_or_else(|_| "null".into());
-            return ctx.eval(&format!("({})", json_str));
-        }
-    }
-
-    match flavor.as_str() {
-        "surql" | "surreal" | "surrealql" => run_cell_query(ctx, &query, vec![]),
-        "sqlite" | "postgres" | "pg" | "postgresql" | "mysql" => {
-            let dialect = match flavor.as_str() {
-                "postgres" | "pg" | "postgresql" => SqlDialect::Postgres,
-                "mysql" => SqlDialect::Mysql,
-                _ => SqlDialect::Sqlite,
-            };
-            match compile_sql_to_surql(dialect, &query, bind_args) {
-                Ok(c) => run_cell_query(ctx, &c.surql, c.bindings),
-                Err(e) => {
-                    let err_obj = ctx.new_object();
-                    let k = PropKey::from_string(&ctx.intern("error"));
-                    let v = JsValue::Str(ctx.intern(&e.to_string()));
-                    ctx.define_own(&err_obj, k, Property::data(v, PropFlags::C_W_E));
-                    Ok(JsValue::Object(err_obj))
-                }
-            }
-        }
-        other => {
-            let err_obj = ctx.new_object();
-            let k = PropKey::from_string(&ctx.intern("error"));
-            let v = JsValue::Str(ctx.intern(&format!("Unsupported query flavor '{}'", other)));
-            ctx.define_own(&err_obj, k, Property::data(v, PropFlags::C_W_E));
-            Ok(JsValue::Object(err_obj))
-        }
-    }
-}
-
-fn run_cell_query(
-    ctx: &mut Context,
-    surql: &str,
-    bindings: Vec<(String, DbValue)>,
-) -> JsResult<JsValue> {
-    let scope = ACTIVE_CELL_SCOPE.with(|s| {
-        s.borrow().as_ref().map(|sc| (sc.engine.clone(), sc.app.clone(), sc.cell_id.clone()))
-    });
-    let Some((engine, app, cell_id)) = scope else {
-        return Ok(JsValue::Undefined);
-    };
-
-    let rt = tokio::runtime::Handle::current();
-    let rows = rt.block_on(async move { engine.query_scoped(&app, &cell_id, surql, bindings).await });
-
-    match rows {
-        Ok(list) => {
-            let items: Vec<JsValue> = list.into_iter().map(|v| super::super::surreal_to_js(ctx, v)).collect();
-            Ok(JsValue::Object(ctx.new_array_from(items)))
-        }
-        Err(e) => {
-            let err_obj = ctx.new_object();
-            let k = PropKey::from_string(&ctx.intern("error"));
-            let v = JsValue::Str(ctx.intern(&e.to_string()));
-            ctx.define_own(&err_obj, k, Property::data(v, PropFlags::C_W_E));
-            Ok(JsValue::Object(err_obj))
-        }
-    }
-}
-
-fn cell_kv_get_cb(
-    ctx: &mut Context,
-    _this: &JsValue,
-    args: &[JsValue],
-    _magic: i32,
-) -> JsResult<JsValue> {
-    let key = args.first().map(js_val_to_string).unwrap_or_default();
-    let scope = ACTIVE_CELL_SCOPE.with(|s| {
-        s.borrow().as_ref().map(|sc| (sc.engine.clone(), sc.app.clone(), sc.cell_id.clone()))
-    });
-    let Some((engine, app, cell_id)) = scope else {
-        return Ok(JsValue::Undefined);
-    };
-    let rt = tokio::runtime::Handle::current();
-    match rt.block_on(async move { engine.kv_get(&app, &cell_id, &key).await }) {
-        Ok(Some(v)) => Ok(super::super::surreal_to_js(ctx, v)),
-        _ => Ok(JsValue::Undefined),
-    }
-}
-
-fn cell_kv_put_cb(
-    _ctx: &mut Context,
-    _this: &JsValue,
-    args: &[JsValue],
-    _magic: i32,
-) -> JsResult<JsValue> {
-    let key = args.first().map(js_val_to_string).unwrap_or_default();
-    let val = args.get(1).map(js_to_db).unwrap_or(DbValue::Null);
-    let scope = ACTIVE_CELL_SCOPE.with(|s| {
-        s.borrow().as_ref().map(|sc| (sc.engine.clone(), sc.app.clone(), sc.cell_id.clone()))
-    });
-    let Some((engine, app, cell_id)) = scope else {
-        return Ok(JsValue::Undefined);
-    };
-    let rt = tokio::runtime::Handle::current();
-    let _ = rt.block_on(async move { engine.kv_put(&app, &cell_id, &key, val).await });
-    Ok(JsValue::Undefined)
-}
-
-fn cell_kv_delete_cb(
-    _ctx: &mut Context,
-    _this: &JsValue,
-    args: &[JsValue],
-    _magic: i32,
-) -> JsResult<JsValue> {
-    let key = args.first().map(js_val_to_string).unwrap_or_default();
-    let scope = ACTIVE_CELL_SCOPE.with(|s| {
-        s.borrow().as_ref().map(|sc| (sc.engine.clone(), sc.app.clone(), sc.cell_id.clone()))
-    });
-    let Some((engine, app, cell_id)) = scope else {
-        return Ok(JsValue::Undefined);
-    };
-    let rt = tokio::runtime::Handle::current();
-    let _ = rt.block_on(async move { engine.kv_delete(&app, &cell_id, &key).await });
-    Ok(JsValue::Undefined)
-}
-} // mod native_js
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::db::Database;
-
-    #[cfg(feature = "js-native")]
-    #[test]
-    fn elastic_cell_supports_sqlite_api_surrealql_and_hibernation() {
-        std::thread::Builder::new()
-            .stack_size(16 * 1024 * 1024)
-            .spawn(|| {
-                let rt = tokio::runtime::Builder::new_multi_thread()
-                    .enable_all()
-                    .thread_stack_size(16 * 1024 * 1024)
-                    .build()
-                    .unwrap();
-                rt.block_on(Box::pin(async {
-                    let db = Arc::new(Database::open_mem());
-                    let blobs = Arc::new(BlobBridge::new(db.clone()).await.unwrap());
-                    let manager = CellManager::new(db.clone(), blobs);
-
-                    let js_cell = r#"
-                        ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS todos (title TEXT, done INT)");
-                        function addTodo(t) {
-                            ctx.storage.sql.exec("INSERT INTO todos (title, done) VALUES (?, ?)", t.title, t.done);
-                            ctx.storage.put("last_title", t.title);
-                            return ctx.storage.sql.exec("SELECT title FROM todos WHERE done = ?", 0).toArray().length;
-                        }
-                    "#;
-
-                    // 1. Wake elastic cell (acquires CAS lease)
-                    manager
-                        .wake("demo_app", "room_1", CellPolicy::elastic_default(), js_cell.to_string())
-                        .await
-                        .unwrap();
-
-                    // 2. Write via SQLite API + KV, then read the exact same records via SurrealQL
-                    let count = manager
-                        .eval_in_cell("demo_app", "room_1", r#"addTodo({ title: "ship celld", done: 0 })"#)
-                        .await
-                        .unwrap();
-                    assert_eq!(count, "1");
-
-                    let surql_check = manager
-                        .eval_in_cell(
-                            "demo_app",
-                            "room_1",
-                            r#"ctx.storage.surreal.query("SELECT title FROM todos")[0].title"#,
-                        )
-                        .await
-                        .unwrap();
-                    assert_eq!(surql_check, "ship celld");
-
-                    // 3. Hibernate cell (flushes snapshot to BlobBridge + releases CAS lease)
-                    manager.hibernate("demo_app", "room_1").await.unwrap();
-
-                    // 4. Re-wake cell and verify KV state survived hibernation
-                    manager
-                        .wake("demo_app", "room_1", CellPolicy::elastic_default(), js_cell.to_string())
-                        .await
-                        .unwrap();
-                    let restored = manager
-                        .eval_in_cell("demo_app", "room_1", r#"ctx.storage.get("last_title")"#)
-                        .await
-                        .unwrap();
-                    assert_eq!(restored, "ship celld");
-                }));
-            })
-            .unwrap()
-            .join()
-            .unwrap();
-    }
 
     #[test]
     fn cell_db_config_enforces_stateless_reference_mesh_flavors_and_transports() {
@@ -1466,7 +1034,7 @@ mod tests {
         assert!(m_bound.read_only);
     }
 
-    #[cfg(all(feature = "wasm-runtime", not(target_os = "ios")))]
+    #[cfg(all(feature = "runtime-wasm", not(target_os = "ios")))]
     #[tokio::test(flavor = "multi_thread")]
     async fn end_to_end_quickjs_wasm_cell_and_wasm_db_engine_via_cell_manager() {
         let db = Arc::new(Database::open_mem());

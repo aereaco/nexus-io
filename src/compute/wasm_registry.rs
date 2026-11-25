@@ -95,17 +95,17 @@ pub const SUPPORTED_WASM_MEDIA_TYPES: &[&str] = &[
     "application/vnd.oci.image.layer.v1.tar+wasm",
 ];
 
-#[cfg(feature = "oci-registry")]
+#[cfg(feature = "runtime-oci")]
 pub const MAX_OCI_MANIFEST_BYTES: usize = 1024 * 1024; // 1 MiB
-#[cfg(feature = "oci-registry")]
+#[cfg(feature = "runtime-oci")]
 pub const MAX_OCI_POLICY_BYTES: usize = 256 * 1024; // 256 KiB
-#[cfg(feature = "oci-registry")]
+#[cfg(feature = "runtime-oci")]
 pub const DEFAULT_MAX_OCI_WASM_BYTES: usize = 64 * 1024 * 1024; // 64 MiB
 
 /// Optional Nexus-specific capability & policy manifest embedded in an OCI Wasm artifact
 /// (`application/vnd.nexus.policy.v1+json`).
 ///
-/// SECURITY CONTRACT: Treated strictly as *requested* capabilities — never self-granted authority.
+/// SECURITY CONTRACT: Treated strictly as *requested* capabilities â€” never self-granted authority.
 /// The local microkernel IAM and operator policy always cap or approve actual runtime grants.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NexusPackagePolicy {
@@ -221,6 +221,32 @@ pub enum ResolvedRuntime {
     Aot(Vec<u8>),
     /// Raw `.wasm` or `.wat` module bytes (compiled via Cranelift on non-iOS).
     Wasm(Vec<u8>),
+}
+
+/// 8-byte magic header for self-verifying derived AOT `.cwasm` cache envelopes:
+/// `[b"NXAOT01\0" (8 bytes)][blake3(payload) (32 bytes)][raw .cwasm payload]`.
+const AOT_ENVELOPE_MAGIC: &[u8; 8] = b"NXAOT01\0";
+
+fn encode_aot_envelope(cwasm: &[u8]) -> Bytes {
+    let digest = blake3::hash(cwasm);
+    let mut out = Vec::with_capacity(8 + 32 + cwasm.len());
+    out.extend_from_slice(AOT_ENVELOPE_MAGIC);
+    out.extend_from_slice(digest.as_bytes());
+    out.extend_from_slice(cwasm);
+    Bytes::from(out)
+}
+
+fn decode_verified_aot_envelope(raw: &[u8]) -> Option<Vec<u8>> {
+    if raw.len() < 40 || &raw[..8] != AOT_ENVELOPE_MAGIC {
+        return None;
+    }
+    let expected = &raw[8..40];
+    let payload = &raw[40..];
+    if blake3::hash(payload).as_bytes() == expected {
+        Some(payload.to_vec())
+    } else {
+        None
+    }
 }
 
 /// Content-addressed, restart-persistent registry of WASI guest runtimes stored in `BlobBridge`
@@ -423,14 +449,14 @@ impl WasmRuntimeRegistry {
         let compat = current_aot_compat_key();
         #[cfg(not(target_os = "ios"))]
         let (aot_cached, aot_compat) = {
-            let aot_bytes = Bytes::from(compiled_aot);
-            // Publish derived AOT artifact atomically keyed by `(compat_key, cid)`
+            let aot_envelope = encode_aot_envelope(&compiled_aot);
+            // Publish self-verifying derived AOT artifact atomically keyed by `(compat_key, cid)`
             let _ = self
                 .blobs
                 .put_object_cas(
                     RUNTIMES_BUCKET,
                     &format!("aot-cid/{}/{}.cwasm", compat, cid),
-                    aot_bytes,
+                    aot_envelope,
                     None,
                     true,
                 )
@@ -478,12 +504,12 @@ impl WasmRuntimeRegistry {
     /// Pull a Wasm guest runtime from any OCI Distribution v2 registry (GHCR, Docker Hub, Zot,
     /// Wasm Directory / `wkg`, or local OCI mirror) with full transport & artifact hardening:
     /// - Enforces HTTPS for remote registries (unless `NEXUS_OCI_ALLOW_INSECURE=1` or loopback).
-    /// - Strips `Authorization` Bearer credentials on cross-origin redirects & blocks HTTPS→HTTP downgrade.
+    /// - Strips `Authorization` Bearer credentials on cross-origin redirects & blocks HTTPSâ†’HTTP downgrade.
     /// - Verifies manifest SHA-256 when pinned by `@sha256:...` digest.
     /// - Requires an explicitly supported Wasm media type (no blind fallback).
     /// - Enforces streaming byte caps on manifests (1 MiB), policies (256 KiB), and Wasm blobs (64 MiB default).
     /// - Verifies SHA-256 digest of both Wasm and policy layers before AOT compilation & durable catalog commit.
-    #[cfg(feature = "oci-registry")]
+    #[cfg(feature = "runtime-oci")]
     pub async fn pull_oci(
         &self,
         alias_name: Option<&str>,
@@ -504,7 +530,7 @@ impl WasmRuntimeRegistry {
         .await
     }
 
-    #[cfg(feature = "oci-registry")]
+    #[cfg(feature = "runtime-oci")]
     pub async fn pull_oci_with_limits(
         &self,
         alias_name: Option<&str>,
@@ -683,20 +709,33 @@ impl WasmRuntimeRegistry {
             .map(|rec| rec.cid)
             .unwrap_or_else(|| key.clone());
 
-        // 2. Check derived AOT cache strictly keyed by `(compat_key, cid)`
+        // 2. Check derived AOT cache strictly keyed by `(compat_key, cid)` with BLAKE3 integrity check.
+        //    If a cached `.cwasm` envelope fails integrity verification, evict it and fall through to
+        //    transparently rebuild from the authoritative BLAKE3-verified `cid/<cid>` `.wasm` source.
         let aot_cid_key = format!("aot-cid/{}/{}.cwasm", compat, resolved_cid);
         if let Some(bytes) = self.blobs.get_object(RUNTIMES_BUCKET, &aot_cid_key).await? {
-            return Ok(ResolvedRuntime::Aot(bytes.to_vec()));
+            if let Some(verified_cwasm) = decode_verified_aot_envelope(&bytes) {
+                return Ok(ResolvedRuntime::Aot(verified_cwasm));
+            }
+            // Derived cache corrupted: evict bad cache entry and self-heal from authoritative source
+            let _ = self.blobs.delete_object(RUNTIMES_BUCKET, &aot_cid_key).await;
         }
 
-        // 3. Derived AOT cache miss: load and BLAKE3-verify the authoritative owned `cid/<cid>`
-        //    `.wasm` blob BEFORE compiling, then atomically publish the derived `.cwasm` cache.
-        if let Ok(verified_wasm) = self
-            .cas
-            .get_verified_blob(RUNTIMES_BUCKET, "cid/", &resolved_cid)
-            .await
-        {
-            let wasm_bytes = verified_wasm.to_vec();
+        // 3. Derived AOT cache miss: distinguish genuinely missing `cid/<cid>` from corruption or
+        //    storage failure! A corrupted authoritative source MUST fail explicitly â€” never fall through.
+        let cid_key = format!("cid/{}", resolved_cid);
+        if let Some(raw_source) = self.blobs.get_object(RUNTIMES_BUCKET, &cid_key).await? {
+            let actual_cid = blake3::hash(&raw_source).to_hex().to_string();
+            if actual_cid != resolved_cid {
+                anyhow::bail!(
+                    "Authoritative Wasm runtime source '{}/{}' failed BLAKE3 integrity verification (expected {}, got {})",
+                    RUNTIMES_BUCKET,
+                    cid_key,
+                    resolved_cid,
+                    actual_cid
+                );
+            }
+            let wasm_bytes = raw_source.to_vec();
             #[cfg(not(target_os = "ios"))]
             {
                 let input = wasm_bytes.clone();
@@ -706,12 +745,12 @@ impl WasmRuntimeRegistry {
                 })
                 .await
                 {
-                    let aot_b = Bytes::from(compiled.clone());
+                    let aot_envelope = encode_aot_envelope(&compiled);
                     // Atomic create-if-absent publication: concurrent misses racing on the exact
                     // same `(compat, cid)` key cannot produce partial or inconsistent artifacts.
                     let _ = self
                         .blobs
-                        .put_object_cas(RUNTIMES_BUCKET, &aot_cid_key, aot_b, None, true)
+                        .put_object_cas(RUNTIMES_BUCKET, &aot_cid_key, aot_envelope, None, true)
                         .await;
                     return Ok(ResolvedRuntime::Aot(compiled));
                 }
@@ -761,7 +800,7 @@ impl WasmRuntimeRegistry {
     }
 }
 
-#[cfg(feature = "oci-registry")]
+#[cfg(feature = "runtime-oci")]
 mod oci_client {
     use anyhow::{anyhow, Context, Result};
     use bytes::Bytes;
@@ -802,7 +841,7 @@ mod oci_client {
     }
 
     /// Hardened OCI Distribution v2 HTTP/HTTPS GET client:
-    /// - Strips Bearer credentials on cross-origin redirects & blocks HTTPS→HTTP downgrades.
+    /// - Strips Bearer credentials on cross-origin redirects & blocks HTTPSâ†’HTTP downgrades.
     /// - Enforces hard streaming size cap `max_bytes` before buffering into memory.
     /// - Handles RFC-compliant `WWW-Authenticate: Bearer` token exchange with percent-encoding.
     pub(super) async fn oci_http_get(
@@ -1124,9 +1163,9 @@ mod tests {
         assert_eq!(listed[0].name, "quickjs");
         assert_eq!(listed[0].cid, rec.cid);
 
-        // Derived AOT cache contract: deleting EVERY AOT `.cwasm` cache entry affects only
-        // latency, never correctness or availability — `resolve_runtime` transparently rebuilds
-        // from the verified owned `cid/<cid>` `.wasm` blob and atomically re-caches it.
+        // Derived AOT cache contract: deleting OR corrupting an AOT `.cwasm` cache entry affects
+        // only latency, never correctness or availability â€” `resolve_runtime` detects corruption
+        // via the NXAOT01 BLAKE3 envelope, evicts the bad cache entry, and rebuilds from `cid/<cid>`.
         let compat = current_aot_compat_key();
         let aot_cid_key = format!("aot-cid/{}/{}.cwasm", compat, rec.cid);
         blobs.delete_object(RUNTIMES_BUCKET, &aot_cid_key).await.unwrap();
@@ -1134,6 +1173,35 @@ mod tests {
         let resolved = reg2.resolve_runtime("quickjs").await.unwrap();
         assert!(matches!(resolved, ResolvedRuntime::Aot(_)));
         assert!(blobs.get_object(RUNTIMES_BUCKET, &aot_cid_key).await.unwrap().is_some());
+
+        // Corrupt derived AOT cache entry -> self-heals transparently
+        blobs
+            .put_object(RUNTIMES_BUCKET, &aot_cid_key, Bytes::from_static(b"CORRUPTED-AOT-CACHE"))
+            .await
+            .unwrap();
+        let healed = reg2.resolve_runtime("quickjs").await.unwrap();
+        assert!(matches!(healed, ResolvedRuntime::Aot(_)));
+        let healed_raw = blobs.get_object(RUNTIMES_BUCKET, &aot_cid_key).await.unwrap().unwrap();
+        assert!(decode_verified_aot_envelope(&healed_raw).is_some());
+
+        // Corrupt authoritative `cid/<cid>` source (with no AOT cache) -> MUST fail explicitly!
+        let saved_src = blobs
+            .get_object(RUNTIMES_BUCKET, &format!("cid/{}", rec.cid))
+            .await
+            .unwrap()
+            .unwrap();
+        blobs.delete_object(RUNTIMES_BUCKET, &aot_cid_key).await.unwrap();
+        blobs
+            .put_object(RUNTIMES_BUCKET, &format!("cid/{}", rec.cid), Bytes::from_static(b"TAMPERED"))
+            .await
+            .unwrap();
+        let integrity_err = reg2.resolve_runtime("quickjs").await.unwrap_err();
+        assert!(integrity_err.to_string().contains("BLAKE3 integrity verification"));
+        // Restore authoritative source for subsequent uninstall assertions
+        blobs
+            .put_object(RUNTIMES_BUCKET, &format!("cid/{}", rec.cid), saved_src)
+            .await
+            .unwrap();
 
         // Shared CID ownership across aliases: installing a second alias for the same Wasm bytes
         // keeps the shared CID alive when the first alias is uninstalled, and drops it when the last is uninstalled.
@@ -1145,7 +1213,7 @@ mod tests {
         assert!(blobs.get_object(RUNTIMES_BUCKET, &format!("cid/{}", rec.cid)).await.unwrap().is_none());
     }
 
-    #[cfg(feature = "oci-registry")]
+    #[cfg(feature = "runtime-oci")]
     mod oci_security_tests {
         use super::*;
         use sha2::{Digest, Sha256};

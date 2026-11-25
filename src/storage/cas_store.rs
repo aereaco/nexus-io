@@ -280,13 +280,17 @@ impl CasStore {
     }
 
     /// Boot/restart/maintenance reconciliation pass:
-    /// 1. Checks BOTH `gc_pending`/`gc_running` AND any incomplete `tx/*.json` ownership journal records.
-    ///    If clean and `!force`, returns immediately (`skipped: true`, O(1) no-op, zero scanning!).
+    /// 1. Checks BOTH `gc_pending`/`gc_running` AND any incomplete `tx/*.json` write-ahead ownership
+    ///    journal records (propagating storage listing errors — never silently skipping). If clean
+    ///    and `!force`, avoids scanning data blobs and returns immediately (`skipped: true`, cost
+    ///    bounded by a single `tx/` prefix listing).
     /// 2. Replays every incomplete `OwnershipTx`:
     ///    - If target manifest committed (`version >= tx.target_version`), finishes releasing `tx.prev_cids`.
-    ///    - If target manifest did NOT commit (`version < tx.target_version`), rolls back `tx.acquired_cids`.
+    ///    - If target manifest did NOT commit (`version < tx.target_version`), idempotently rolls back
+    ///      `tx.acquired_cids` (safe even if crash happened before ownership acquisition!).
+    ///    - Rejects any existing target manifest with a missing or invalid `version` (never defaults to 0).
     ///    - Deletes `tx/<tx_id>.json` ONLY after the ownership transition succeeds durably.
-    /// 3. Recovers expired `DeleteClaim`s and performs optional orphan reconciliation.
+    /// 3. Recovers expired `DeleteClaim`s and performs optional orphan reconciliation (only when flagged/forced).
     /// 4. Clears `gc_pending = false` + increments `gc_completed_generation` ONLY on full success.
     pub async fn reconcile_on_boot(
         &self,
@@ -304,11 +308,17 @@ impl CasStore {
             None => (ReconciliationState::default(), None),
         };
 
+        // Fail closed on storage listing errors so a backend failure never looks like an empty tx/ dir
         let pending_tx_objs = self
             .blobs
             .list_objects(bucket, Some("tx/"))
             .await
-            .unwrap_or_default();
+            .with_context(|| {
+                format!(
+                    "Failed to list OwnershipTx journals under '{}/tx/' during boot reconciliation",
+                    bucket
+                )
+            })?;
 
         if !state.gc_pending && !state.gc_running && pending_tx_objs.is_empty() && !force {
             return Ok(ReconciliationReport {
@@ -398,7 +408,14 @@ impl CasStore {
                         .and_then(|m| m.get("version"))
                         .or_else(|| v.get("version"))
                         .and_then(|n| n.as_u64())
-                        .unwrap_or(0)
+                        .ok_or_else(|| {
+                            anyhow!(
+                                "Target manifest '{}/{}' is missing a valid numeric `version` during OwnershipTx '{}' replay (journal preserved)",
+                                bucket,
+                                tx.target_manifest_key,
+                                tx.tx_id
+                            )
+                        })?
                 }
                 None => 0,
             };
@@ -1340,15 +1357,46 @@ mod tests {
         assert!(!ledger_after_commit.owners.contains_key(&old_cid));
         assert!(blobs.list_objects("tx-rec", Some("tx/")).await.unwrap().is_empty());
 
-        //    (c) Identity mismatch failure preserves journal (never deletes evidence on failure)
+        //    (c) Crash AFTER writing WAL OwnershipTx and BEFORE acquiring ownership ->
+        //        idempotent rollback safely ignores unacquired CIDs, preserves prev_cids, and deletes tx
+        let pre_acq_cid = fresh_cas_2
+            .put_verified_blob("tx-rec", "blobs/", Bytes::from_static(b"v3-pre-acquire"))
+            .await
+            .unwrap();
         fresh_cas_2
+            .begin_ownership_tx(
+                "tx-rec",
+                &OwnershipTx {
+                    tx_id: "tx-pre-acquire".into(),
+                    owner_id: "wasmdb:a/c".into(),
+                    target_manifest_key: "cells/a/c/manifest.json".into(),
+                    target_version: 3,
+                    acquired_cids: vec![pre_acq_cid.clone()],
+                    prev_cids: vec![new_cid_ok.clone()],
+                    created_at_ms: now_ms(),
+                },
+            )
+            .await
+            .unwrap();
+        // Process crashes BEFORE acquire_owners_batch runs!
+        let fresh_cas_3 = CasStore::new(blobs.clone());
+        let rep_pre_acq = fresh_cas_3
+            .reconcile_on_boot("tx-rec", "blobs/", &HashSet::new(), 0, false)
+            .await
+            .unwrap();
+        assert_eq!(rep_pre_acq.tx_replayed, 1);
+        assert!(fresh_cas_3.get_verified_blob("tx-rec", "blobs/", &new_cid_ok).await.is_ok());
+        assert!(blobs.list_objects("tx-rec", Some("tx/")).await.unwrap().is_empty());
+
+        //    (d) Identity mismatch failure preserves journal (never deletes evidence on failure)
+        fresh_cas_3
             .begin_ownership_tx(
                 "tx-rec",
                 &OwnershipTx {
                     tx_id: "tx-bad-id".into(),
                     owner_id: "wasmdb:a/c".into(),
                     target_manifest_key: "cells/other/cell/manifest.json".into(),
-                    target_version: 2,
+                    target_version: 3,
                     acquired_cids: vec![],
                     prev_cids: vec![],
                     created_at_ms: now_ms(),
@@ -1356,7 +1404,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(fresh_cas_2
+        assert!(fresh_cas_3
             .reconcile_on_boot("tx-rec", "blobs/", &HashSet::new(), 0, false)
             .await
             .is_err());

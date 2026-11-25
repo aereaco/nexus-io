@@ -109,7 +109,7 @@ impl NativeGuiDescriptor {
     pub const fn current() -> Self {
         let engine = NativeWebViewEngine::current();
         Self {
-            compiled: cfg!(feature = "gui"),
+            compiled: cfg!(feature = "gui-webview"),
             target_os: std::env::consts::OS,
             engine,
             engine_label: engine.as_str(),
@@ -120,7 +120,7 @@ impl NativeGuiDescriptor {
 /// Launch a device-native OS WebView window (`WebView2` / `WKWebView` / `WebKitGTK`).
 ///
 /// Must be called on the main OS thread on desktop platforms.
-#[cfg(all(feature = "gui", not(any(target_os = "android", target_os = "ios"))))]
+#[cfg(all(feature = "gui-webview", not(any(target_os = "android", target_os = "ios"))))]
 pub fn launch_native_window(config: NativeWindowConfig) -> Result<()> {
     use tao::dpi::LogicalSize;
     use tao::event::{Event, WindowEvent};
@@ -152,7 +152,7 @@ pub fn launch_native_window(config: NativeWindowConfig) -> Result<()> {
         })?;
 
     println!(
-        "🖥️  Native GUI launched via {} -> {}",
+        "ðŸ–¥ï¸  Native GUI launched via {} -> {}",
         NativeWebViewEngine::current().as_str(),
         config.url
     );
@@ -171,10 +171,10 @@ pub fn launch_native_window(config: NativeWindowConfig) -> Result<()> {
 
 /// On Android and iOS, the mobile OS Activity / UIViewController owns the main UI thread
 /// and attaches its native `WebView` / `WKWebView` to `config.url`.
-#[cfg(all(feature = "gui", any(target_os = "android", target_os = "ios")))]
+#[cfg(all(feature = "gui-webview", any(target_os = "android", target_os = "ios")))]
 pub fn launch_native_window(config: NativeWindowConfig) -> Result<()> {
     println!(
-        "📱 Native mobile WebView host bridge ready ({}) -> {}",
+        "ðŸ“± Native mobile WebView host bridge ready ({}) -> {}",
         NativeWebViewEngine::current().as_str(),
         config.url
     );
@@ -182,7 +182,7 @@ pub fn launch_native_window(config: NativeWindowConfig) -> Result<()> {
 }
 
 /// Headless build stub when `--features gui` is not enabled.
-#[cfg(not(feature = "gui"))]
+#[cfg(not(feature = "gui-webview"))]
 pub fn launch_native_window(_config: NativeWindowConfig) -> Result<()> {
     anyhow::bail!(
         "Native GUI is not compiled into this binary. Rebuild with `--features gui` to enable {}.",

@@ -1,22 +1,22 @@
 use anyhow::Result;
-#[cfg(feature = "shell")]
+#[cfg(feature = "ops-shell")]
 use nu_engine::CallExt;
-#[cfg(feature = "shell")]
+#[cfg(feature = "ops-shell")]
 use nu_protocol::engine::{Call, Command, EngineState, Stack};
-#[cfg(feature = "shell")]
+#[cfg(feature = "ops-shell")]
 use nu_protocol::{Category, PipelineData, ShellError, Signature, SyntaxShape, Value};
 use std::collections::HashMap;
-#[cfg(feature = "shell")]
+#[cfg(feature = "ops-shell")]
 use std::sync::Arc;
 
-#[cfg(feature = "wasm-runtime")]
+#[cfg(feature = "runtime-wasm")]
 use crate::compute::crystal::CrystalEngine;
 use crate::db::sql_compiler::compile_sqlite_to_surql;
-#[cfg(feature = "shell")]
+#[cfg(feature = "ops-shell")]
 use crate::db::Database;
 use crate::db::StateEngine;
 use crate::js::cell::{CellManager, CellPolicy};
-#[cfg(feature = "shell")]
+#[cfg(feature = "ops-shell")]
 use crate::storage::BlobBridge;
 
 /// Declarative backend `SystemNode` parsed from a Markdown (`.md`) service file.
@@ -244,7 +244,7 @@ pub async fn deploy_markdown(
 
 /// Execute an exported `(i64, i64) -> i64` function from the first inline `wat` Crystal block
 /// on a `SystemNode` via `CrystalEngine` (pre-compiled AOT + fuel metering).
-#[cfg(all(feature = "wasm-runtime", not(target_os = "ios")))]
+#[cfg(all(feature = "runtime-wasm", not(target_os = "ios")))]
 pub fn execute_node_crystal_i64(
     node: &SystemNode,
     fn_name: &str,
@@ -261,16 +261,16 @@ pub fn execute_node_crystal_i64(
     crystal.run_aot_i64(&aot, fn_name, a, b, fuel_limit)
 }
 
-/// Nushell/CLI command: `cell deploy <path.md>` — deploys a declarative Markdown service file
+/// Nushell/CLI command: `cell deploy <path.md>` â€” deploys a declarative Markdown service file
 /// onto `CellManager` and `StateEngine`.
-#[cfg(feature = "shell")]
+#[cfg(feature = "ops-shell")]
 #[derive(Clone)]
 pub struct CellDeployCommand {
     pub db: Arc<Database>,
     pub bridge: Arc<BlobBridge>,
 }
 
-#[cfg(feature = "shell")]
+#[cfg(feature = "ops-shell")]
 impl Command for CellDeployCommand {
     fn name(&self) -> &str {
         "cell deploy"
@@ -325,7 +325,7 @@ impl Command for CellDeployCommand {
             .iter()
             .map(|n| format!("{}/{} ({})", n.app, n.cell_id, n.name))
             .collect();
-        let msg = format!("✅ Deployed {} cell(s): {}", nodes.len(), summary.join(", "));
+        let msg = format!("âœ… Deployed {} cell(s): {}", nodes.len(), summary.join(", "));
         Ok(PipelineData::Value(Value::string(msg, span), None))
     }
 }
@@ -383,20 +383,7 @@ function record(m) {
                     assert_eq!(nodes[0].cell_id, "counter_service");
                     assert_eq!(nodes[0].wasm_refs, vec!["s3://crystals/pricing.wasm"]);
 
-                    #[cfg(feature = "js-native")]
-                    {
-                        let out = manager
-                            .eval_in_cell(
-                                "semantic_demo",
-                                "counter_service",
-                                r#"record({ label: "req", val: 7 })"#,
-                            )
-                            .await
-                            .unwrap();
-                        assert_eq!(out, "1");
-                    }
-
-            #[cfg(all(feature = "wasm-runtime", not(target_os = "ios")))]
+            #[cfg(all(feature = "runtime-wasm", not(target_os = "ios")))]
             {
                 let prod = execute_node_crystal_i64(&nodes[0], "mul", 6, 7, 10_000).unwrap();
                 assert_eq!(prod, 42);

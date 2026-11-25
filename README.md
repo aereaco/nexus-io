@@ -18,27 +18,34 @@ Every workload — **JavaScript/TypeScript (`quickjs.wasm`)**, **PHP/WordPress (
 
 ---
 
-## The 5 Native Microkernel Primitives (`profile-core`)
+## The 5 Native Microkernel Primitives (`core`)
 
-Everything in `profile-core` is strictly limited to the five sovereign host primitives — heavy non-kernel tools (interactive Nushell, OXC TypeScript compiler, P2P Iroh, S3 gateway, Kubernetes bridge, WireGuard VPN, NVML GPU monitoring, native WebView GUI) are **opt-in capabilities**:
+Everything in `core` is strictly limited to the five sovereign host primitives — Wasmtime 51 is the **sole** guest runtime (JS, TS, Python, PHP, SQLite, Postgres, SurrealDB all run as Wasm modules), and all additional platform domains are cleanly opt-in:
 
-1. **Compute (`CrystalEngine` + `WasmRuntimeRegistry`):** Wasmtime 51 + WASI Preview 1/2 sandbox with deterministic fuel metering, AOT `.cwasm` precompilation (cached in `BlobBridge`), zero ambient host authority, and the unified `nexus_host` syscall ABI (`nexus_db_query`, `nexus_blob_get`, `nexus_blob_put`, `nexus_log`).
-2. **State (`nexus-db` + `WasmDbMount`):** Kernel-native clean-room multi-model DB (SurrealQL, SQLite/Postgres/MySQL SQL, GraphQL, ISO GQL, vector HNSW, FTS, RBAC, WAL) **plus** per-cell `CellDbMode::WasmEngine` to mount real Wasm database engines (`pglite.wasm`, `sqlite.wasm`, `duckdb.wasm`) backed by `BlobBridge` virtual FS persistence.
-3. **Storage (`BlobBridge`):** Local BLAKE3 content-addressed object store with CAS single-writer leases (optional distributed `iroh-blobs` P2P + `s3s` S3 gateway in `profile-app`).
-4. **Network (`UxGateway`):** Salvo HTTP/WebSocket ingress, `/cells/<app>/<cell_id>` routing, `/cells/_runtimes/<name>` registry API, and opt-in PostgreSQL v3 (`pgwire`), MySQL v10 (`mysqlwire`), and LibSQL/Turso Hrana (`sqlite-hrana`) wire listeners.
-5. **Security (`IAM` + `CellDbConfig`):** Argon2id + HS256/EdDSA/ES256/RS256 JWT + RBAC (`OWNER`/`EDITOR`/`VIEWER`) + per-cell declarative database topology (`none`, `dedicated`, `reference`, `mesh`, `wasm_engine`), allowed query flavors, and allowed connection transports.
+1. **Compute (`CrystalEngine` + `WasmRuntimeRegistry`):** Wasmtime 51 + WASI Preview 1/2 sandbox with deterministic fuel metering, self-verifying derived AOT `.cwasm` caches (`NXAOT01` BLAKE3 envelopes keyed by `(compat_key, cid)`), zero ambient host authority, and the unified `nexus_host` syscall ABI (`nexus_db_query`, `nexus_blob_get`, `nexus_blob_put`, `nexus_log`).
+2. **State (`nexus-db` + `WasmDbMount`):** Kernel-native 100% MIT multi-model DB (`nexus-db`) **plus** per-cell `CellDbMode::WasmEngine` to mount real Wasm database engines (`pglite.wasm`, `sqlite.wasm`, `duckdb.wasm`, `surrealdb.wasm`) backed by single-CAS fenced `WasmDbCellRecord` leases and WAL `OwnershipTx` journals.
+3. **Storage (`BlobBridge` + `CasStore`):** Local BLAKE3 content-addressed object store with 3-state `Live → Tombstoned → Deleting` reclamation and write-ahead ownership journaling (optional `storage-p2p` Iroh + `storage-s3` S3 gateway).
+4. **Network (`UxGateway`):** Salvo HTTP/WebSocket ingress, `/cells/<app>/<cell_id>` routing, `/cells/_runtimes/<name>` registry API, and opt-in `net-*` (`net-http3`, `net-acme`, `net-openapi`, `net-vpn`) + `serve-*` (`serve-web`, `serve-proxy`) capabilities.
+5. **Security (`IAM` + `CapabilitySet` + `CellDbConfig`):** Argon2id + HS256/EdDSA/ES256/RS256 JWT + RBAC (`OWNER`/`EDITOR`/`VIEWER`) + syscall-level `CapabilitySet` enforcement + per-cell declarative database topology.
 
 ---
 
-## Deployment Profiles
+## Deployment Profiles & Semantic Feature Domains
 
 | Profile | Included Capabilities |
 | :--- | :--- |
-| **`profile-core`** *(default)* | Microkernel only: `wasm-runtime` (Wasmtime + WASI), `database` (`nexus-db`), `gateway`, `cells`, `iam` (zero Nushell, zero OXC, zero P2P/S3/VPN bloat) |
-| **`profile-app`** | `profile-core` + `ts-compiler` (OXC), `p2p-storage`, `s3-gateway`, `pgwire`, `mysqlwire`, `sqlite-hrana`, `graphql`, `gql`, QUIC/ACME |
-| **`profile-full`** | `profile-app` + `shell` (Nushell), `k8s-bridge`, `vpn` (WireGuard), `hardware-monitoring` (NVML), `nexus-db/full` |
-| **`profile-dev`** | `profile-full` + `surrealdb-ref` (live SurrealDB 4.0 differential conformance test harness) |
-| **`profile-{windows,linux,macos,android,ios}`** | OS-tailored profiles (combine with `--features gui` for native OS WebView2 / WKWebView / WebKitGTK; iOS is strictly `W^X`-safe AOT `.cwasm`) |
+| **`core`** *(default)* | Pure microkernel: `runtime-wasm` (Wasmtime 51 + WASI), `nexus-db` (`db-auth`, `db-cbor`), `BlobBridge + CasStore`, `UxGateway` (HTTP/WS), `IAM + CapabilitySet`, `NexusMetrics` |
+| **`full`** | `core` + `runtime-all` + `db-all` + `net-all` + `storage-all` + `serve-all` + `ops-all` *(headless-safe; compose any profile with `gui-all` for OS-autodetected native WebView)* |
+
+| Domain | Granular Flags | Bundle Flag |
+| :--- | :--- | :--- |
+| **Runtime** | `runtime-wasm` *(in `core`)*, `runtime-oci` | `runtime-all` |
+| **Database (`nexus-db`)** | `db-auth`, `db-cbor`, `db-fts`, `db-vector`, `db-files`, `db-geo`, `db-crypto`, `db-ml`, `db-graphql`, `db-gql`, `db-pgwire`, `db-mysqlwire`, `db-sqlite` | `db-all` |
+| **Network** | `net-http3`, `net-acme`, `net-openapi`, `net-vpn` | `net-all` |
+| **Storage** | `storage-p2p`, `storage-s3` | `storage-all` |
+| **Serve** | `serve-web`, `serve-proxy` | `serve-all` |
+| **Operations** | `ops-shell`, `ops-k8s`, `ops-gpu` | `ops-all` |
+| **GUI** | `gui-webview` *(OS-autodetected: WebView2 / WKWebView / WebKitGTK / Android / iOS)* | `gui-all` |
 
 ---
 
@@ -46,25 +53,13 @@ Everything in `profile-core` is strictly limited to the five sovereign host prim
 
 ```bash
 # Run the lean microkernel daemon (Wasmtime + Nexus-DB + UxGateway + IAM)
-cargo run --no-default-features --features profile-core
+cargo run --no-default-features --features core
 
-# Register a WASI guest runtime (e.g. quickjs.wasm, php-cgi.wasm, sqlite.wasm, pglite.wasm)
-# Automatically stored content-addressed in BlobBridge and AOT-precompiled to .cwasm:
-curl -X PUT --data-binary @quickjs.wasm http://127.0.0.1:8080/cells/_runtimes/quickjs
-
-# Deploy a JS/TS cell onto Wasmtime (`quickjs.wasm`)
-curl -X PUT -H "X-Nexus-Runtime: js-wasm" --data-binary @app.js http://127.0.0.1:8080/cells/demo/api
-
-# Deploy a WASI CGI cell (e.g. PHP/WordPress `php-cgi.wasm`)
-curl -X PUT -H "X-Nexus-Runtime: wasi-cgi" --data-binary @php-cgi.wasm http://127.0.0.1:8080/cells/blog/wp
-
-# Configure a cell's declarative database policy (stateless, dedicated, reference, mesh, or wasm_engine)
-curl -X PUT -H "Content-Type: application/json" \
-  -d '{"mode":{"wasm_engine":{"engine":"pglite","module_cid":"pglite","mount_path":"/data"}},"flavors":["postgres"],"transports":["internal","http_rest"]}' \
-  http://127.0.0.1:8080/cells/shop/orders/db-config
+# Compose exact domains (e.g. core + OCI pulls + web server + native OS WebView)
+cargo run --no-default-features --features core,runtime-oci,serve-all,gui-all
 
 # Run unit tests
-cargo test --lib --no-default-features --features profile-core
+cargo test --lib --no-default-features --features core
 ```
 
 See [docs/architecture.md](docs/architecture.md) for the full microkernel ABI, `CellDbConfig` policy model, and Wasm-hosted DB lifecycle, and [docs/benchmarks.md](docs/benchmarks.md) for measured binary size and memory footprint across profiles.

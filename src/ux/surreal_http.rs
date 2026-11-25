@@ -110,7 +110,7 @@ pub(crate) fn resolve_http_auth(
     Err("Unsupported Authorization scheme".to_string())
 }
 
-/// `POST /sql` — SurrealDB HTTP SQL endpoint.
+/// `POST /sql` â€” SurrealDB HTTP SQL endpoint.
 #[derive(Clone)]
 pub struct SurrealSqlHandler {
     pub db: Arc<Database>,
@@ -151,7 +151,7 @@ impl Handler for SurrealSqlHandler {
                         let json_rows: Vec<JsonValue> =
                             o.result.iter().map(DbValue::to_json).collect();
                         json!({
-                            "time": format!("{}µs", o.time_us),
+                            "time": format!("{}Âµs", o.time_us),
                             "status": o.status,
                             "result": json_rows
                         })
@@ -162,7 +162,7 @@ impl Handler for SurrealSqlHandler {
             Err(e) => {
                 res.status_code(StatusCode::BAD_REQUEST);
                 res.render(Json(json!([{
-                    "time": "0µs",
+                    "time": "0Âµs",
                     "status": "ERR",
                     "result": e.to_string()
                 }])));
@@ -171,7 +171,7 @@ impl Handler for SurrealSqlHandler {
     }
 }
 
-/// `POST /rpc` — Stateless SurrealDB HTTP JSON-RPC 2.0 / CBOR endpoint.
+/// `POST /rpc` â€” Stateless SurrealDB HTTP JSON-RPC 2.0 / CBOR endpoint.
 #[derive(Clone)]
 pub struct SurrealHttpRpcHandler {
     pub db: Arc<Database>,
@@ -223,7 +223,7 @@ impl Handler for SurrealHttpRpcHandler {
     }
 }
 
-/// `POST /signin` & `POST /signup` — Standard SurrealDB HTTP authentication endpoints.
+/// `POST /signin` & `POST /signup` â€” Standard SurrealDB HTTP authentication endpoints.
 #[derive(Clone)]
 pub struct SurrealAuthHandler {
     pub db: Arc<Database>,
@@ -323,7 +323,7 @@ impl Handler for SurrealExportImportHandler {
     }
 }
 
-/// `/key/<table>` and `/key/<table>/<id>` — SurrealDB REST KV/record CRUD endpoints.
+/// `/key/<table>` and `/key/<table>/<id>` â€” SurrealDB REST KV/record CRUD endpoints.
 #[derive(Clone)]
 pub struct SurrealKeyHandler {
     pub db: Arc<Database>,
@@ -401,7 +401,7 @@ impl Handler for SurrealKeyHandler {
     }
 }
 
-/// `/api/<ns>/<db>/<**path>` — invokes custom `DEFINE API` endpoints in `nexus-db`.
+/// `/api/<ns>/<db>/<**path>` â€” invokes custom `DEFINE API` endpoints in `nexus-db`.
 #[derive(Clone)]
 pub struct SurrealCustomApiHandler {
     pub db: Arc<Database>,
@@ -586,14 +586,14 @@ impl Handler for UnifiedQueryHandler {
     }
 }
 
-/// `POST /v2/pipeline` — LibSQL / Turso Hrana HTTP SQLite pipeline endpoint backed by `nexus-db`.
-#[cfg(feature = "sqlite-hrana")]
+/// `POST /v2/pipeline` â€” LibSQL / Turso Hrana HTTP SQLite pipeline endpoint backed by `nexus-db`.
+#[cfg(feature = "db-sqlite")]
 #[derive(Clone)]
 pub struct SqliteHranaHandler {
     pub db: Arc<Database>,
 }
 
-#[cfg(feature = "sqlite-hrana")]
+#[cfg(feature = "db-sqlite")]
 #[async_trait]
 impl Handler for SqliteHranaHandler {
     async fn handle(&self, req: &mut Request, _depot: &mut Depot, res: &mut Response, _ctrl: &mut FlowCtrl) {

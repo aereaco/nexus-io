@@ -38,7 +38,7 @@ impl NodeResources {
         // 2. GPU Telemetry (NVML - Desktop/Server only; gated out on Android/iOS)
         #[allow(unused_mut)]
         let mut gpus = vec![];
-        #[cfg(all(feature = "hardware-monitoring", not(any(target_os = "android", target_os = "ios"))))]
+        #[cfg(all(feature = "ops-gpu", not(any(target_os = "android", target_os = "ios"))))]
         if let Ok(nvml) = nvml_wrapper::Nvml::init() {
             if let Ok(count) = nvml.device_count() {
                 for i in 0..count {

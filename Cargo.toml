@@ -14,94 +14,35 @@ name = "nexus_io"
 path = "src/lib.rs"
 
 [features]
-# Deployment profiles: one platform, selective footprint.
-default = ["profile-core"]
+# =============================================================================
+# Deployment Profiles (2 clean tiers — compose any profile with `gui-all`)
+# =============================================================================
+default = ["core"]
 
-profile-core = [
-    "database",
-    "gateway",
-    "wasm-runtime",
-    "cells",
-    "iam",
+# Minimal sovereign microkernel: Wasmtime 51 + WASI, Nexus-DB (core+auth+cbor),
+# BlobBridge + CasStore, UxGateway (HTTP/WS), IAM + CapabilitySet, NexusMetrics.
+core = [
+    "runtime-wasm",
+    "db-auth",
+    "db-cbor",
 ]
 
-profile-app = [
-    "profile-core",
-    "oci-registry",
-    "sql-compat",
-    "js-runtime",
-    "ts-compiler",
-    "p2p-storage",
-    "s3-gateway",
-    "sqlite-hrana",
-    "graphql",
-    "gql",
-    "pgwire",
-    "mysqlwire",
-    "salvo/acme",
-    "salvo/quinn",
-    "salvo/oapi",
-    "nexus-db/fts",
-    "nexus-db/vector",
-    "nexus-db/files",
-    "nexus-db/auth",
-    "nexus-db/cbor",
+# Full headless platform: every domain bundle enabled (compose with `gui-all` for native WebView).
+full = [
+    "core",
+    "runtime-all",
+    "db-all",
+    "net-all",
+    "storage-all",
+    "serve-all",
+    "ops-all",
 ]
 
-profile-full = [
-    "profile-app",
-    "wasm-runtime",
-    "k8s-bridge",
-    "vpn",
-    "hardware-monitoring",
-    "shell",
-    "nexus-db/full",
-]
-
-profile-dev = [
-    "profile-full",
-    "surrealdb-ref",
-]
-
-# OS-specific deployment profiles (compose with `--features gui` for native OS WebView)
-profile-windows = [
-    "profile-app",
-    "wasm-runtime",
-    "vpn",
-    "hardware-monitoring",
-    "shell",
-]
-
-profile-linux = [
-    "profile-app",
-    "wasm-runtime",
-    "vpn",
-    "k8s-bridge",
-    "hardware-monitoring",
-    "shell",
-]
-
-profile-macos = [
-    "profile-app",
-    "wasm-runtime",
-    "vpn",
-    "shell",
-]
-
-profile-android = [
-    "profile-app",
-    "wasm-runtime",
-]
-
-profile-ios = [
-    "profile-app",
-    "wasm-runtime",
-]
-
-# Granular capability flags
-database = []
-gateway = []
-oci-registry = [
+# =============================================================================
+# Domain 1: Runtime (Wasmtime is the sole guest runtime; JS/TS/DBs run as Wasm)
+# =============================================================================
+runtime-wasm = ["dep:wasmtime", "dep:wasmtime-wasi"]
+runtime-oci = [
     "dep:hyper",
     "dep:hyper-util",
     "dep:http-body-util",
@@ -110,19 +51,68 @@ oci-registry = [
     "dep:webpki-roots",
     "dep:sha2",
 ]
-sql-compat = ["dep:sqlparser"]
-js-runtime = ["js-native"]
-js-native = ["dep:quickrs-core"]
-cells = []
-iam = []
-sqlite-hrana = ["nexus-db/sqlite"]
-graphql = ["nexus-db/graphql"]
-gql = ["nexus-db/gql"]
-pgwire = ["nexus-db/pgwire"]
-mysqlwire = ["nexus-db/mysqlwire"]
-p2p-storage = ["dep:iroh", "dep:iroh-blobs"]
-s3-gateway = ["dep:s3s"]
-shell = [
+runtime-all = ["runtime-wasm", "runtime-oci"]
+
+# =============================================================================
+# Domain 2: Database (1:1 granular Nexus-DB capability flags)
+# =============================================================================
+db-auth = ["nexus-db/auth"]
+db-cbor = ["nexus-db/cbor"]
+db-fts = ["nexus-db/fts"]
+db-vector = ["nexus-db/vector"]
+db-files = ["nexus-db/files"]
+db-geo = ["nexus-db/geo"]
+db-crypto = ["nexus-db/crypto"]
+db-ml = ["nexus-db/ml"]
+db-graphql = ["nexus-db/graphql"]
+db-gql = ["nexus-db/gql"]
+db-pgwire = ["nexus-db/pgwire"]
+db-mysqlwire = ["nexus-db/mysqlwire"]
+db-sqlite = ["nexus-db/sqlite"]
+db-all = [
+    "db-auth",
+    "db-cbor",
+    "db-fts",
+    "db-vector",
+    "db-files",
+    "db-geo",
+    "db-crypto",
+    "db-ml",
+    "db-graphql",
+    "db-gql",
+    "db-pgwire",
+    "db-mysqlwire",
+    "db-sqlite",
+    "nexus-db/full",
+]
+
+# =============================================================================
+# Domain 3: Network & Transport
+# =============================================================================
+net-http3 = ["salvo/quinn"]
+net-acme = ["salvo/acme"]
+net-openapi = ["salvo/oapi"]
+net-vpn = ["dep:boringtun", "dep:wintun-bindings"]
+net-all = ["net-http3", "net-acme", "net-openapi", "net-vpn"]
+
+# =============================================================================
+# Domain 4: Storage Backends
+# =============================================================================
+storage-p2p = ["dep:iroh", "dep:iroh-blobs"]
+storage-s3 = ["dep:s3s"]
+storage-all = ["storage-p2p", "storage-s3"]
+
+# =============================================================================
+# Domain 5: Serve (Nexus-UX Web Server & Reverse Proxy)
+# =============================================================================
+serve-web = []
+serve-proxy = []
+serve-all = ["serve-web", "serve-proxy"]
+
+# =============================================================================
+# Domain 6: Operations & Infrastructure
+# =============================================================================
+ops-shell = [
     "dep:nu-engine",
     "dep:nu-protocol",
     "dep:nu-command",
@@ -131,63 +121,43 @@ shell = [
     "dep:nu-cli",
     "dep:rustyline",
 ]
-ts-compiler = [
-    "dep:oxc_allocator",
-    "dep:oxc_parser",
-    "dep:oxc_semantic",
-    "dep:oxc_transformer",
-    "dep:oxc_codegen",
-    "dep:oxc_span",
-    "dep:oxc_ast",
-]
-wasm-runtime = ["dep:wasmtime", "dep:wasmtime-wasi"]
-k8s-bridge = ["dep:serde_norway"]
-vpn = ["dep:boringtun", "dep:wintun-bindings"]
-hardware-monitoring = ["dep:nvml-wrapper"]
-gui = ["dep:wry", "dep:tao"]
-surrealdb-ref = ["dep:surrealdb"]
+ops-k8s = ["dep:serde_norway"]
+ops-gpu = ["dep:nvml-wrapper"]
+ops-all = ["ops-shell", "ops-k8s", "ops-gpu"]
+
+# =============================================================================
+# Domain 7: GUI (OS-Autodetected Native WebView across Windows/macOS/Linux/Android/iOS)
+# =============================================================================
+gui-webview = ["dep:wry", "dep:tao"]
+gui-all = ["gui-webview"]
 
 [dependencies]
-# 1. The Mind (State — MIT-licensed nexus-db by default; optional surrealdb-ref for differential tests)
+# 1. The Mind (100% MIT-licensed embedded nexus-db)
 nexus-db = { path = "crates/nexus-db", default-features = false, features = ["auth", "cbor"] }
-surrealdb = { version = "4.0.1", optional = true, default-features = false, features = ["kv-mem"] }
-sqlparser = { version = "0.64.0", optional = true }
 tokio = { version = "1.0", features = ["rt-multi-thread", "net", "io-util", "sync", "time", "fs", "macros", "signal"] }
 
-# 2. The Nerves (Optional Interactive Nushell — gated behind `shell`)
+# 2. The Nerves (Optional Interactive Nushell — gated behind `ops-shell`)
 nu-engine = { version = "0.117.0", optional = true }
 nu-protocol = { version = "0.117.0", optional = true }
 nu-command = { version = "0.117.0", optional = true, features = ["os", "network", "rand", "sqlite"] }
 nu-parser = { version = "0.117.0", optional = true }
 nu-cmd-lang = { version = "0.117.0", optional = true }
 
-# 3. The Trampoline (Unified Wasmtime/WASI Core + optional TS compiler + transitional optional quickrs-core)
-quickrs-core = { version = "0.16.2", optional = true }
+# 3. The Trampoline (Unified Wasmtime 51 / WASI Runtime — JS, TS, Python, SQLite, SurrealDB run as Wasm)
 wasmtime = { version = "51.0.0", optional = true, default-features = false, features = ["runtime"] }
 wasmtime-wasi = { version = "51.0.0", optional = true }
 
-# Tier S: Optional Native TypeScript Compiler (OXC — gated behind `ts-compiler`)
-oxc_allocator = { version = "0.144.0", optional = true, features = ["serialize"] }
-oxc_parser = { version = "0.144.0", optional = true }
-oxc_semantic = { version = "0.144.0", optional = true }
-oxc_transformer = { version = "0.144.0", optional = true }
-oxc_codegen = { version = "0.144.0", optional = true }
-oxc_span = { version = "0.144.0", optional = true, features = ["serialize"] }
-oxc_ast = { version = "0.144.0", optional = true, features = ["serialize"] }
-
-# 4. The Cloud (Cross-Platform Distributed Storage & Networking — optional behind `p2p-storage` / `s3-gateway`)
+# 4. The Cloud (Distributed Storage & Networking — gated behind `storage-*` / `net-vpn`)
 s3s = { version = "0.17.0", optional = true }
 iroh = { version = "1.0.3", optional = true }
 iroh-blobs = { version = "0.104.1", optional = true }
-
-# WireGuard - Zero-Trust VPN Mesh (optional behind `vpn`)
 boringtun = { version = "0.7.1", optional = true }
 
-# Networking & UX Gateway (Salvo — lean Core default; QUIC/ACME/OpenAPI enabled in profile-app+)
+# 5. Gateway & Networking (Salvo core HTTP/WS; HTTP/3, ACME, OpenAPI gated behind `net-*`)
 salvo = { version = "1.1.1", features = ["rustls", "websocket"] }
-
-# Networking & Async Utils (OCI Distribution v2 client gated behind `oci-registry`)
 tokio-util = { version = "0.7", features = ["codec"] }
+
+# OCI Distribution v2 client (gated behind `runtime-oci`)
 hyper = { version = "1", optional = true, features = ["client", "http1"] }
 hyper-util = { version = "0.1", optional = true, features = ["tokio"] }
 http-body-util = { version = "0.1", optional = true }
@@ -232,9 +202,6 @@ wintun-bindings = { version = "0.7.6", optional = true }
 
 [profile.dev]
 debug = 0
-
-[profile.dev.package.surrealdb-core]
-opt-level = 1
 
 [profile.release]
 opt-level = "z"

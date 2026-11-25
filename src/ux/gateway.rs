@@ -68,12 +68,12 @@ impl UxGateway {
 
     /// Start all configured gateway listeners
     pub async fn start(self) -> Result<(), Box<dyn std::error::Error>> {
-        println!("🌐 Nexus-IO Gateway starting...");
-        println!("   HTTPS (443): {}", if self.config.enable_https { "✅" } else { "❌" });
-        println!("   HTTP (80):   {}", if self.config.enable_http { "✅" } else { "❌" });
-        println!("   DB Direct:   {}", if self.config.enable_surreal_direct { "✅" } else { "❌" });
-        println!("   S3 Direct:   {}", if self.config.enable_s3_direct { "✅" } else { "❌" });
-        println!("   Metrics:     {}", if self.config.enable_metrics { "✅" } else { "❌" });
+        println!("ðŸŒ Nexus-IO Gateway starting...");
+        println!("   HTTPS (443): {}", if self.config.enable_https { "âœ…" } else { "âŒ" });
+        println!("   HTTP (80):   {}", if self.config.enable_http { "âœ…" } else { "âŒ" });
+        println!("   DB Direct:   {}", if self.config.enable_surreal_direct { "âœ…" } else { "âŒ" });
+        println!("   S3 Direct:   {}", if self.config.enable_s3_direct { "âœ…" } else { "âŒ" });
+        println!("   Metrics:     {}", if self.config.enable_metrics { "âœ…" } else { "âŒ" });
 
         let mut handles = vec![];
 
@@ -82,29 +82,29 @@ impl UxGateway {
             let gateway = self.clone();
             handles.push(tokio::spawn(async move {
                 if let Err(e) = gateway.serve_https().await {
-                    eprintln!("❌ HTTPS gateway error: {}", e);
+                    eprintln!("âŒ HTTPS gateway error: {}", e);
                 }
             }));
         }
 
-        // Port 5432: PostgreSQL v3 Wire Protocol (`PgWireSession`) — disabled by default
-        #[cfg(feature = "pgwire")]
+        // Port 5432: PostgreSQL v3 Wire Protocol (`PgWireSession`) â€” disabled by default
+        #[cfg(feature = "db-pgwire")]
         if self.config.enable_pgwire {
             let gateway = self.clone();
             handles.push(tokio::spawn(async move {
                 if let Err(e) = gateway.serve_pgwire().await {
-                    eprintln!("❌ PgWire listener error: {}", e);
+                    eprintln!("âŒ PgWire listener error: {}", e);
                 }
             }));
         }
 
-        // Port 3306: MySQL v10 Wire Protocol (`MySqlWireSession`) — disabled by default
-        #[cfg(feature = "mysqlwire")]
+        // Port 3306: MySQL v10 Wire Protocol (`MySqlWireSession`) â€” disabled by default
+        #[cfg(feature = "db-mysqlwire")]
         if self.config.enable_mysqlwire {
             let gateway = self.clone();
             handles.push(tokio::spawn(async move {
                 if let Err(e) = gateway.serve_mysqlwire().await {
-                    eprintln!("❌ MySQL wire listener error: {}", e);
+                    eprintln!("âŒ MySQL wire listener error: {}", e);
                 }
             }));
         }
@@ -114,7 +114,7 @@ impl UxGateway {
             let gateway = self.clone();
             handles.push(tokio::spawn(async move {
                 if let Err(e) = gateway.serve_http().await {
-                    eprintln!("❌ HTTP redirect error: {}", e);
+                    eprintln!("âŒ HTTP redirect error: {}", e);
                 }
             }));
         }
@@ -124,7 +124,7 @@ impl UxGateway {
             let gateway = self.clone();
             handles.push(tokio::spawn(async move {
                 if let Err(e) = gateway.serve_surreal_direct().await {
-                    eprintln!("❌ SurrealDB direct access error: {}", e);
+                    eprintln!("âŒ SurrealDB direct access error: {}", e);
                 }
             }));
         }
@@ -134,7 +134,7 @@ impl UxGateway {
             let gateway = self.clone();
             handles.push(tokio::spawn(async move {
                 if let Err(e) = gateway.serve_s3_direct().await {
-                    eprintln!("❌ S3 direct access error: {}", e);
+                    eprintln!("âŒ S3 direct access error: {}", e);
                 }
             }));
         }
@@ -144,7 +144,7 @@ impl UxGateway {
             let gateway = self.clone();
             handles.push(tokio::spawn(async move {
                 if let Err(e) = gateway.serve_metrics().await {
-                    eprintln!("❌ Metrics server error: {}", e);
+                    eprintln!("âŒ Metrics server error: {}", e);
                 }
             }));
         }
@@ -175,7 +175,7 @@ impl UxGateway {
                 salvo::conn::rustls::Keycert::new().cert(cert).key(key),
             );
             let acceptor = TcpListener::new(bind_addr.clone()).rustls(config).bind().await;
-            println!("🔒 HTTPS/TLS Gateway listening on https://{}", bind_addr);
+            println!("ðŸ”’ HTTPS/TLS Gateway listening on https://{}", bind_addr);
             Server::new(acceptor).serve(router).await;
             return Ok(());
         }
@@ -183,7 +183,7 @@ impl UxGateway {
         let dev_bind =
             std::env::var("NEXUS_HTTP_BIND").unwrap_or_else(|_| "127.0.0.1:8443".to_string());
         println!(
-            "⚠️  Dev HTTP Gateway (TLS DISABLED — plaintext) listening on http://{}",
+            "âš ï¸  Dev HTTP Gateway (TLS DISABLED â€” plaintext) listening on http://{}",
             dev_bind
         );
         println!("   Set NEXUS_TLS_CERT and NEXUS_TLS_KEY to enable real HTTPS/TLS.");
@@ -200,7 +200,7 @@ impl UxGateway {
             .push(Router::with_path("<**rest>").get(redirect_to_https));
 
         let acceptor = TcpListener::new("0.0.0.0:8080").bind().await;
-        println!("✅ HTTP Redirect listening on 0.0.0.0:8080 (dev: using 8080 instead of 80)");
+        println!("âœ… HTTP Redirect listening on 0.0.0.0:8080 (dev: using 8080 instead of 80)");
         
         Server::new(acceptor).serve(router).await;
 
@@ -210,7 +210,7 @@ impl UxGateway {
     /// Port 5432 (configurable): PostgreSQL v3 Wire Protocol TCP listener (`psql`, `pg`, Prisma, Drizzle).
     /// Binds loopback (`127.0.0.1`) by default, handles `SSLRequest`, enforces `AuthenticationCleartextPassword`
     /// backed by `nexus-db` RBAC, and uses streaming length-prefixed TCP framing.
-    #[cfg(feature = "pgwire")]
+    #[cfg(feature = "db-pgwire")]
     async fn serve_pgwire(&self) -> Result<(), Box<dyn std::error::Error>> {
         use nexus_db::pgwire::{PgWireSession, StartupPacket};
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -229,7 +229,7 @@ impl UxGateway {
         let trust_local_env = std::env::var("NEXUS_PGWIRE_TRUST_LOCAL").as_deref() == Ok("1");
         let listener = tokio::net::TcpListener::bind(&addr).await?;
         println!(
-            "🐘 PostgreSQL v3 Wire Protocol (PgWire) listening on {} (auth: {})",
+            "ðŸ˜ PostgreSQL v3 Wire Protocol (PgWire) listening on {} (auth: {})",
             addr,
             if trust_local_env { "trust-loopback-only" } else { "password-required" }
         );
@@ -312,7 +312,7 @@ impl UxGateway {
     /// Port 3306 (configurable): MySQL v10 Wire Protocol TCP listener (`mysql`, MySQL2, Prisma, Drizzle).
     /// Binds loopback (`127.0.0.1`) by default, requires `HandshakeResponse41` auth backed by `nexus-db` RBAC,
     /// and uses streaming 4-byte MySQL packet framing.
-    #[cfg(feature = "mysqlwire")]
+    #[cfg(feature = "db-mysqlwire")]
     async fn serve_mysqlwire(&self) -> Result<(), Box<dyn std::error::Error>> {
         use nexus_db::mysqlwire::MySqlWireSession;
         use std::sync::atomic::{AtomicU32, Ordering};
@@ -333,7 +333,7 @@ impl UxGateway {
         let trust_local_env = std::env::var("NEXUS_MYSQLWIRE_TRUST_LOCAL").as_deref() == Ok("1");
         let listener = tokio::net::TcpListener::bind(&addr).await?;
         println!(
-            "🐬 MySQL v10 Wire Protocol (MySqlWire) listening on {} (auth: {})",
+            "ðŸ¬ MySQL v10 Wire Protocol (MySqlWire) listening on {} (auth: {})",
             addr,
             if trust_local_env { "trust-loopback-only" } else { "password-required" }
         );
@@ -406,7 +406,7 @@ impl UxGateway {
             .push(Router::with_path("/rpc").post(surreal_rpc_handler));
 
         let acceptor = TcpListener::new("0.0.0.0:8000").bind().await;
-        println!("✅ SurrealDB Direct Access listening on 0.0.0.0:8000");
+        println!("âœ… SurrealDB Direct Access listening on 0.0.0.0:8000");
         
         Server::new(acceptor).serve(router).await;
 
@@ -423,7 +423,7 @@ impl UxGateway {
             );
 
         let acceptor = TcpListener::new("0.0.0.0:3900").bind().await;
-        println!("✅ S3 Direct Access listening on 0.0.0.0:3900");
+        println!("âœ… S3 Direct Access listening on 0.0.0.0:3900");
         
         Server::new(acceptor).serve(router).await;
 
@@ -436,7 +436,7 @@ impl UxGateway {
             .get(metrics_handler);
 
         let acceptor = TcpListener::new("127.0.0.1:9090").bind().await;
-        println!("✅ Metrics listening on 127.0.0.1:9090");
+        println!("âœ… Metrics listening on 127.0.0.1:9090");
         
         Server::new(acceptor).serve(router).await;
 
@@ -538,7 +538,7 @@ impl UxGateway {
                     .post(crate::ux::surreal_http::WalReplicationHandler { db: self.db.clone(), is_apply: true }),
             );
 
-        #[cfg(feature = "graphql")]
+        #[cfg(feature = "db-graphql")]
         let router = router.push(
             Router::with_path("/graphql")
                 .hoop(crate::ux::iam::IamMiddleware::authenticated(self.db.clone()))
@@ -549,7 +549,7 @@ impl UxGateway {
                 }),
         );
 
-        #[cfg(feature = "sqlite-hrana")]
+        #[cfg(feature = "db-sqlite")]
         let router = router.push(
             Router::with_path("/v2/pipeline")
                 .hoop(crate::ux::iam::IamMiddleware::authenticated(self.db.clone()))
@@ -661,8 +661,8 @@ async fn serve_static(res: &mut Response) {
   </style>
 </head>
 <body>
-  <h1>🌐 Nexus-IO Gateway</h1>
-  <p><span class="status">● ONLINE</span></p>
+  <h1>ðŸŒ Nexus-IO Gateway</h1>
+  <p><span class="status">â— ONLINE</span></p>
   
   <h2>Available Routes</h2>
   <ul>
@@ -674,12 +674,12 @@ async fn serve_static(res: &mut Response) {
   
   <h2>Gateway Features</h2>
   <ul>
-    <li class="feature">✅ Multi-port architecture (443, 80, optional direct access)</li>
-    <li class="feature">✅ Salvo framework with built-in ACME support</li>
-    <li class="feature">🚧 HTTP/3 support (planned)</li>
-    <li class="feature">🚧 OpenAPI auto-generation (planned)</li>
-    <li class="feature">🚧 WebSocket upgrades (in progress)</li>
-    <li class="feature">🚧 S3 proxy to Garage (in progress)</li>
+    <li class="feature">âœ… Multi-port architecture (443, 80, optional direct access)</li>
+    <li class="feature">âœ… Salvo framework with built-in ACME support</li>
+    <li class="feature">ðŸš§ HTTP/3 support (planned)</li>
+    <li class="feature">ðŸš§ OpenAPI auto-generation (planned)</li>
+    <li class="feature">ðŸš§ WebSocket upgrades (in progress)</li>
+    <li class="feature">ðŸš§ S3 proxy to Garage (in progress)</li>
   </ul>
 
   <h2>Next Steps</h2>

@@ -1,26 +1,26 @@
 pub mod capabilities;
 pub mod kernel;
 
-#[cfg(feature = "shell")]
+#[cfg(feature = "ops-shell")]
 use nu_protocol::engine::{Command, EngineState, Stack};
-#[cfg(feature = "shell")]
+#[cfg(feature = "ops-shell")]
 use nu_protocol::{PipelineData, Signature, ShellError};
-#[cfg(feature = "shell")]
+#[cfg(feature = "ops-shell")]
 use nu_engine::CallExt;
-#[cfg(feature = "shell")]
+#[cfg(feature = "ops-shell")]
 use std::sync::Arc;
 
-#[cfg(feature = "shell")]
+#[cfg(feature = "ops-shell")]
 use crate::iam::kernel::SecurityKernel;
 
-#[cfg(feature = "shell")]
+#[cfg(feature = "ops-shell")]
 #[derive(Clone)]
 pub struct GuardedCommand {
     pub inner: Box<dyn Command>,
     pub kernel: Arc<SecurityKernel>,
 }
 
-#[cfg(feature = "shell")]
+#[cfg(feature = "ops-shell")]
 impl Command for GuardedCommand {
     fn name(&self) -> &str {
         self.inner.name()

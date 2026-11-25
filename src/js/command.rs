@@ -44,7 +44,7 @@ impl Command for JsCommand {
             }
             c
         } else {
-            #[cfg(all(feature = "shell", not(any(target_os = "android", target_os = "ios"))))]
+            #[cfg(all(feature = "ops-shell", not(any(target_os = "android", target_os = "ios"))))]
             {
                 // Interactive Sub-REPL
                 use rustyline::error::ReadlineError;
@@ -89,11 +89,11 @@ impl Command for JsCommand {
                                         nu_cli::EvaluateCommandsOpts::default(),
                                     );
                                     if let Err(e) = result {
-                                        eprintln!("❌ Rendering Error: {:?}", e);
+                                        eprintln!("âŒ Rendering Error: {:?}", e);
                                     }
                                 }
                                 Err(e) => {
-                                    eprintln!("❌ Error: {:?}", e);
+                                    eprintln!("âŒ Error: {:?}", e);
                                 }
                             }
                         },
@@ -112,7 +112,7 @@ impl Command for JsCommand {
                 }
                 return Ok(PipelineData::empty());
             }
-            #[cfg(not(all(feature = "shell", not(any(target_os = "android", target_os = "ios")))))]
+            #[cfg(not(all(feature = "ops-shell", not(any(target_os = "android", target_os = "ios")))))]
             {
                 return Err(crate::shell_err(
                     "Interactive JS REPL not compiled",

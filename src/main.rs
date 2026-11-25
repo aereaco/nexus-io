@@ -1,4 +1,4 @@
-#[cfg(not(feature = "shell"))]
+#[cfg(not(feature = "ops-shell"))]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     use nexus_io::{db, storage, ux};
     use std::sync::Arc;
@@ -44,7 +44,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         let gw = ux::UxGateway::new(db, bridge, ux::GatewayConfig::default());
         println!(
-            "🚀 Nexus-IO Sovereign Microkernel ({}) starting on http://127.0.0.1:8080",
+            "ðŸš€ Nexus-IO Sovereign Microkernel ({}) starting on http://127.0.0.1:8080",
             nexus_io::runtime::CapabilityRegistry::active_profile()
         );
         gw.start().await
@@ -52,23 +52,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[cfg(feature = "shell")]
+#[cfg(feature = "ops-shell")]
 use nexus_io::{compute, db, economy, iam, js, shell, storage, ux};
 
-#[cfg(feature = "shell")]
+#[cfg(feature = "ops-shell")]
 use std::sync::Arc;
-#[cfg(feature = "shell")]
+#[cfg(feature = "ops-shell")]
 use std::time::Instant;
-#[cfg(feature = "shell")]
+#[cfg(feature = "ops-shell")]
 use nu_protocol::engine::{StateWorkingSet, Stack};
-#[cfg(feature = "shell")]
+#[cfg(feature = "ops-shell")]
 use nu_cmd_lang::create_default_context;
-#[cfg(feature = "shell")]
+#[cfg(feature = "ops-shell")]
 use nu_command::add_shell_command_context;
-#[cfg(feature = "shell")]
+#[cfg(feature = "ops-shell")]
 use nu_protocol::{Value, Span};
 
-#[cfg(feature = "shell")]
+#[cfg(feature = "ops-shell")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
     let is_test = args.contains(&"--test".to_string());
@@ -150,7 +150,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
             
-            #[cfg(all(feature = "shell", not(any(target_os = "android", target_os = "ios"))))]
+            #[cfg(all(feature = "ops-shell", not(any(target_os = "android", target_os = "ios"))))]
             if let Err(e) = nu_cli::evaluate_commands(
                 &nu_protocol::Spanned { item: "table".to_string(), span: nu_protocol::Span::unknown() },
                 &mut engine_state,
@@ -162,7 +162,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                  nu_protocol::report_shell_error(None, &engine_state, &e);
                  std::process::exit(1);
             }
-            #[cfg(not(all(feature = "shell", not(any(target_os = "android", target_os = "ios")))))]
+            #[cfg(not(all(feature = "ops-shell", not(any(target_os = "android", target_os = "ios")))))]
             {
                 println!("{}", result.to_abbreviated_string(&nu_protocol::Config::default()));
             }
@@ -179,7 +179,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     rt.block_on(async_main(args, is_test))
 }
 
-#[cfg(feature = "shell")]
+#[cfg(feature = "ops-shell")]
 async fn async_main(args: Vec<String>, is_test: bool) -> Result<(), Box<dyn std::error::Error>> {
     let _start_time = Instant::now();
     // 2. Parallel Genesis (Full Planes for Complex Tasks)
@@ -208,14 +208,14 @@ async fn async_main(args: Vec<String>, is_test: bool) -> Result<(), Box<dyn std:
     let economy = Arc::new(economy::EconomicKernel::new(db.clone()));
     
     // Initialize Mesh Network lazily (only when `vpn` feature is compiled AND `NEXUS_ENABLE_MESH=1`)
-    #[cfg(feature = "vpn")]
+    #[cfg(feature = "net-vpn")]
     if std::env::var("NEXUS_ENABLE_MESH").as_deref() == Ok("1") {
         let db_clone = db.clone();
         let bridge_clone = bridge.clone();
         tokio::spawn(async move {
             match storage::WireGuardManager::init_mesh(db_clone.clone()).await {
                 Ok(Some(interface)) => {
-                    println!("✅ Mesh Interface Active. Starting Reactor...");
+                    println!("âœ… Mesh Interface Active. Starting Reactor...");
                     let reactor = Arc::new(storage::MeshReactor::new(
                         db_clone,
                         interface,
@@ -224,7 +224,7 @@ async fn async_main(args: Vec<String>, is_test: bool) -> Result<(), Box<dyn std:
                     reactor.start().await;
                 }
                 Ok(None) => {}
-                Err(e) => eprintln!("⚠️  Mesh Initialization Warning: {}", e),
+                Err(e) => eprintln!("âš ï¸  Mesh Initialization Warning: {}", e),
             }
         });
     }
@@ -239,7 +239,7 @@ async fn async_main(args: Vec<String>, is_test: bool) -> Result<(), Box<dyn std:
     let gateway = ux::UxGateway::new(db.clone(), bridge.clone(), gateway_config);
     tokio::spawn(async move {
         if let Err(e) = gateway.start().await {
-            eprintln!("❌ UX Gateway Error: {}", e);
+            eprintln!("âŒ UX Gateway Error: {}", e);
         }
     });
 
@@ -353,7 +353,7 @@ async fn async_main(args: Vec<String>, is_test: bool) -> Result<(), Box<dyn std:
         kernel: kernel.clone(),
     }));
 
-    #[cfg(feature = "k8s-bridge")]
+    #[cfg(feature = "ops-k8s")]
     {
         working_set.add_decl(Box::new(iam::GuardedCommand {
             inner: Box::new(compute::k8s_bridge::K8sImportCommand {
@@ -453,7 +453,7 @@ async fn async_main(args: Vec<String>, is_test: bool) -> Result<(), Box<dyn std:
             positional_args.join(" ")
         };
 
-        #[cfg(all(feature = "shell", not(any(target_os = "android", target_os = "ios"))))]
+        #[cfg(all(feature = "ops-shell", not(any(target_os = "android", target_os = "ios"))))]
         {
             let command_spanned = nu_protocol::Spanned {
                 item: command,
@@ -473,7 +473,7 @@ async fn async_main(args: Vec<String>, is_test: bool) -> Result<(), Box<dyn std:
                 std::process::exit(1);
             }
         }
-        #[cfg(not(all(feature = "shell", not(any(target_os = "android", target_os = "ios")))))]
+        #[cfg(not(all(feature = "ops-shell", not(any(target_os = "android", target_os = "ios")))))]
         {
             let mut working_set = StateWorkingSet::new(&engine_state);
             let block = nu_parser::parse(&mut working_set, None, command.as_bytes(), false);
@@ -502,7 +502,7 @@ async fn async_main(args: Vec<String>, is_test: bool) -> Result<(), Box<dyn std:
             }
         }
     } else {
-        #[cfg(all(feature = "shell", not(any(target_os = "android", target_os = "ios"))))]
+        #[cfg(all(feature = "ops-shell", not(any(target_os = "android", target_os = "ios"))))]
         {
             let result = nu_cli::evaluate_repl(
                 &mut engine_state,
@@ -516,10 +516,10 @@ async fn async_main(args: Vec<String>, is_test: bool) -> Result<(), Box<dyn std:
                 std::process::exit(1);
             }
         }
-        #[cfg(not(all(feature = "shell", not(any(target_os = "android", target_os = "ios")))))]
+        #[cfg(not(all(feature = "ops-shell", not(any(target_os = "android", target_os = "ios")))))]
         {
             println!(
-                "🚀 Nexus-IO ({}) ready (headless profile — pass a command or rebuild with `--features shell` for interactive REPL).",
+                "ðŸš€ Nexus-IO ({}) ready (headless profile â€” pass a command or rebuild with `--features shell` for interactive REPL).",
                 nexus_io::runtime::CapabilityRegistry::active_profile()
             );
         }

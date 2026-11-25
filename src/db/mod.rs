@@ -5,7 +5,7 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 use std::sync::{Arc, RwLock};
 
-#[cfg(feature = "shell")]
+#[cfg(feature = "ops-shell")]
 pub mod command;
 pub mod sql_compiler;
 pub mod state_engine;

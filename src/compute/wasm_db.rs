@@ -414,10 +414,10 @@ impl WasmDbMount {
             );
         }
 
-        // Recoverable Acquire-Before-Commit Ownership Transaction:
+        // Recoverable Write-Ahead Ownership Transaction:
         // 1. Write new content-addressed blobs
-        // 2. Acquire ownership of all NEW CIDs FIRST (invariant: manifest NEVER references unowned blobs)
-        // 3. Persist OwnershipTx record
+        // 2. Persist OwnershipTx intent journal FIRST (true WAL: closes crash window before acquire)
+        // 3. Acquire ownership of all NEW CIDs BEFORE committing manifest
         // 4. Atomically commit WasmDbCellRecord (manifest + expired/released lease) using live ETag
         // 5. Release superseded OLD CIDs via 3-state Drop & finalize OwnershipTx
         let commit_res: Result<()> = async {
@@ -440,11 +440,7 @@ impl WasmDbMount {
             let newly_added: Vec<String> = next_cids.difference(&prev_cids).cloned().collect();
             let superseded: Vec<String> = prev_cids.difference(&next_cids).cloned().collect();
 
-            // Step 2: Acquire ownership of NEW CIDs BEFORE committing manifest
-            cas.acquire_owners_batch(WASM_DB_BUCKET, &owner_id, &newly_added)
-                .await?;
-
-            // Step 3: Persist recoverable OwnershipTx record
+            // Step 2 (WAL): Persist recoverable OwnershipTx intent journal BEFORE acquiring ownership
             let tx_id = uuid::Uuid::new_v4().simple().to_string();
             let tx = OwnershipTx {
                 tx_id: tx_id.clone(),
@@ -455,10 +451,21 @@ impl WasmDbMount {
                 prev_cids: superseded.clone(),
                 created_at_ms: now_ms(),
             };
-            if let Err(e) = cas.begin_ownership_tx(WASM_DB_BUCKET, &tx).await {
-                let _ = cas
+            cas.begin_ownership_tx(WASM_DB_BUCKET, &tx).await?;
+
+            // Step 3: Acquire ownership of NEW CIDs BEFORE committing manifest
+            if let Err(e) = cas
+                .acquire_owners_batch(WASM_DB_BUCKET, &owner_id, &newly_added)
+                .await
+            {
+                // Journal remains on disk if rollback fails so boot replay cleans up safely
+                if cas
                     .release_owners_batch(WASM_DB_BUCKET, "blobs/", &owner_id, &newly_added)
-                    .await;
+                    .await
+                    .is_ok()
+                {
+                    let _ = cas.finalize_ownership_tx(WASM_DB_BUCKET, &tx_id).await;
+                }
                 return Err(e);
             }
 

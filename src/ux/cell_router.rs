@@ -4,7 +4,7 @@ use salvo::prelude::*;
 use salvo::websocket::{Message, WebSocketUpgrade};
 use std::sync::Arc;
 
-#[cfg(feature = "k8s-bridge")]
+#[cfg(feature = "ops-k8s")]
 use crate::compute::k8s_bridge::{export_k8s_yaml, import_k8s_yaml, ExportOptions};
 use crate::compute::md_runtime::deploy_markdown;
 use crate::db::Database;
@@ -104,7 +104,7 @@ impl Handler for CellGatewayHandler {
         }
 
         // POST /cells/import-k8s -> import Kubernetes YAML into Nexus .md (requires CellSpawn)
-        #[cfg(feature = "k8s-bridge")]
+        #[cfg(feature = "ops-k8s")]
         if req.method() == &Method::POST && req.uri().path().trim_end_matches('/') == "/cells/import-k8s" {
             if !require_capability(depot, res, Capability::CellSpawn) {
                 return;
@@ -149,7 +149,7 @@ impl Handler for CellGatewayHandler {
         }
 
         // POST /cells/export-k8s -> export Nexus .md service document to standard Kubernetes YAML
-        #[cfg(feature = "k8s-bridge")]
+        #[cfg(feature = "ops-k8s")]
         if req.method() == &Method::POST && req.uri().path().trim_end_matches('/') == "/cells/export-k8s" {
             let md = match req.payload().await {
                 Ok(bytes) => String::from_utf8_lossy(bytes).to_string(),
@@ -183,7 +183,7 @@ impl Handler for CellGatewayHandler {
         }
 
         // POST /cells/_runtimes/pull -> pull Wasm runtime from OCI v2 registry (requires RuntimeInstall)
-        #[cfg(all(feature = "wasm-runtime", feature = "oci-registry"))]
+        #[cfg(all(feature = "runtime-wasm", feature = "runtime-oci"))]
         if req.method() == &Method::POST && req.uri().path().trim_end_matches('/') == "/cells/_runtimes/pull" {
             if !require_capability(depot, res, Capability::RuntimeInstall) {
                 return;
@@ -216,7 +216,7 @@ impl Handler for CellGatewayHandler {
         }
 
         // GET /cells/_runtimes -> list registered WASI guest runtimes (quickjs, php-cgi, sqlite, pglite, ...)
-        #[cfg(feature = "wasm-runtime")]
+        #[cfg(feature = "runtime-wasm")]
         if req.method() == &Method::GET && req.uri().path().trim_end_matches('/') == "/cells/_runtimes" {
             let runtimes = self.cells.runtimes().list_runtimes().await;
             res.status_code(StatusCode::OK);
@@ -225,7 +225,7 @@ impl Handler for CellGatewayHandler {
         }
 
         // PUT /cells/_runtimes/<name> -> register & AOT-precompile a WASI guest runtime (requires RuntimeInstall)
-        #[cfg(feature = "wasm-runtime")]
+        #[cfg(feature = "runtime-wasm")]
         if req.method() == &Method::PUT {
             let runtime_name = req
                 .uri()
@@ -260,7 +260,7 @@ impl Handler for CellGatewayHandler {
         }
 
         // DELETE /cells/_runtimes/<name> -> uninstall a WASI guest runtime (requires RuntimeInstall)
-        #[cfg(feature = "wasm-runtime")]
+        #[cfg(feature = "runtime-wasm")]
         if req.method() == &Method::DELETE {
             let runtime_name = req
                 .uri()
@@ -398,7 +398,7 @@ impl Handler for CellGatewayHandler {
                         return;
                     }
                 };
-                #[cfg(feature = "wasm-runtime")]
+                #[cfg(feature = "runtime-wasm")]
                 if runtime_hdr.as_deref() == Some("js-wasm") || runtime_hdr.as_deref() == Some("quickjs") {
                     let script = String::from_utf8_lossy(&raw_bytes).to_string();
                     match self
@@ -467,7 +467,7 @@ impl Handler for CellGatewayHandler {
                         return;
                     }
                 };
-                #[cfg(all(feature = "wasm-runtime", not(target_os = "ios")))]
+                #[cfg(all(feature = "runtime-wasm", not(target_os = "ios")))]
                 if self.cells.is_wasm_workload(&app, &cell_id).await {
                     let query = req.uri().query().unwrap_or("");
                     match self
@@ -535,7 +535,7 @@ impl Handler for CellGatewayHandler {
 
             // GET /cells/<app>/<cell_id> -> invoke WASI/CGI handler or WinterCG fetch(request)
             &Method::GET => {
-                #[cfg(all(feature = "wasm-runtime", not(target_os = "ios")))]
+                #[cfg(all(feature = "runtime-wasm", not(target_os = "ios")))]
                 if self.cells.is_wasm_workload(&app, &cell_id).await {
                     let query = req.uri().query().unwrap_or("");
                     match self
