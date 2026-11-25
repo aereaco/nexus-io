@@ -9,7 +9,9 @@ use wasmtime_wasi::{FsPerms, WasiCtxBuilder};
 
 use crate::db::sql_compiler::execute_unified_query;
 use crate::db::StateEngine;
+use crate::iam::capabilities::{is_mutating_query, Capability, CapabilitySet};
 use crate::js::cell::{CellDbConfig, CellDbTransport, CellManager};
+use crate::observability::global_metrics;
 use crate::storage::BlobBridge;
 
 fn wt_err(e: wasmtime::Error) -> anyhow::Error {
@@ -18,12 +20,14 @@ fn wt_err(e: wasmtime::Error) -> anyhow::Error {
 
 /// Capability-scoped host context exposed to WASI guests via the `nexus_host` ABI.
 /// Every guest language (JS/TS via `quickjs.wasm`, PHP/WordPress, Python, Go, Rust)
-/// inherits `CellDbConfig` enforcement and `BlobBridge` isolation through this single boundary.
+/// inherits `EffectiveCapabilities`, `CellDbConfig` enforcement, and `BlobBridge` isolation
+/// through this single microkernel syscall boundary.
 #[derive(Clone)]
 pub struct NexusHostContext {
     pub app: String,
     pub cell_id: String,
     pub db_config: CellDbConfig,
+    pub capabilities: CapabilitySet,
     pub engine: Arc<dyn StateEngine>,
     pub blobs: Arc<BlobBridge>,
     pub logs: Arc<Mutex<Vec<String>>>,
@@ -37,14 +41,26 @@ impl NexusHostContext {
         engine: Arc<dyn StateEngine>,
         blobs: Arc<BlobBridge>,
     ) -> Self {
+        let capabilities = CapabilitySet::resolve_effective(
+            &CapabilitySet::standard_cell(),
+            &CapabilitySet::standard_cell(),
+            None,
+            &db_config,
+        );
         Self {
             app: app.into(),
             cell_id: cell_id.into(),
             db_config,
+            capabilities,
             engine,
             blobs,
             logs: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    pub fn with_capabilities(mut self, caps: CapabilitySet) -> Self {
+        self.capabilities = caps;
+        self
     }
 }
 
@@ -376,6 +392,7 @@ impl CrystalEngine {
                 if let Some(exit) = err.downcast_ref::<wasmtime_wasi::I32Exit>() {
                     exit.0
                 } else {
+                    global_metrics().inc_compute_trap();
                     return Err(wt_err(err));
                 }
             }
@@ -383,6 +400,7 @@ impl CrystalEngine {
 
         let remaining = store.get_fuel().unwrap_or(0);
         let fuel_consumed = cfg.fuel_limit.saturating_sub(remaining);
+        global_metrics().inc_compute_exec(fuel_consumed);
 
         Ok(WasiRunOutput {
             exit_code,
@@ -501,6 +519,14 @@ fn register_nexus_host_abi(linker: &mut Linker<CrystalWasiState>) -> Result<()> 
                 let Some(host) = caller.data().host.clone() else {
                     return -1;
                 };
+                // Enforce formal EffectiveCapabilities before touching StateEngine
+                let mutating = is_mutating_query(&query);
+                if (mutating && !host.capabilities.has(Capability::DbWrite))
+                    || (!mutating && !host.capabilities.has(Capability::DbRead))
+                {
+                    global_metrics().inc_iam_auth_denial();
+                    return -2;
+                }
                 let Ok(binding) = CellManager::check_db_config(
                     &host.db_config,
                     &host.app,
@@ -571,6 +597,10 @@ fn register_nexus_host_abi(linker: &mut Linker<CrystalWasiState>) -> Result<()> 
                 let Some(host) = caller.data().host.clone() else {
                     return -1;
                 };
+                if !host.capabilities.has(Capability::BlobWrite) {
+                    global_metrics().inc_iam_auth_denial();
+                    return -2;
+                }
                 let bucket = String::from_utf8_lossy(&b).to_string();
                 let key = String::from_utf8_lossy(&k).to_string();
                 let res = run_host_future(async move {
@@ -605,6 +635,10 @@ fn register_nexus_host_abi(linker: &mut Linker<CrystalWasiState>) -> Result<()> 
                 let Some(host) = caller.data().host.clone() else {
                     return -1;
                 };
+                if !host.capabilities.has(Capability::BlobRead) {
+                    global_metrics().inc_iam_auth_denial();
+                    return -2;
+                }
                 let bucket = String::from_utf8_lossy(&b).to_string();
                 let key = String::from_utf8_lossy(&k).to_string();
                 match run_host_future(host.blobs.get_object(&bucket, &key)) {

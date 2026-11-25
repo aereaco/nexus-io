@@ -9,7 +9,7 @@ use tokio::sync::{Mutex, RwLock};
 
 use crate::compute::crystal::{CrystalEngine, WasiRunConfig};
 use crate::compute::wasm_registry::{ResolvedRuntime, WasmRuntimeRegistry};
-use crate::storage::BlobBridge;
+use crate::storage::{BlobBridge, CasStore};
 
 pub const WASM_DB_BUCKET: &str = "nexus-wasm-db";
 
@@ -51,10 +51,22 @@ impl WasmDbMount {
             return lock;
         }
         let mut guard = self.cell_locks.write().await;
+        // Bounded lock map hygiene: evict uncontended locks when map exceeds 256 entries
+        if guard.len() >= 256 {
+            guard.retain(|_, v| Arc::strong_count(v) > 1);
+        }
         guard
             .entry(key)
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone()
+    }
+
+    /// Explicitly evict uncontended per-cell locks (called on cell hibernation/cleanup).
+    pub async fn evict_idle_locks(&self) -> usize {
+        let mut guard = self.cell_locks.write().await;
+        let before = guard.len();
+        guard.retain(|_, v| Arc::strong_count(v) > 1);
+        before.saturating_sub(guard.len())
     }
 
     /// Read the current multi-file manifest for `(app, cell_id)` from `BlobBridge`.
@@ -100,9 +112,13 @@ impl WasmDbMount {
             Err(_) => registry.resolve_runtime(engine_name).await?,
         };
 
-        // 3. Hydrate entire multi-file virtual directory tree from BlobBridge
-        let _ = blobs.create_bucket(WASM_DB_BUCKET).await;
-        let prev_manifest = Self::read_manifest(blobs, app, cell_id).await?;
+        // 3. Hydrate entire multi-file virtual directory tree via shared CasStore (BLAKE3 verified)
+        let cas = CasStore::new(blobs.clone());
+        let manifest_key = format!("cells/{}/{}/manifest.json", app, cell_id);
+        let (prev_manifest, prev_etag) = match cas.read_manifest::<WasmDbFsManifest>(WASM_DB_BUCKET, &manifest_key).await? {
+            Some((m, etag)) => (m, Some(etag)),
+            None => (WasmDbFsManifest::default(), None),
+        };
         let work_dir = std::env::temp_dir().join(format!(
             "nexus_wasmdb_{}_{}_{}",
             sanitize(app),
@@ -116,16 +132,13 @@ impl WasmDbMount {
             if let Some(parent) = dest.parent() {
                 tokio::fs::create_dir_all(parent).await?;
             }
-            let data = blobs
-                .get_object(WASM_DB_BUCKET, &format!("blobs/{}", cid))
-                .await?
-                .ok_or_else(|| {
-                    anyhow!(
-                        "Missing Wasm DB blob '{}' for file '{}' in {}/{}",
-                        cid,
-                        rel_path,
-                        app,
-                        cell_id
+            let data = cas
+                .get_verified_blob(WASM_DB_BUCKET, "blobs/", cid)
+                .await
+                .with_context(|| {
+                    format!(
+                        "Failed to hydrate verified Wasm DB file '{}' (cid={}) for {}/{}",
+                        rel_path, cid, app, cell_id
                     )
                 })?;
             tokio::fs::write(&dest, &data).await?;
@@ -189,30 +202,22 @@ impl WasmDbMount {
             );
         }
 
-        // 5. Walk entire workspace dir, persist all files content-addressed, and atomically commit manifest.
-        // Every persistence error is strictly propagated (never silently ignored).
+        // 5. Walk workspace, store verified immutable blobs, and atomically commit manifest via CAS.
+        // Coordinates safely across processes/nodes; every persistence error is strictly propagated.
         let commit_res: Result<()> = async {
             let walked = collect_dir_files(&work_dir, &work_dir).await?;
             let mut next_files = BTreeMap::new();
             for (rel_path, full_path) in walked {
                 let bytes = tokio::fs::read(&full_path).await?;
-                let cid = blake3::hash(&bytes).to_hex().to_string();
-                let unchanged = prev_manifest
-                    .files
-                    .get(&rel_path)
-                    .map(|prev_cid| prev_cid == &cid)
-                    .unwrap_or(false);
-                if !unchanged {
-                    blobs
-                        .put_object(WASM_DB_BUCKET, &format!("blobs/{}", cid), Bytes::from(bytes))
-                        .await
-                        .with_context(|| {
-                            format!(
-                                "Failed to persist Wasm DB file '{}' (cid={}) for {}/{}",
-                                rel_path, cid, app, cell_id
-                            )
-                        })?;
-                }
+                let cid = cas
+                    .put_verified_blob(WASM_DB_BUCKET, "blobs/", Bytes::from(bytes))
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "Failed to persist Wasm DB file '{}' for {}/{}",
+                            rel_path, app, cell_id
+                        )
+                    })?;
                 next_files.insert(rel_path, cid);
             }
 
@@ -220,17 +225,19 @@ impl WasmDbMount {
                 version: prev_manifest.version + 1,
                 files: next_files,
             };
-            let manifest_bytes = serde_json::to_vec(&next_manifest)?;
-            let manifest_key = format!("cells/{}/{}/manifest.json", app, cell_id);
-            blobs
-                .put_object(WASM_DB_BUCKET, &manifest_key, Bytes::from(manifest_bytes))
-                .await
-                .with_context(|| {
-                    format!(
-                        "Failed to commit WasmDbFsManifest v{} for {}/{}",
-                        next_manifest.version, app, cell_id
-                    )
-                })?;
+            cas.commit_manifest_cas(
+                WASM_DB_BUCKET,
+                &manifest_key,
+                &next_manifest,
+                prev_etag.as_deref(),
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "Atomic CAS commit failed for WasmDbFsManifest v{} ({}/{})",
+                    next_manifest.version, app, cell_id
+                )
+            })?;
             Ok(())
         }
         .await;

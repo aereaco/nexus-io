@@ -1,12 +1,16 @@
 // SurrealDB-compatible WebSocket RPC Handler powered directly by `nexus_db::rpc::RpcSession`.
+// Inherits the canonical `AuthContext` attached by `IamMiddleware` (no anonymous WS sessions).
 
 use futures::{SinkExt, StreamExt};
+use nexus_db::auth::AuthContext;
 use salvo::async_trait;
 use salvo::prelude::*;
 use salvo::websocket::{Message, WebSocket, WebSocketUpgrade};
 use std::sync::Arc;
 
 use crate::db::Database;
+use crate::ux::iam::depot_auth_context;
+use crate::ux::surreal_http::extract_ns_db;
 
 /// WebSocket handler exposing SurrealDB JSON-RPC 2.0 & CBOR wire protocol over `/rpc`.
 #[derive(Clone)]
@@ -19,20 +23,32 @@ impl Handler for WebSocketHandler {
     async fn handle(
         &self,
         req: &mut Request,
-        _depot: &mut Depot,
+        depot: &mut Depot,
         res: &mut Response,
         _ctrl: &mut FlowCtrl,
     ) {
         let db = self.db.clone();
+        let (ns, database) = extract_ns_db(req);
+        let auth = depot_auth_context(depot);
         let _ = WebSocketUpgrade::new()
-            .upgrade(req, res, move |ws| handle_websocket_connection(ws, db))
+            .upgrade(req, res, move |ws| {
+                handle_websocket_connection(ws, db, ns, database, auth)
+            })
             .await;
     }
 }
 
-async fn handle_websocket_connection(ws: WebSocket, db: Arc<Database>) {
+async fn handle_websocket_connection(
+    ws: WebSocket,
+    db: Arc<Database>,
+    ns: String,
+    database: String,
+    auth: Option<AuthContext>,
+) {
     let (mut ws_tx, mut ws_rx) = ws.split();
-    let mut session = db.inner.rpc_session("nexus", "system");
+    let mut session = db.inner.rpc_session(&ns, &database);
+    // Propagate canonical authenticated identity from `IamMiddleware` into `RpcSession`
+    session.auth = auth;
     let mut live_tick = tokio::time::interval(std::time::Duration::from_millis(50));
 
     loop {

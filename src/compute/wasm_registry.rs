@@ -7,10 +7,53 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use crate::compute::crystal::CrystalEngine;
-use crate::storage::BlobBridge;
+use crate::observability::global_metrics;
+use crate::storage::{BlobBridge, CasStore};
 
 pub const RUNTIMES_BUCKET: &str = "nexus-runtimes";
 const CATALOG_INDEX_KEY: &str = "index.json";
+
+/// Runtime compatibility key binding AOT `.cwasm` artifacts to the exact Wasmtime major version,
+/// target OS, and CPU architecture so incompatible pre-compiled machine code is never loaded.
+pub fn current_aot_compat_key() -> String {
+    format!(
+        "wasmtime-51-{}-{}",
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    )
+}
+
+/// Operator trust policy governing which OCI registries/publishers may be installed and
+/// whether installed runtime names are immutable (must be explicitly uninstalled before replacing).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RuntimeTrustPolicy {
+    /// If non-empty, OCI pulls are only permitted from these registry hostnames (e.g. `["ghcr.io"]`).
+    pub allowed_registries: Vec<String>,
+    /// When true, registering an already-installed runtime name with a different CID is rejected
+    /// until `uninstall_runtime()` is explicitly called.
+    pub immutable_versions: bool,
+}
+
+/// Strict validation of runtime names/aliases (prevents path traversal, control chars, or empty keys).
+pub fn validate_runtime_name(name: &str) -> Result<String> {
+    let norm = name.trim().to_ascii_lowercase();
+    if norm.is_empty() || norm.len() > 64 {
+        anyhow::bail!("Invalid runtime name '{}': must be 1..=64 characters", name);
+    }
+    if norm.contains("..") || norm.starts_with('.') || norm.starts_with('-') {
+        anyhow::bail!("Invalid runtime name '{}': illegal leading char or '..'", name);
+    }
+    if !norm
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_' | b'-'))
+    {
+        anyhow::bail!(
+            "Invalid runtime name '{}': only [a-z0-9._-] characters are allowed",
+            name
+        );
+    }
+    Ok(norm)
+}
 
 pub const OCI_WASM_LAYER_MEDIA_TYPE: &str = "application/vnd.wasm.content.layer.v1+wasm";
 pub const OCI_NEXUS_POLICY_MEDIA_TYPE: &str = "application/vnd.nexus.policy.v1+json";
@@ -51,6 +94,8 @@ pub struct RuntimeRecord {
     pub cid: String,
     pub size_bytes: usize,
     pub aot_cached: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aot_compat: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub oci_source: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -152,21 +197,31 @@ pub enum ResolvedRuntime {
 #[derive(Clone)]
 pub struct WasmRuntimeRegistry {
     blobs: Arc<BlobBridge>,
+    cas: CasStore,
     index: Arc<RwLock<BTreeMap<String, RuntimeRecord>>>,
+    index_etag: Arc<RwLock<Option<String>>>,
+    trust_policy: Arc<RwLock<RuntimeTrustPolicy>>,
     hydrated: Arc<RwLock<bool>>,
 }
 
 impl WasmRuntimeRegistry {
     pub fn new(blobs: Arc<BlobBridge>) -> Self {
+        let cas = CasStore::new(blobs.clone());
         Self {
             blobs,
+            cas,
             index: Arc::new(RwLock::new(BTreeMap::new())),
+            index_etag: Arc::new(RwLock::new(None)),
+            trust_policy: Arc::new(RwLock::new(RuntimeTrustPolicy::default())),
             hydrated: Arc::new(RwLock::new(false)),
         }
     }
 
-    /// Lazily hydrate the durable catalog index (`index.json`) from `BlobBridge` so installed
-    /// runtimes, CIDs, OCI sources, and requested policies survive full process restarts.
+    pub async fn set_trust_policy(&self, policy: RuntimeTrustPolicy) {
+        *self.trust_policy.write().await = policy;
+    }
+
+    /// Lazily hydrate the durable catalog index (`index.json`) and its CAS ETag from `BlobBridge`.
     async fn ensure_hydrated(&self) -> Result<()> {
         if *self.hydrated.read().await {
             return Ok(());
@@ -175,27 +230,46 @@ impl WasmRuntimeRegistry {
         if *h {
             return Ok(());
         }
-        if let Some(bytes) = self.blobs.get_object(RUNTIMES_BUCKET, CATALOG_INDEX_KEY).await? {
-            let persisted: BTreeMap<String, RuntimeRecord> = serde_json::from_slice(&bytes)
-                .with_context(|| "Corrupted WasmRuntimeRegistry index.json in BlobBridge")?;
+        if let Some((persisted, etag)) = self
+            .cas
+            .read_manifest::<BTreeMap<String, RuntimeRecord>>(RUNTIMES_BUCKET, CATALOG_INDEX_KEY)
+            .await?
+        {
             let mut idx = self.index.write().await;
             for (k, v) in persisted {
                 idx.entry(k).or_insert(v);
             }
+            *self.index_etag.write().await = Some(etag);
         }
         *h = true;
         Ok(())
     }
 
-    /// Atomically persist the durable catalog index (`index.json`) to `BlobBridge`.
+    /// Atomically persist the durable catalog index (`index.json`) via CAS `commit_manifest_cas`.
     async fn persist_index(&self) -> Result<()> {
         let snapshot = self.index.read().await.clone();
-        let json = serde_json::to_vec(&snapshot)?;
-        self.blobs
-            .put_object(RUNTIMES_BUCKET, CATALOG_INDEX_KEY, Bytes::from(json))
+        let expected = self.index_etag.read().await.clone();
+        let new_etag = self
+            .cas
+            .commit_manifest_cas(RUNTIMES_BUCKET, CATALOG_INDEX_KEY, &snapshot, expected.as_deref())
             .await
-            .with_context(|| "Failed to persist WasmRuntimeRegistry catalog index.json")?;
+            .with_context(|| "Atomic CAS commit failed for WasmRuntimeRegistry index.json")?;
+        *self.index_etag.write().await = Some(new_etag);
         Ok(())
+    }
+
+    /// Explicitly uninstall a registered runtime from the durable catalog and remove its name aliases.
+    pub async fn uninstall_runtime(&self, name: &str) -> Result<bool> {
+        self.ensure_hydrated().await?;
+        let norm = validate_runtime_name(name)?;
+        let removed = self.index.write().await.remove(&norm).is_some();
+        if removed {
+            let compat = current_aot_compat_key();
+            let _ = self.blobs.delete_object(RUNTIMES_BUCKET, &format!("raw/{}.wasm", norm)).await;
+            let _ = self.blobs.delete_object(RUNTIMES_BUCKET, &format!("aot/{}/{}.cwasm", compat, norm)).await;
+            self.persist_index().await?;
+        }
+        Ok(removed)
     }
 
     /// Register a `.wasm` or `.wat` guest runtime under `name` (e.g. `"quickjs"`, `"php-cgi"`, `"sqlite"`),
@@ -215,23 +289,41 @@ impl WasmRuntimeRegistry {
         requested_policy: Option<NexusPackagePolicy>,
     ) -> Result<RuntimeRecord> {
         self.ensure_hydrated().await?;
-        let norm = name.trim().to_ascii_lowercase();
-        if norm.is_empty() {
-            anyhow::bail!("Runtime name cannot be empty");
-        }
+        let norm = validate_runtime_name(name)?;
         let _ = self.blobs.create_bucket(RUNTIMES_BUCKET).await;
 
         let cid = blake3::hash(wasm_or_wat).to_hex().to_string();
+
+        // Enforce immutable version policy if enabled
+        let policy = self.trust_policy.read().await.clone();
+        if policy.immutable_versions {
+            if let Some(existing) = self.index.read().await.get(&norm) {
+                if existing.cid != cid {
+                    anyhow::bail!(
+                        "Runtime '{}' is immutable (installed CID {}). Uninstall first or publish under a new versioned name.",
+                        norm,
+                        existing.cid
+                    );
+                }
+            }
+        }
 
         // Compile AOT first (before writing to catalog) so invalid Wasm fails cleanly without polluting state
         #[cfg(not(target_os = "ios"))]
         let compiled_aot = {
             let input = wasm_or_wat.to_vec();
-            tokio::task::spawn_blocking(move || {
+            match tokio::task::spawn_blocking(move || {
                 let crystal = CrystalEngine::new()?;
                 crystal.compile_aot(&input)
             })
-            .await??
+            .await?
+            {
+                Ok(b) => b,
+                Err(e) => {
+                    global_metrics().inc_registry_aot_failure();
+                    return Err(e);
+                }
+            }
         };
 
         let raw_bytes = Bytes::copy_from_slice(wasm_or_wat);
@@ -242,32 +334,35 @@ impl WasmRuntimeRegistry {
             .put_object(RUNTIMES_BUCKET, &format!("cid/{}", cid), raw_bytes)
             .await?;
 
+        let compat = current_aot_compat_key();
         #[cfg(not(target_os = "ios"))]
-        let aot_cached = {
+        let (aot_cached, aot_compat) = {
             let aot_bytes = Bytes::from(compiled_aot);
             self.blobs
-                .put_object(RUNTIMES_BUCKET, &format!("aot/{}.cwasm", norm), aot_bytes.clone())
+                .put_object(RUNTIMES_BUCKET, &format!("aot/{}/{}.cwasm", compat, norm), aot_bytes.clone())
                 .await?;
             self.blobs
-                .put_object(RUNTIMES_BUCKET, &format!("aot-cid/{}.cwasm", cid), aot_bytes)
+                .put_object(RUNTIMES_BUCKET, &format!("aot-cid/{}/{}.cwasm", compat, cid), aot_bytes)
                 .await?;
-            true
+            (true, Some(compat))
         };
 
         #[cfg(target_os = "ios")]
-        let aot_cached = false;
+        let (aot_cached, aot_compat) = (false, None);
 
         let rec = RuntimeRecord {
             name: norm.clone(),
             cid,
             size_bytes: wasm_or_wat.len(),
             aot_cached,
+            aot_compat,
             oci_source,
             sha256_digest,
             requested_policy,
         };
         self.index.write().await.insert(norm, rec.clone());
         self.persist_index().await?;
+        global_metrics().inc_registry_register();
         Ok(rec)
     }
 
@@ -310,6 +405,24 @@ impl WasmRuntimeRegistry {
         max_wasm_bytes: usize,
     ) -> Result<RuntimeRecord> {
         let oci = OciRef::parse(oci_ref_str)?;
+
+        // Enforce operator registry trust policy allowlist (if configured)
+        {
+            let policy = self.trust_policy.read().await;
+            if !policy.allowed_registries.is_empty()
+                && !policy
+                    .allowed_registries
+                    .iter()
+                    .any(|r| r.eq_ignore_ascii_case(&oci.registry))
+            {
+                global_metrics().inc_iam_auth_denial();
+                anyhow::bail!(
+                    "Registry '{}' is not in RuntimeTrustPolicy.allowed_registries",
+                    oci.registry
+                );
+            }
+        }
+        global_metrics().inc_registry_pull();
 
         // Transport security: require HTTPS for non-loopback registries unless explicitly opted in
         if oci.scheme != "https" {
@@ -414,15 +527,16 @@ impl WasmRuntimeRegistry {
     /// Register a pre-compiled AOT `.cwasm` runtime directly (used on iOS or when shipping pre-compiled artifacts).
     pub async fn register_aot_runtime(&self, name: &str, aot_bytes: &[u8]) -> Result<RuntimeRecord> {
         self.ensure_hydrated().await?;
-        let norm = name.trim().to_ascii_lowercase();
+        let norm = validate_runtime_name(name)?;
         let _ = self.blobs.create_bucket(RUNTIMES_BUCKET).await;
         let cid = blake3::hash(aot_bytes).to_hex().to_string();
+        let compat = current_aot_compat_key();
         let bytes = Bytes::copy_from_slice(aot_bytes);
         self.blobs
-            .put_object(RUNTIMES_BUCKET, &format!("aot/{}.cwasm", norm), bytes.clone())
+            .put_object(RUNTIMES_BUCKET, &format!("aot/{}/{}.cwasm", compat, norm), bytes.clone())
             .await?;
         self.blobs
-            .put_object(RUNTIMES_BUCKET, &format!("aot-cid/{}.cwasm", cid), bytes)
+            .put_object(RUNTIMES_BUCKET, &format!("aot-cid/{}/{}.cwasm", compat, cid), bytes)
             .await?;
 
         let rec = RuntimeRecord {
@@ -430,6 +544,7 @@ impl WasmRuntimeRegistry {
             cid,
             size_bytes: aot_bytes.len(),
             aot_cached: true,
+            aot_compat: Some(compat),
             oci_source: None,
             sha256_digest: None,
             requested_policy: None,
@@ -440,10 +555,15 @@ impl WasmRuntimeRegistry {
     }
 
     /// Resolve a runtime by logical name (e.g. `"quickjs"`, `"sqlite"`) or BLAKE3 CID.
+    /// Only loads AOT `.cwasm` artifacts matching `current_aot_compat_key()`.
     pub async fn resolve_runtime(&self, name_or_cid: &str) -> Result<ResolvedRuntime> {
         let key = name_or_cid.trim().to_ascii_lowercase();
+        let compat = current_aot_compat_key();
 
-        for aot_key in [format!("aot/{}.cwasm", key), format!("aot-cid/{}.cwasm", key)] {
+        for aot_key in [
+            format!("aot/{}/{}.cwasm", compat, key),
+            format!("aot-cid/{}/{}.cwasm", compat, key),
+        ] {
             if let Some(bytes) = self.blobs.get_object(RUNTIMES_BUCKET, &aot_key).await? {
                 return Ok(ResolvedRuntime::Aot(bytes.to_vec()));
             }

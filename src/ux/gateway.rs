@@ -436,66 +436,102 @@ impl UxGateway {
                 let db = self.db.clone();
                 let ws_handler = WebSocketHandler { db: db.clone() };
                 let http_rpc = crate::ux::surreal_http::SurrealHttpRpcHandler { db: db.clone() };
-                let iam = crate::ux::iam::IamMiddleware { db };
+                let iam = crate::ux::iam::IamMiddleware::authenticated(db);
                 Router::with_path("/rpc")
                     .hoop(iam)
                     .get(ws_handler)
                     .post(http_rpc)
             })
             // SurrealDB-compatible HTTP REST API (/sql, /signin, /signup, /export, /import, /key, /api)
-            .push(Router::with_path("/sql").post(crate::ux::surreal_http::SurrealSqlHandler { db: self.db.clone() }))
+            .push(
+                Router::with_path("/sql")
+                    .hoop(crate::ux::iam::IamMiddleware::authenticated(self.db.clone()))
+                    .post(crate::ux::surreal_http::SurrealSqlHandler { db: self.db.clone() }),
+            )
             .push(Router::with_path("/signin").post(crate::ux::surreal_http::SurrealAuthHandler { db: self.db.clone(), is_signup: false }))
             .push(Router::with_path("/signup").post(crate::ux::surreal_http::SurrealAuthHandler { db: self.db.clone(), is_signup: true }))
-            .push(Router::with_path("/export")
-                .get(crate::ux::surreal_http::SurrealExportImportHandler { db: self.db.clone(), is_import: false })
-                .post(crate::ux::surreal_http::SurrealExportImportHandler { db: self.db.clone(), is_import: false }))
-            .push(Router::with_path("/import").post(crate::ux::surreal_http::SurrealExportImportHandler { db: self.db.clone(), is_import: true }))
-            .push(Router::with_path("/key/<table:str>")
-                .get(crate::ux::surreal_http::SurrealKeyHandler { db: self.db.clone() })
-                .post(crate::ux::surreal_http::SurrealKeyHandler { db: self.db.clone() })
-                .delete(crate::ux::surreal_http::SurrealKeyHandler { db: self.db.clone() }))
-            .push(Router::with_path("/key/<table:str>/<id:str>")
-                .get(crate::ux::surreal_http::SurrealKeyHandler { db: self.db.clone() })
-                .put(crate::ux::surreal_http::SurrealKeyHandler { db: self.db.clone() })
-                .patch(crate::ux::surreal_http::SurrealKeyHandler { db: self.db.clone() })
-                .delete(crate::ux::surreal_http::SurrealKeyHandler { db: self.db.clone() }))
+            .push(
+                Router::with_path("/export")
+                    .hoop(crate::ux::iam::IamMiddleware::authenticated(self.db.clone()))
+                    .get(crate::ux::surreal_http::SurrealExportImportHandler { db: self.db.clone(), is_import: false })
+                    .post(crate::ux::surreal_http::SurrealExportImportHandler { db: self.db.clone(), is_import: false }),
+            )
+            .push(
+                Router::with_path("/import")
+                    .hoop(crate::ux::iam::IamMiddleware::admin(self.db.clone()))
+                    .post(crate::ux::surreal_http::SurrealExportImportHandler { db: self.db.clone(), is_import: true }),
+            )
+            .push(
+                Router::with_path("/key/<table:str>")
+                    .hoop(crate::ux::iam::IamMiddleware::authenticated(self.db.clone()))
+                    .get(crate::ux::surreal_http::SurrealKeyHandler { db: self.db.clone() })
+                    .post(crate::ux::surreal_http::SurrealKeyHandler { db: self.db.clone() })
+                    .delete(crate::ux::surreal_http::SurrealKeyHandler { db: self.db.clone() }),
+            )
+            .push(
+                Router::with_path("/key/<table:str>/<id:str>")
+                    .hoop(crate::ux::iam::IamMiddleware::authenticated(self.db.clone()))
+                    .get(crate::ux::surreal_http::SurrealKeyHandler { db: self.db.clone() })
+                    .put(crate::ux::surreal_http::SurrealKeyHandler { db: self.db.clone() })
+                    .patch(crate::ux::surreal_http::SurrealKeyHandler { db: self.db.clone() })
+                    .delete(crate::ux::surreal_http::SurrealKeyHandler { db: self.db.clone() }),
+            )
             .push(Router::with_path("/api/<ns:str>/<db:str>/<**path>")
                 .get(crate::ux::surreal_http::SurrealCustomApiHandler { db: self.db.clone() })
                 .post(crate::ux::surreal_http::SurrealCustomApiHandler { db: self.db.clone() })
                 .put(crate::ux::surreal_http::SurrealCustomApiHandler { db: self.db.clone() })
                 .delete(crate::ux::surreal_http::SurrealCustomApiHandler { db: self.db.clone() }))
+            // Public health/readiness/version + Observability metrics
             .push(Router::with_path("/status").get(crate::ux::surreal_http::surreal_status))
             .push(Router::with_path("/ready").get(crate::ux::surreal_http::surreal_ready))
             .push(Router::with_path("/version").get(crate::ux::surreal_http::surreal_version))
+            .push(Router::with_path("/_nexus/metrics").get(serve_metrics))
             // Unified External Multi-Flavor Query API (`POST /query`, `POST /cells/:app/:cell_id/query`)
-            .push(Router::with_path("/query").post(crate::ux::surreal_http::UnifiedQueryHandler {
-                db: self.db.clone(),
-                cells: self.cells.clone(),
-                default_flavor: "surql",
-            }))
-            .push(Router::with_path("/cells/<app:str>/<cell_id:str>/query").post(
-                crate::ux::surreal_http::UnifiedQueryHandler {
-                    db: self.db.clone(),
-                    cells: self.cells.clone(),
-                    default_flavor: "surql",
-                },
-            ))
-            // Multi-node WAL replication transport
-            .push(Router::with_path("/_nexus/wal/entries").get(crate::ux::surreal_http::WalReplicationHandler { db: self.db.clone(), is_apply: false }))
-            .push(Router::with_path("/_nexus/wal/apply").post(crate::ux::surreal_http::WalReplicationHandler { db: self.db.clone(), is_apply: true }));
+            .push(
+                Router::with_path("/query")
+                    .hoop(crate::ux::iam::IamMiddleware::authenticated(self.db.clone()))
+                    .post(crate::ux::surreal_http::UnifiedQueryHandler {
+                        db: self.db.clone(),
+                        cells: self.cells.clone(),
+                        default_flavor: "surql",
+                    }),
+            )
+            .push(
+                Router::with_path("/cells/<app:str>/<cell_id:str>/query")
+                    .hoop(crate::ux::iam::IamMiddleware::authenticated(self.db.clone()))
+                    .post(crate::ux::surreal_http::UnifiedQueryHandler {
+                        db: self.db.clone(),
+                        cells: self.cells.clone(),
+                        default_flavor: "surql",
+                    }),
+            )
+            // Privileged Multi-node WAL replication transport (Admin tier)
+            .push(
+                Router::with_path("/_nexus/wal/entries")
+                    .hoop(crate::ux::iam::IamMiddleware::admin(self.db.clone()))
+                    .get(crate::ux::surreal_http::WalReplicationHandler { db: self.db.clone(), is_apply: false }),
+            )
+            .push(
+                Router::with_path("/_nexus/wal/apply")
+                    .hoop(crate::ux::iam::IamMiddleware::admin(self.db.clone()))
+                    .post(crate::ux::surreal_http::WalReplicationHandler { db: self.db.clone(), is_apply: true }),
+            );
 
         #[cfg(feature = "graphql")]
-        let router = router.push(Router::with_path("/graphql").post(
-            crate::ux::surreal_http::UnifiedQueryHandler {
-                db: self.db.clone(),
-                cells: self.cells.clone(),
-                default_flavor: "graphql",
-            },
-        ));
+        let router = router.push(
+            Router::with_path("/graphql")
+                .hoop(crate::ux::iam::IamMiddleware::authenticated(self.db.clone()))
+                .post(crate::ux::surreal_http::UnifiedQueryHandler {
+                    db: self.db.clone(),
+                    cells: self.cells.clone(),
+                    default_flavor: "graphql",
+                }),
+        );
 
         #[cfg(feature = "sqlite-hrana")]
         let router = router.push(
             Router::with_path("/v2/pipeline")
+                .hoop(crate::ux::iam::IamMiddleware::authenticated(self.db.clone()))
                 .post(crate::ux::surreal_http::SqliteHranaHandler { db: self.db.clone() }),
         );
 
@@ -506,7 +542,7 @@ impl UxGateway {
                 let db = self.db.clone();
                 let garage = self.garage.clone();
                 let s3_handler = S3ProxyHandler { garage };
-                let iam = crate::ux::iam::IamMiddleware { db };
+                let iam = crate::ux::iam::IamMiddleware::authenticated(db);
                 Router::with_path("/s3/<**path>")
                     .hoop(iam)
                     .get(s3_handler.clone())
@@ -522,7 +558,7 @@ impl UxGateway {
                     db: db.clone(),
                     cells: self.cells.clone(),
                 };
-                let iam = crate::ux::iam::IamMiddleware { db };
+                let iam = crate::ux::iam::IamMiddleware::authenticated(db);
                 Router::with_path("/cells/<**path>")
                     .hoop(iam)
                     .get(cell_handler.clone())
@@ -538,11 +574,16 @@ impl UxGateway {
 }
 
 #[handler]
+async fn serve_metrics(res: &mut Response) {
+    res.render(Json(crate::observability::global_metrics().snapshot()));
+}
+
+#[handler]
 async fn capabilities_handler(res: &mut Response) {
     let reg = crate::runtime::CapabilityRegistry::new();
     reg.set_state("database", crate::runtime::CapabilityState::Active, Some("nexus-db".into()));
     reg.set_state("gateway", crate::runtime::CapabilityState::Active, Some("salvo".into()));
-    reg.set_state("cells", crate::runtime::CapabilityState::Active, Some("quickrs-core".into()));
+    reg.set_state("cells", crate::runtime::CapabilityState::Active, Some("wasmtime".into()));
     res.render(Json(reg.snapshot_json()));
 }
 

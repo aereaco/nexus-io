@@ -4,10 +4,12 @@ pub mod wireguard;
 pub mod mesh;
 pub mod storage_config;
 pub mod blob_bridge;
+pub mod cas_store;
 #[cfg(feature = "shell")]
 pub mod command;
 
 pub use blob_bridge::BlobBridge;
+pub use cas_store::CasStore;
 pub use wireguard::WireGuardManager;
 #[cfg(feature = "vpn")]
 pub use mesh::MeshReactor;

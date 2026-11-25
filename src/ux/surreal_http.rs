@@ -41,7 +41,7 @@ fn check_auth_rate_limit(client_key: &str) -> bool {
 
 use crate::db::Database;
 
-fn extract_ns_db(req: &Request) -> (String, String) {
+pub(crate) fn extract_ns_db(req: &Request) -> (String, String) {
     let ns = req
         .headers()
         .get("surreal-ns")
@@ -71,7 +71,7 @@ fn is_loopback_addr(req: &Request) -> bool {
 /// - Missing `Authorization` is REJECTED (`401 Unauthorized`) by default.
 /// - Unauthenticated local dev access is ONLY permitted when BOTH `NEXUS_ALLOW_UNAUTH_LOCAL=1`
 ///   AND the request originates from loopback (`127.0.0.1` / `::1`).
-fn resolve_http_auth(
+pub(crate) fn resolve_http_auth(
     req: &Request,
     db: &Database,
     ns: &str,

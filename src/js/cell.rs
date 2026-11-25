@@ -258,9 +258,44 @@ pub struct CellHttpResponse {
     pub body: Vec<u8>,
 }
 
+/// Explicit formal cell lifecycle state machine governing every transition.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CellLifecycleState {
+    Declared,
+    Provisioning,
+    Running,
+    Hibernating,
+    Hibernated,
+    Restoring,
+    Failed(String),
+}
+
+/// Enforced per-cell execution resource limits (CPU fuel, output cap, concurrency, and deadline).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CellResourceLimits {
+    pub max_fuel: u64,
+    pub max_output_bytes: usize,
+    pub max_concurrent_execs: usize,
+    pub deadline_ms: u64,
+}
+
+impl Default for CellResourceLimits {
+    fn default() -> Self {
+        Self {
+            max_fuel: 50_000_000,
+            max_output_bytes: 4 * 1024 * 1024,
+            max_concurrent_execs: 16,
+            deadline_ms: 15_000,
+        }
+    }
+}
+
 struct ActiveCell {
     policy: CellPolicy,
     workload: CellWorkload,
+    limits: CellResourceLimits,
+    exec_permits: Arc<tokio::sync::Semaphore>,
     lease_etag: Option<String>,
     last_active: Instant,
 }
@@ -292,6 +327,7 @@ pub struct CellManager {
     #[cfg(feature = "wasm-runtime")]
     wasm_db: crate::compute::wasm_db::WasmDbMount,
     active: Arc<RwLock<HashMap<CellKey, ActiveCell>>>,
+    states: Arc<RwLock<HashMap<CellKey, CellLifecycleState>>>,
     db_configs: Arc<RwLock<HashMap<CellKey, CellDbConfig>>>,
 }
 
@@ -316,8 +352,22 @@ impl CellManager {
             #[cfg(feature = "wasm-runtime")]
             wasm_db,
             active: Arc::new(RwLock::new(HashMap::new())),
+            states: Arc::new(RwLock::new(HashMap::new())),
             db_configs: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    /// Inspect the current formal lifecycle state of `(app, cell_id)`.
+    pub async fn cell_state(&self, app: &str, cell_id: &str) -> CellLifecycleState {
+        self.states
+            .read()
+            .await
+            .get(&CellKey {
+                app: app.to_string(),
+                cell_id: cell_id.to_string(),
+            })
+            .cloned()
+            .unwrap_or(CellLifecycleState::Declared)
     }
 
     #[cfg(feature = "wasm-runtime")]
@@ -463,15 +513,34 @@ impl CellManager {
             return Ok(());
         }
 
+        let prev_state = self.cell_state(app, cell_id).await;
+        let transition_state = if prev_state == CellLifecycleState::Hibernated {
+            CellLifecycleState::Restoring
+        } else {
+            CellLifecycleState::Provisioning
+        };
+        self.states.write().await.insert(key.clone(), transition_state);
+
         let mut lease_etag = None;
         if let CellPolicy::Elastic { lease_bucket, .. } = &policy {
             let _ = self.blobs.create_bucket(lease_bucket).await;
             let lease_key = format!("leases/{}/{}.lease", app, cell_id);
             let lease_payload = bytes::Bytes::from(format!("owner:{}", self.blobs.node_id()));
-            let etag = self
+            let etag = match self
                 .blobs
                 .put_object_cas(lease_bucket, &lease_key, lease_payload, None, true)
-                .await?;
+                .await
+            {
+                Ok(e) => e,
+                Err(err) => {
+                    self.states
+                        .write()
+                        .await
+                        .insert(key, CellLifecycleState::Failed(err.to_string()));
+                    crate::observability::global_metrics().inc_cell_failure();
+                    return Err(err);
+                }
+            };
             lease_etag = Some(etag);
 
             // Hydrate snapshot from `BlobBridge` if the cell was previously hibernated
@@ -481,15 +550,24 @@ impl CellManager {
             }
         }
 
+        let limits = CellResourceLimits::default();
+        let exec_permits = Arc::new(tokio::sync::Semaphore::new(limits.max_concurrent_execs));
         self.active.write().await.insert(
-            key,
+            key.clone(),
             ActiveCell {
                 policy,
                 workload,
+                limits,
+                exec_permits,
                 lease_etag,
                 last_active: Instant::now(),
             },
         );
+        self.states
+            .write()
+            .await
+            .insert(key, CellLifecycleState::Running);
+        crate::observability::global_metrics().inc_cell_wake();
         Ok(())
     }
 
@@ -626,14 +704,23 @@ impl CellManager {
             app: app.to_string(),
             cell_id: cell_id.to_string(),
         };
-        let workload = {
+        let (workload, limits, permits) = {
             let mut map = self.active.write().await;
             let cell = map
                 .get_mut(&key)
                 .ok_or_else(|| anyhow::anyhow!("Cell {}/{} is not awake", app, cell_id))?;
             cell.last_active = Instant::now();
-            cell.workload.clone()
+            (
+                cell.workload.clone(),
+                cell.limits.clone(),
+                cell.exec_permits.clone(),
+            )
         };
+        let _exec_permit = permits
+            .acquire_owned()
+            .await
+            .map_err(|_| anyhow::anyhow!("Cell {}/{} concurrency limiter closed", app, cell_id))?;
+        let deadline = Duration::from_millis(limits.deadline_ms);
 
         let db_config = self.get_db_config(app, cell_id).await;
         let host = crate::compute::crystal::NexusHostContext::new(
@@ -714,21 +801,35 @@ impl CellManager {
                     script
                 };
                 let body_vec = body.to_vec();
-                let out = tokio::task::spawn_blocking(move || {
-                    if is_aot {
-                        let cfg = crate::compute::crystal::WasiRunConfig {
-                            args: vec!["quickjs.wasm".to_string()],
-                            env: vec![("NEXUS_JS_SOURCE".to_string(), js_script)],
-                            stdin: body_vec,
-                            preopen_dirs: Vec::new(),
-                            fuel_limit,
-                        };
-                        crystal.run_wasi_aot_with_host(&engine_wasm, cfg, host)
-                    } else {
-                        crystal.invoke_js_wasm(&engine_wasm, &js_script, &body_vec, Some(host), fuel_limit)
-                    }
-                })
-                .await??;
+                let fuel_cap = fuel_limit.min(limits.max_fuel);
+                let out = tokio::time::timeout(
+                    deadline,
+                    tokio::task::spawn_blocking(move || {
+                        if is_aot {
+                            let cfg = crate::compute::crystal::WasiRunConfig {
+                                args: vec!["quickjs.wasm".to_string()],
+                                env: vec![("NEXUS_JS_SOURCE".to_string(), js_script)],
+                                stdin: body_vec,
+                                preopen_dirs: Vec::new(),
+                                fuel_limit: fuel_cap,
+                            };
+                            crystal.run_wasi_aot_with_host(&engine_wasm, cfg, host)
+                        } else {
+                            crystal.invoke_js_wasm(&engine_wasm, &js_script, &body_vec, Some(host), fuel_cap)
+                        }
+                    }),
+                )
+                .await
+                .map_err(|_| anyhow::anyhow!("Cell {}/{} execution exceeded deadline ({}ms)", app, cell_id, limits.deadline_ms))???;
+                if out.stdout.len() > limits.max_output_bytes {
+                    anyhow::bail!(
+                        "Cell {}/{} output exceeded limit ({} > {} bytes)",
+                        app,
+                        cell_id,
+                        out.stdout.len(),
+                        limits.max_output_bytes
+                    );
+                }
                 Ok(CellHttpResponse {
                     status: if out.exit_code == 0 { 200 } else { 500 },
                     headers: std::collections::BTreeMap::new(),
@@ -854,6 +955,11 @@ impl CellManager {
             (cell.policy.clone(), cell.lease_etag.clone())
         };
 
+        self.states
+            .write()
+            .await
+            .insert(key.clone(), CellLifecycleState::Hibernating);
+
         if let CellPolicy::Elastic { lease_bucket, .. } = &policy {
             let snapshot = self.engine.export_snapshot(app, cell_id).await?;
             let snap_key = format!("snapshots/{}/{}.json", app, cell_id);
@@ -871,6 +977,13 @@ impl CellManager {
         }
 
         self.active.write().await.remove(&key);
+        self.states
+            .write()
+            .await
+            .insert(key, CellLifecycleState::Hibernated);
+        #[cfg(feature = "wasm-runtime")]
+        let _ = self.wasm_db.evict_idle_locks().await;
+        crate::observability::global_metrics().inc_cell_hibernate();
         Ok(())
     }
 

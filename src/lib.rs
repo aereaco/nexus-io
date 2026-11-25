@@ -4,6 +4,7 @@ pub mod economy;
 pub mod ffi;
 pub mod iam;
 pub mod js;
+pub mod observability;
 pub mod runtime;
 #[cfg(feature = "shell")]
 pub mod shell;
