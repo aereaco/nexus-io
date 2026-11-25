@@ -157,6 +157,37 @@ impl Handler for CellGatewayHandler {
             return;
         }
 
+        // POST /cells/_runtimes/pull -> pull Wasm runtime + optional Nexus policy from any OCI v2 registry
+        // Body: { "reference": "@aerea/quickjs:1.0", "name": "quickjs" (optional) }
+        #[cfg(feature = "wasm-runtime")]
+        if req.method() == &Method::POST && req.uri().path().trim_end_matches('/') == "/cells/_runtimes/pull" {
+            let body: serde_json::Value = match req.parse_json().await {
+                Ok(v) => v,
+                Err(e) => {
+                    res.status_code(StatusCode::BAD_REQUEST);
+                    res.render(Text::Plain(format!("Invalid pull JSON body: {}", e)));
+                    return;
+                }
+            };
+            let Some(reference) = body.get("reference").and_then(|v| v.as_str()) else {
+                res.status_code(StatusCode::BAD_REQUEST);
+                res.render(Text::Plain("Missing required 'reference' field (e.g. '@aerea/quickjs:1.0')"));
+                return;
+            };
+            let alias = body.get("name").and_then(|v| v.as_str());
+            match self.cells.runtimes().pull_oci(alias, reference).await {
+                Ok(rec) => {
+                    res.status_code(StatusCode::OK);
+                    res.render(Json(rec));
+                }
+                Err(e) => {
+                    res.status_code(StatusCode::BAD_GATEWAY);
+                    res.render(Text::Plain(format!("OCI pull error: {}", e)));
+                }
+            }
+            return;
+        }
+
         // GET /cells/_runtimes -> list registered WASI guest runtimes (quickjs, php-cgi, sqlite, pglite, ...)
         #[cfg(feature = "wasm-runtime")]
         if req.method() == &Method::GET && req.uri().path().trim_end_matches('/') == "/cells/_runtimes" {
