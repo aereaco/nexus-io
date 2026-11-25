@@ -41,7 +41,7 @@ impl WireGuardManager {
     pub async fn generate_keypair(&self) -> Result<(String, String)> {
         let mut privkey_bytes = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut privkey_bytes);
-        // Clamp scalar per RFC 7748 Â§5
+        // Clamp scalar per RFC 7748 §5
         privkey_bytes[0] &= 248;
         privkey_bytes[31] &= 127;
         privkey_bytes[31] |= 64;
@@ -148,7 +148,7 @@ pub struct WireGuardInterface {
 impl WireGuardInterface {
     /// Start the userspace WireGuard interface
     pub async fn start(name: &str, _privkey: &str, _port: u16) -> Result<Self> {
-        println!("ðŸš€ Starting WireGuard Interface: {}", name);
+        println!("🚀 Starting WireGuard Interface: {}", name);
 
         #[cfg(all(feature = "net-vpn", unix, not(any(target_os = "android", target_os = "ios"))))]
         let mut _handle = None;
@@ -159,11 +159,11 @@ impl WireGuardInterface {
             // This starts the boringtun event loop
             match boringtun::device::DeviceHandle::new(name, config) {
                 Ok(h) => {
-                    println!("âœ… WireGuard Device created: {}", name);
+                    println!("✅ WireGuard Device created: {}", name);
                     _handle = Some(h);
                 },
                 Err(e) => {
-                    eprintln!("âš ï¸ Userspace WireGuard (boringtun) unavailable: {}", e);
+                    eprintln!("⚠️ Userspace WireGuard (boringtun) unavailable: {}", e);
                     eprintln!("   (This is expected if running without CAP_NET_ADMIN. Mesh networking will be limited.)");
                 }
             }
@@ -174,17 +174,17 @@ impl WireGuardInterface {
             // Native Windows Wintun adapter hook (requires wintun.dll + elevation for L3 TUN)
             match unsafe { wintun_bindings::load() } {
                 Ok(_wintun) => {
-                    println!("âœ… Wintun driver loaded for WireGuard interface: {}", name);
+                    println!("✅ Wintun driver loaded for WireGuard interface: {}", name);
                 }
                 Err(e) => {
-                    eprintln!("âš ï¸ Wintun driver unavailable ({}); WireGuard crypto active in userspace mode", e);
+                    eprintln!("⚠️ Wintun driver unavailable ({}); WireGuard crypto active in userspace mode", e);
                 }
             }
         }
 
         #[cfg(not(feature = "net-vpn"))]
         {
-            eprintln!("â„¹ï¸ WireGuard VPN driver not compiled in this profile (enable `--features vpn`).");
+            eprintln!("ℹ️ WireGuard VPN driver not compiled in this profile (enable `--features vpn`).");
         }
 
         Ok(Self {
@@ -243,7 +243,7 @@ impl WireGuardInterface {
         }
         let uapi_payload = Self::format_uapi_set_peers(peers);
         println!(
-            "ðŸ•¸ï¸  Mesh Reactor: Syncing {} peers to WireGuard interface {} ({} bytes UAPI)",
+            "🕸️  Mesh Reactor: Syncing {} peers to WireGuard interface {} ({} bytes UAPI)",
             peers.len(),
             self._name,
             uapi_payload.len()
@@ -414,7 +414,7 @@ mod tests {
 
     #[test]
     fn x25519_matches_rfc7748_test_vector() {
-        // RFC 7748 Â§6.1 Alice private key -> public key
+        // RFC 7748 §6.1 Alice private key -> public key
         let alice_priv: [u8; 32] = [
             0x77, 0x07, 0x6d, 0x0a, 0x73, 0x18, 0xa5, 0x7d,
             0x3c, 0x16, 0xc1, 0x72, 0x51, 0xb2, 0x66, 0x45,

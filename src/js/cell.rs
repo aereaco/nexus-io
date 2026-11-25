@@ -35,7 +35,7 @@ pub enum MeshDbRole {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CellDbMode {
-    /// Stateless cell â€” zero DB allocation or exposure.
+    /// Stateless cell — zero DB allocation or exposure.
     None,
     /// Dedicated isolated `(app, cell_id)` `nexus-db` instance.
     Dedicated,

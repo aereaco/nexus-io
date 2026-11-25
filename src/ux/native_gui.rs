@@ -152,7 +152,7 @@ pub fn launch_native_window(config: NativeWindowConfig) -> Result<()> {
         })?;
 
     println!(
-        "ðŸ–¥ï¸  Native GUI launched via {} -> {}",
+        "🖥️  Native GUI launched via {} -> {}",
         NativeWebViewEngine::current().as_str(),
         config.url
     );
@@ -174,7 +174,7 @@ pub fn launch_native_window(config: NativeWindowConfig) -> Result<()> {
 #[cfg(all(feature = "gui-webview", any(target_os = "android", target_os = "ios")))]
 pub fn launch_native_window(config: NativeWindowConfig) -> Result<()> {
     println!(
-        "ðŸ“± Native mobile WebView host bridge ready ({}) -> {}",
+        "📱 Native mobile WebView host bridge ready ({}) -> {}",
         NativeWebViewEngine::current().as_str(),
         config.url
     );

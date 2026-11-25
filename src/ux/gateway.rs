@@ -2,14 +2,42 @@
 // Architecture: HTTPS (443) + HTTP (80) + Optional direct access ports
 
 use salvo::prelude::*;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::db::Database;
 use crate::js::cell::CellManager;
+use crate::storage::cas_store::{CasStore, ReconciliationReport, DEFAULT_DELETE_CLAIM_TTL_MS};
 use crate::storage::BlobBridge;
 use crate::ux::cell_router::CellGatewayHandler;
 use crate::ux::surreal_ws::WebSocketHandler;
 use crate::ux::s3_proxy::S3ProxyHandler;
+
+/// Fail-closed middleware that blocks cell workloads with `503 Service Unavailable`
+/// until `UxGateway::reconcile_storage_on_boot()` has completed durably.
+#[derive(Clone)]
+struct BootRecoveryGateMiddleware {
+    storage_ready: Arc<AtomicBool>,
+}
+
+#[async_trait]
+impl Handler for BootRecoveryGateMiddleware {
+    async fn handle(
+        &self,
+        _req: &mut Request,
+        _depot: &mut Depot,
+        res: &mut Response,
+        ctrl: &mut FlowCtrl,
+    ) {
+        if !self.storage_ready.load(Ordering::SeqCst) {
+            res.status_code(StatusCode::SERVICE_UNAVAILABLE);
+            res.render(Json(serde_json::json!({
+                "error": "Storage boot recovery has not completed yet"
+            })));
+            ctrl.skip_rest();
+        }
+    }
+}
 
 /// Gateway configuration - controls which ports are exposed
 #[derive(Clone)]
@@ -58,22 +86,74 @@ pub struct UxGateway {
     garage: Arc<BlobBridge>,
     cells: Arc<CellManager>,
     config: GatewayConfig,
+    storage_ready: Arc<AtomicBool>,
 }
 
 impl UxGateway {
     pub fn new(db: Arc<Database>, garage: Arc<BlobBridge>, config: GatewayConfig) -> Self {
         let cells = Arc::new(CellManager::new(db.clone(), garage.clone()));
-        Self { db, garage, cells, config }
+        Self {
+            db,
+            garage,
+            cells,
+            config,
+            storage_ready: Arc::new(AtomicBool::new(false)),
+        }
     }
 
-    /// Start all configured gateway listeners
+    /// Startup invariant: run `CasStore::reconcile_on_boot()` across both durable CAS buckets
+    /// (`nexus-wasm-db` and `nexus-runtimes`) to replay any incomplete write-ahead `OwnershipTx`
+    /// journals and recover expired `DeleteClaim`s BEFORE the gateway accepts cell work.
+    pub async fn reconcile_storage_on_boot(
+        &self,
+    ) -> anyhow::Result<(ReconciliationReport, ReconciliationReport)> {
+        let cas = CasStore::new(self.garage.clone());
+        let empty = std::collections::HashSet::new();
+        let db_rep = cas
+            .reconcile_on_boot(
+                "nexus-wasm-db",
+                "blobs/",
+                &empty,
+                DEFAULT_DELETE_CLAIM_TTL_MS,
+                false,
+            )
+            .await?;
+        let rt_rep = cas
+            .reconcile_on_boot(
+                "nexus-runtimes",
+                "cid/",
+                &empty,
+                DEFAULT_DELETE_CLAIM_TTL_MS,
+                false,
+            )
+            .await?;
+        self.storage_ready.store(true, Ordering::SeqCst);
+        Ok((db_rep, rt_rep))
+    }
+
+    pub fn is_storage_ready(&self) -> bool {
+        self.storage_ready.load(Ordering::SeqCst)
+    }
+
+    /// Start all configured gateway listeners (always completes storage boot recovery first).
     pub async fn start(self) -> Result<(), Box<dyn std::error::Error>> {
-        println!("ðŸŒ Nexus-IO Gateway starting...");
-        println!("   HTTPS (443): {}", if self.config.enable_https { "âœ…" } else { "âŒ" });
-        println!("   HTTP (80):   {}", if self.config.enable_http { "âœ…" } else { "âŒ" });
-        println!("   DB Direct:   {}", if self.config.enable_surreal_direct { "âœ…" } else { "âŒ" });
-        println!("   S3 Direct:   {}", if self.config.enable_s3_direct { "âœ…" } else { "âŒ" });
-        println!("   Metrics:     {}", if self.config.enable_metrics { "âœ…" } else { "âŒ" });
+        let (db_rep, rt_rep) = self.reconcile_storage_on_boot().await?;
+        if !db_rep.skipped || !rt_rep.skipped {
+            println!(
+                "🔄 Storage boot recovery complete (wasm-db tx={}, claims={}; runtimes tx={}, claims={})",
+                db_rep.tx_replayed,
+                db_rep.expired_claims_recovered,
+                rt_rep.tx_replayed,
+                rt_rep.expired_claims_recovered
+            );
+        }
+
+        println!("🌐 Nexus-IO Gateway starting...");
+        println!("   HTTPS (443): {}", if self.config.enable_https { "✅" } else { "❌" });
+        println!("   HTTP (80):   {}", if self.config.enable_http { "✅" } else { "❌" });
+        println!("   DB Direct:   {}", if self.config.enable_surreal_direct { "✅" } else { "❌" });
+        println!("   S3 Direct:   {}", if self.config.enable_s3_direct { "✅" } else { "❌" });
+        println!("   Metrics:     {}", if self.config.enable_metrics { "✅" } else { "❌" });
 
         let mut handles = vec![];
 
@@ -87,7 +167,7 @@ impl UxGateway {
             }));
         }
 
-        // Port 5432: PostgreSQL v3 Wire Protocol (`PgWireSession`) â€” disabled by default
+        // Port 5432: PostgreSQL v3 Wire Protocol (`PgWireSession`) — disabled by default
         #[cfg(feature = "db-pgwire")]
         if self.config.enable_pgwire {
             let gateway = self.clone();
@@ -98,7 +178,7 @@ impl UxGateway {
             }));
         }
 
-        // Port 3306: MySQL v10 Wire Protocol (`MySqlWireSession`) â€” disabled by default
+        // Port 3306: MySQL v10 Wire Protocol (`MySqlWireSession`) — disabled by default
         #[cfg(feature = "db-mysqlwire")]
         if self.config.enable_mysqlwire {
             let gateway = self.clone();
@@ -175,7 +255,7 @@ impl UxGateway {
                 salvo::conn::rustls::Keycert::new().cert(cert).key(key),
             );
             let acceptor = TcpListener::new(bind_addr.clone()).rustls(config).bind().await;
-            println!("ðŸ”’ HTTPS/TLS Gateway listening on https://{}", bind_addr);
+            println!("🔒 HTTPS/TLS Gateway listening on https://{}", bind_addr);
             Server::new(acceptor).serve(router).await;
             return Ok(());
         }
@@ -183,7 +263,7 @@ impl UxGateway {
         let dev_bind =
             std::env::var("NEXUS_HTTP_BIND").unwrap_or_else(|_| "127.0.0.1:8443".to_string());
         println!(
-            "âš ï¸  Dev HTTP Gateway (TLS DISABLED â€” plaintext) listening on http://{}",
+            "⚠️  Dev HTTP Gateway (TLS DISABLED — plaintext) listening on http://{}",
             dev_bind
         );
         println!("   Set NEXUS_TLS_CERT and NEXUS_TLS_KEY to enable real HTTPS/TLS.");
@@ -200,7 +280,7 @@ impl UxGateway {
             .push(Router::with_path("<**rest>").get(redirect_to_https));
 
         let acceptor = TcpListener::new("0.0.0.0:8080").bind().await;
-        println!("âœ… HTTP Redirect listening on 0.0.0.0:8080 (dev: using 8080 instead of 80)");
+        println!("✅ HTTP Redirect listening on 0.0.0.0:8080 (dev: using 8080 instead of 80)");
         
         Server::new(acceptor).serve(router).await;
 
@@ -229,7 +309,7 @@ impl UxGateway {
         let trust_local_env = std::env::var("NEXUS_PGWIRE_TRUST_LOCAL").as_deref() == Ok("1");
         let listener = tokio::net::TcpListener::bind(&addr).await?;
         println!(
-            "ðŸ˜ PostgreSQL v3 Wire Protocol (PgWire) listening on {} (auth: {})",
+            "🐘 PostgreSQL v3 Wire Protocol (PgWire) listening on {} (auth: {})",
             addr,
             if trust_local_env { "trust-loopback-only" } else { "password-required" }
         );
@@ -333,7 +413,7 @@ impl UxGateway {
         let trust_local_env = std::env::var("NEXUS_MYSQLWIRE_TRUST_LOCAL").as_deref() == Ok("1");
         let listener = tokio::net::TcpListener::bind(&addr).await?;
         println!(
-            "ðŸ¬ MySQL v10 Wire Protocol (MySqlWire) listening on {} (auth: {})",
+            "🐬 MySQL v10 Wire Protocol (MySqlWire) listening on {} (auth: {})",
             addr,
             if trust_local_env { "trust-loopback-only" } else { "password-required" }
         );
@@ -406,7 +486,7 @@ impl UxGateway {
             .push(Router::with_path("/rpc").post(surreal_rpc_handler));
 
         let acceptor = TcpListener::new("0.0.0.0:8000").bind().await;
-        println!("âœ… SurrealDB Direct Access listening on 0.0.0.0:8000");
+        println!("✅ SurrealDB Direct Access listening on 0.0.0.0:8000");
         
         Server::new(acceptor).serve(router).await;
 
@@ -423,7 +503,7 @@ impl UxGateway {
             );
 
         let acceptor = TcpListener::new("0.0.0.0:3900").bind().await;
-        println!("âœ… S3 Direct Access listening on 0.0.0.0:3900");
+        println!("✅ S3 Direct Access listening on 0.0.0.0:3900");
         
         Server::new(acceptor).serve(router).await;
 
@@ -436,7 +516,7 @@ impl UxGateway {
             .get(metrics_handler);
 
         let acceptor = TcpListener::new("127.0.0.1:9090").bind().await;
-        println!("âœ… Metrics listening on 127.0.0.1:9090");
+        println!("✅ Metrics listening on 127.0.0.1:9090");
         
         Server::new(acceptor).serve(router).await;
 
@@ -518,7 +598,10 @@ impl UxGateway {
                     }),
             )
             .push(
-                Router::with_path("/cells/<app:str>/<cell_id:str>/query")
+                Router::with_path("/cells/{app}/{cell_id}/query")
+                    .hoop(BootRecoveryGateMiddleware {
+                        storage_ready: self.storage_ready.clone(),
+                    })
                     .hoop(crate::ux::iam::IamMiddleware::authenticated(self.db.clone()))
                     .post(crate::ux::surreal_http::UnifiedQueryHandler {
                         db: self.db.clone(),
@@ -556,6 +639,19 @@ impl UxGateway {
                 .post(crate::ux::surreal_http::SqliteHranaHandler { db: self.db.clone() }),
         );
 
+        #[cfg(feature = "serve-web")]
+        let router = router.push(
+            Router::with_path("/web/{**path}").get(serve_web_static),
+        );
+
+        #[cfg(feature = "serve-proxy")]
+        let router = router.push(
+            Router::with_path("/proxy/{upstream}/{**path}")
+                .hoop(crate::ux::iam::IamMiddleware::authenticated(self.db.clone()))
+                .get(serve_proxy_handler)
+                .post(serve_proxy_handler),
+        );
+
         router
             
             // S3 Proxy (browser-friendly)
@@ -564,7 +660,7 @@ impl UxGateway {
                 let garage = self.garage.clone();
                 let s3_handler = S3ProxyHandler { garage };
                 let iam = crate::ux::iam::IamMiddleware::authenticated(db);
-                Router::with_path("/s3/<**path>")
+                Router::with_path("/s3/{**path}")
                     .hoop(iam)
                     .get(s3_handler.clone())
                     .put(s3_handler.clone())
@@ -580,7 +676,10 @@ impl UxGateway {
                     cells: self.cells.clone(),
                 };
                 let iam = crate::ux::iam::IamMiddleware::authenticated(db);
-                Router::with_path("/cells/<**path>")
+                Router::with_path("/cells/{**path}")
+                    .hoop(BootRecoveryGateMiddleware {
+                        storage_ready: self.storage_ready.clone(),
+                    })
                     .hoop(iam)
                     .get(cell_handler.clone())
                     .post(cell_handler.clone())
@@ -592,6 +691,74 @@ impl UxGateway {
             .push(Router::with_path("/health").get(health_check))
             .push(Router::with_path("/_nexus/capabilities").get(capabilities_handler))
     }
+
+    /// Expose the configured Salvo router for programmatic embedding and integration tests.
+    pub fn router(&self) -> Router {
+        self.build_main_router()
+    }
+}
+
+#[cfg(feature = "serve-web")]
+#[handler]
+async fn serve_web_static(req: &mut Request, res: &mut Response) {
+    let root = std::path::PathBuf::from(
+        std::env::var("NEXUS_WEB_ROOT").unwrap_or_else(|_| "public".to_string()),
+    );
+    let rel = req.param::<String>("**path").unwrap_or_default();
+    if rel.contains("..") {
+        res.status_code(StatusCode::BAD_REQUEST);
+        return;
+    }
+    let candidate = root.join(rel.trim_start_matches('/'));
+    let target = if candidate.is_file() {
+        candidate
+    } else {
+        root.join("index.html")
+    };
+    match tokio::fs::read(&target).await {
+        Ok(bytes) => {
+            let ct = if target.extension().and_then(|e| e.to_str()) == Some("html") {
+                "text/html; charset=utf-8"
+            } else if target.extension().and_then(|e| e.to_str()) == Some("js") {
+                "application/javascript; charset=utf-8"
+            } else if target.extension().and_then(|e| e.to_str()) == Some("css") {
+                "text/css; charset=utf-8"
+            } else {
+                "application/octet-stream"
+            };
+            res.headers_mut().insert(
+                salvo::http::header::CONTENT_TYPE,
+                salvo::http::HeaderValue::from_static(ct),
+            );
+            res.body(bytes);
+        }
+        Err(_) => {
+            res.status_code(StatusCode::NOT_FOUND);
+        }
+    }
+}
+
+#[cfg(feature = "serve-proxy")]
+#[handler]
+async fn serve_proxy_handler(req: &mut Request, res: &mut Response) {
+    let upstream = req.param::<String>("upstream").unwrap_or_default();
+    let allowlist = std::env::var("NEXUS_PROXY_UPSTREAMS").unwrap_or_default();
+    let allowed = allowlist
+        .split(',')
+        .map(|s| s.trim())
+        .any(|entry| !entry.is_empty() && entry.starts_with(&format!("{}=", upstream)));
+    if !allowed {
+        res.status_code(StatusCode::FORBIDDEN);
+        res.render(Json(serde_json::json!({
+            "error": format!("Upstream '{}' is not in NEXUS_PROXY_UPSTREAMS allowlist", upstream)
+        })));
+        return;
+    }
+    res.status_code(StatusCode::NOT_IMPLEMENTED);
+    res.render(Json(serde_json::json!({
+        "upstream": upstream,
+        "status": "allowlisted"
+    })));
 }
 
 #[handler]
@@ -661,7 +828,7 @@ async fn serve_static(res: &mut Response) {
   </style>
 </head>
 <body>
-  <h1>ðŸŒ Nexus-IO Gateway</h1>
+  <h1>🌐 Nexus-IO Gateway</h1>
   <p><span class="status">â— ONLINE</span></p>
   
   <h2>Available Routes</h2>
@@ -674,12 +841,12 @@ async fn serve_static(res: &mut Response) {
   
   <h2>Gateway Features</h2>
   <ul>
-    <li class="feature">âœ… Multi-port architecture (443, 80, optional direct access)</li>
-    <li class="feature">âœ… Salvo framework with built-in ACME support</li>
-    <li class="feature">ðŸš§ HTTP/3 support (planned)</li>
-    <li class="feature">ðŸš§ OpenAPI auto-generation (planned)</li>
-    <li class="feature">ðŸš§ WebSocket upgrades (in progress)</li>
-    <li class="feature">ðŸš§ S3 proxy to Garage (in progress)</li>
+    <li class="feature">✅ Multi-port architecture (443, 80, optional direct access)</li>
+    <li class="feature">✅ Salvo framework with built-in ACME support</li>
+    <li class="feature">🚧 HTTP/3 support (planned)</li>
+    <li class="feature">🚧 OpenAPI auto-generation (planned)</li>
+    <li class="feature">🚧 WebSocket upgrades (in progress)</li>
+    <li class="feature">🚧 S3 proxy to Garage (in progress)</li>
   </ul>
 
   <h2>Next Steps</h2>

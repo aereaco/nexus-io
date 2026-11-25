@@ -105,7 +105,7 @@ pub const DEFAULT_MAX_OCI_WASM_BYTES: usize = 64 * 1024 * 1024; // 64 MiB
 /// Optional Nexus-specific capability & policy manifest embedded in an OCI Wasm artifact
 /// (`application/vnd.nexus.policy.v1+json`).
 ///
-/// SECURITY CONTRACT: Treated strictly as *requested* capabilities â€” never self-granted authority.
+/// SECURITY CONTRACT: Treated strictly as *requested* capabilities — never self-granted authority.
 /// The local microkernel IAM and operator policy always cap or approve actual runtime grants.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NexusPackagePolicy {
@@ -504,7 +504,7 @@ impl WasmRuntimeRegistry {
     /// Pull a Wasm guest runtime from any OCI Distribution v2 registry (GHCR, Docker Hub, Zot,
     /// Wasm Directory / `wkg`, or local OCI mirror) with full transport & artifact hardening:
     /// - Enforces HTTPS for remote registries (unless `NEXUS_OCI_ALLOW_INSECURE=1` or loopback).
-    /// - Strips `Authorization` Bearer credentials on cross-origin redirects & blocks HTTPSâ†’HTTP downgrade.
+    /// - Strips `Authorization` Bearer credentials on cross-origin redirects & blocks HTTPS→HTTP downgrade.
     /// - Verifies manifest SHA-256 when pinned by `@sha256:...` digest.
     /// - Requires an explicitly supported Wasm media type (no blind fallback).
     /// - Enforces streaming byte caps on manifests (1 MiB), policies (256 KiB), and Wasm blobs (64 MiB default).
@@ -722,7 +722,7 @@ impl WasmRuntimeRegistry {
         }
 
         // 3. Derived AOT cache miss: distinguish genuinely missing `cid/<cid>` from corruption or
-        //    storage failure! A corrupted authoritative source MUST fail explicitly â€” never fall through.
+        //    storage failure! A corrupted authoritative source MUST fail explicitly — never fall through.
         let cid_key = format!("cid/{}", resolved_cid);
         if let Some(raw_source) = self.blobs.get_object(RUNTIMES_BUCKET, &cid_key).await? {
             let actual_cid = blake3::hash(&raw_source).to_hex().to_string();
@@ -841,7 +841,7 @@ mod oci_client {
     }
 
     /// Hardened OCI Distribution v2 HTTP/HTTPS GET client:
-    /// - Strips Bearer credentials on cross-origin redirects & blocks HTTPSâ†’HTTP downgrades.
+    /// - Strips Bearer credentials on cross-origin redirects & blocks HTTPS→HTTP downgrades.
     /// - Enforces hard streaming size cap `max_bytes` before buffering into memory.
     /// - Handles RFC-compliant `WWW-Authenticate: Bearer` token exchange with percent-encoding.
     pub(super) async fn oci_http_get(
@@ -1164,7 +1164,7 @@ mod tests {
         assert_eq!(listed[0].cid, rec.cid);
 
         // Derived AOT cache contract: deleting OR corrupting an AOT `.cwasm` cache entry affects
-        // only latency, never correctness or availability â€” `resolve_runtime` detects corruption
+        // only latency, never correctness or availability — `resolve_runtime` detects corruption
         // via the NXAOT01 BLAKE3 envelope, evicts the bad cache entry, and rebuilds from `cid/<cid>`.
         let compat = current_aot_compat_key();
         let aot_cid_key = format!("aot-cid/{}/{}.cwasm", compat, rec.cid);

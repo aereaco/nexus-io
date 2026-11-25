@@ -18,15 +18,20 @@ Every workload — **JavaScript/TypeScript (`quickjs.wasm`)**, **PHP/WordPress (
 
 ---
 
-## The 5 Native Microkernel Primitives (`core`)
+## Host Primitives vs. Installable Guest Modules
 
-Everything in `core` is strictly limited to the five sovereign host primitives — Wasmtime 51 is the **sole** guest runtime (JS, TS, Python, PHP, SQLite, Postgres, SurrealDB all run as Wasm modules), and all additional platform domains are cleanly opt-in:
+Nexus-IO strictly separates **host microkernel primitives** from **installable guest Wasm modules**:
 
-1. **Compute (`CrystalEngine` + `WasmRuntimeRegistry`):** Wasmtime 51 + WASI Preview 1/2 sandbox with deterministic fuel metering, self-verifying derived AOT `.cwasm` caches (`NXAOT01` BLAKE3 envelopes keyed by `(compat_key, cid)`), zero ambient host authority, and the unified `nexus_host` syscall ABI (`nexus_db_query`, `nexus_blob_get`, `nexus_blob_put`, `nexus_log`).
-2. **State (`nexus-db` + `WasmDbMount`):** Kernel-native 100% MIT multi-model DB (`nexus-db`) **plus** per-cell `CellDbMode::WasmEngine` to mount real Wasm database engines (`pglite.wasm`, `sqlite.wasm`, `duckdb.wasm`, `surrealdb.wasm`) backed by single-CAS fenced `WasmDbCellRecord` leases and WAL `OwnershipTx` journals.
-3. **Storage (`BlobBridge` + `CasStore`):** Local BLAKE3 content-addressed object store with 3-state `Live → Tombstoned → Deleting` reclamation and write-ahead ownership journaling (optional `storage-p2p` Iroh + `storage-s3` S3 gateway).
-4. **Network (`UxGateway`):** Salvo HTTP/WebSocket ingress, `/cells/<app>/<cell_id>` routing, `/cells/_runtimes/<name>` registry API, and opt-in `net-*` (`net-http3`, `net-acme`, `net-openapi`, `net-vpn`) + `serve-*` (`serve-web`, `serve-proxy`) capabilities.
-5. **Security (`IAM` + `CapabilitySet` + `CellDbConfig`):** Argon2id + HS256/EdDSA/ES256/RS256 JWT + RBAC (`OWNER`/`EDITOR`/`VIEWER`) + syscall-level `CapabilitySet` enforcement + per-cell declarative database topology.
+- **Implemented in the host (`core`, 422 crates / 15.87 MB stripped):**
+  1. **Compute (`CrystalEngine` + `WasmRuntimeRegistry`):** Wasmtime 51 + WASI Preview 1/2 sandbox with deterministic fuel metering, self-verifying derived AOT `.cwasm` caches (`NXAOT01` BLAKE3 envelopes keyed by `(compat_key, cid)`), zero ambient host authority, and the capability-enforced `nexus_host` syscall ABI.
+  2. **State (`nexus-db` + `WasmDbMount`):** Embedded 100% MIT multi-model database (`nexus-db` SurrealQL + optional granular `db-*` extensions) and `WasmDbMount` single-CAS fenced virtual FS mounting for Wasm-hosted database engines.
+  3. **Storage (`BlobBridge` + `CasStore`):** BLAKE3 content-addressed object store with 3-state `Live → Tombstoned → Deleting` reclamation, write-ahead `OwnershipTx` journaling, and mandatory startup recovery (`UxGateway::reconcile_storage_on_boot()`).
+  4. **Network (`UxGateway`):** Salvo HTTP/WebSocket ingress, `/cells/<app>/<cell_id>` routing, `/cells/_runtimes/<name>` registry API, and fail-closed `BootRecoveryGateMiddleware`.
+  5. **Security (`IAM` + `CapabilitySet` + `CellDbConfig`):** Argon2id + HS256/EdDSA/ES256/RS256 JWT + RBAC (`OWNER`/`EDITOR`/`VIEWER`) + syscall-level `CapabilitySet` enforcement.
+- **Supplied by installable guest Wasm modules (not linked into the host binary):**
+  - **JavaScript / TypeScript:** Executed via Wasm guest runtimes (e.g. `quickjs.wasm`); TypeScript must be pre-transpiled or compiled by a Wasm transpiler module (no native QuickJS or OXC crates in the host).
+  - **Relational & External Database Engines:** Real SQLite (`sqlite.wasm`), PostgreSQL (`pglite.wasm`), DuckDB (`duckdb.wasm`), or SurrealDB (`surrealdb.wasm`) run as isolated Wasm guests mounted through `CellDbMode::WasmEngine`, rather than host-side SQL translation.
+  - **Polyglot App Runtimes:** PHP (`php-cgi.wasm`), Python, Ruby, Go, Rust, etc., pulled via OCI Distribution v2 (`runtime-oci`) or uploaded directly.
 
 ---
 

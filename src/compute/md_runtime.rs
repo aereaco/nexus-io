@@ -261,7 +261,7 @@ pub fn execute_node_crystal_i64(
     crystal.run_aot_i64(&aot, fn_name, a, b, fuel_limit)
 }
 
-/// Nushell/CLI command: `cell deploy <path.md>` â€” deploys a declarative Markdown service file
+/// Nushell/CLI command: `cell deploy <path.md>` — deploys a declarative Markdown service file
 /// onto `CellManager` and `StateEngine`.
 #[cfg(feature = "ops-shell")]
 #[derive(Clone)]
@@ -325,7 +325,7 @@ impl Command for CellDeployCommand {
             .iter()
             .map(|n| format!("{}/{} ({})", n.app, n.cell_id, n.name))
             .collect();
-        let msg = format!("âœ… Deployed {} cell(s): {}", nodes.len(), summary.join(", "));
+        let msg = format!("✅ Deployed {} cell(s): {}", nodes.len(), summary.join(", "));
         Ok(PipelineData::Value(Value::string(msg, span), None))
     }
 }

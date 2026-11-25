@@ -132,8 +132,8 @@ gui-webview = ["dep:wry", "dep:tao"]
 gui-all = ["gui-webview"]
 
 [dependencies]
-# 1. The Mind (100% MIT-licensed embedded nexus-db)
-nexus-db = { path = "crates/nexus-db", default-features = false, features = ["auth", "cbor"] }
+# 1. The Mind (100% MIT-licensed embedded nexus-db — all features controlled strictly via `db-*` flags)
+nexus-db = { path = "crates/nexus-db", default-features = false }
 tokio = { version = "1.0", features = ["rt-multi-thread", "net", "io-util", "sync", "time", "fs", "macros", "signal"] }
 
 # 2. The Nerves (Optional Interactive Nushell — gated behind `ops-shell`)

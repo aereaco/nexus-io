@@ -44,7 +44,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         let gw = ux::UxGateway::new(db, bridge, ux::GatewayConfig::default());
         println!(
-            "ðŸš€ Nexus-IO Sovereign Microkernel ({}) starting on http://127.0.0.1:8080",
+            "🚀 Nexus-IO Sovereign Microkernel ({}) starting on http://127.0.0.1:8080",
             nexus_io::runtime::CapabilityRegistry::active_profile()
         );
         gw.start().await
@@ -215,7 +215,7 @@ async fn async_main(args: Vec<String>, is_test: bool) -> Result<(), Box<dyn std:
         tokio::spawn(async move {
             match storage::WireGuardManager::init_mesh(db_clone.clone()).await {
                 Ok(Some(interface)) => {
-                    println!("âœ… Mesh Interface Active. Starting Reactor...");
+                    println!("✅ Mesh Interface Active. Starting Reactor...");
                     let reactor = Arc::new(storage::MeshReactor::new(
                         db_clone,
                         interface,
@@ -224,7 +224,7 @@ async fn async_main(args: Vec<String>, is_test: bool) -> Result<(), Box<dyn std:
                     reactor.start().await;
                 }
                 Ok(None) => {}
-                Err(e) => eprintln!("âš ï¸  Mesh Initialization Warning: {}", e),
+                Err(e) => eprintln!("⚠️  Mesh Initialization Warning: {}", e),
             }
         });
     }
@@ -519,7 +519,7 @@ async fn async_main(args: Vec<String>, is_test: bool) -> Result<(), Box<dyn std:
         #[cfg(not(all(feature = "ops-shell", not(any(target_os = "android", target_os = "ios")))))]
         {
             println!(
-                "ðŸš€ Nexus-IO ({}) ready (headless profile â€” pass a command or rebuild with `--features shell` for interactive REPL).",
+                "🚀 Nexus-IO ({}) ready (headless profile — pass a command or rebuild with `--features shell` for interactive REPL).",
                 nexus_io::runtime::CapabilityRegistry::active_profile()
             );
         }

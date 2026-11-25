@@ -56,9 +56,9 @@ async fn init_blob_node(data_dir: &std::path::Path) -> Result<Arc<BlobNode>> {
         config.data_dir = blob_path.to_string_lossy().to_string();
 
         if let Some(ip) = &vpn_ip {
-            println!("ðŸ”’ Secure Mesh Detected: Binding storage to {}", ip);
+            println!("🔒 Secure Mesh Detected: Binding storage to {}", ip);
         } else {
-            println!("âš ï¸  Secure Mesh NOT Detected: Localhost storage mode");
+            println!("⚠️  Secure Mesh NOT Detected: Localhost storage mode");
         }
 
         #[cfg(feature = "storage-p2p")]
@@ -79,7 +79,7 @@ async fn init_blob_node(data_dir: &std::path::Path) -> Result<Arc<BlobNode>> {
                 .accept(iroh_blobs::ALPN, blobs_proto)
                 .spawn();
 
-            println!("âœ… iroh-blobs FsStore + P2P Endpoint {} ready at {}", node_id, config.data_dir);
+            println!("✅ iroh-blobs FsStore + P2P Endpoint {} ready at {}", node_id, config.data_dir);
             Arc::new(BlobNode {
                 store,
                 endpoint,
@@ -92,7 +92,7 @@ async fn init_blob_node(data_dir: &std::path::Path) -> Result<Arc<BlobNode>> {
         let node = {
             tokio::fs::create_dir_all(&blob_path).await?;
             let node_id = format!("local-{}", blake3::hash(config.data_dir.as_bytes()).to_hex());
-            println!("âœ… Local BLAKE3 CAS BlobStore ({}) ready at {}", &node_id[..16], config.data_dir);
+            println!("✅ Local BLAKE3 CAS BlobStore ({}) ready at {}", &node_id[..16], config.data_dir);
             Arc::new(BlobNode {
                 local_dir: blob_path,
                 node_id,
@@ -197,7 +197,7 @@ impl BlobBridge {
             loop {
                 interval.tick().await;
                 if let Err(e) = bridge.repair_once(3).await {
-                    eprintln!("âš ï¸  Blob anti-entropy repair tick warning: {}", e);
+                    eprintln!("⚠️  Blob anti-entropy repair tick warning: {}", e);
                 }
             }
         });
@@ -280,7 +280,7 @@ impl BlobBridge {
             .await?;
 
         response.check()?;
-        println!("âœ… Bucket '{}' created (s3s + iroh-blobs)", name);
+        println!("✅ Bucket '{}' created (s3s + iroh-blobs)", name);
         Ok(())
     }
 
@@ -295,7 +295,7 @@ impl BlobBridge {
             .bind(("endpoint", endpoint.to_string()))
             .await?;
         response.check()?;
-        println!("âœ… Registered storage mesh peer {} -> {}", pubkey, endpoint);
+        println!("✅ Registered storage mesh peer {} -> {}", pubkey, endpoint);
         Ok(())
     }
 

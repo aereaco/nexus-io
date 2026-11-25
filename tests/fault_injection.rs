@@ -249,3 +249,107 @@ async fn cell_lifecycle_lease_conflict_and_runtime_trust_policy() {
         "CellDbConfig must persist across CellManager restarts"
     );
 }
+
+/// Startup Invariant Test: Proves `UxGateway` blocks cell traffic with `503 Service Unavailable`
+/// until `reconcile_storage_on_boot()` replays pending write-ahead `OwnershipTx` journals durably.
+#[tokio::test(flavor = "multi_thread")]
+async fn boot_recovery_gates_cell_work_and_replays_wal_on_startup() {
+    use nexus_io::storage::cas_store::{CasStore, OwnershipTx};
+    use nexus_io::ux::{GatewayConfig, UxGateway};
+    use salvo::test::TestClient;
+    use salvo::Service;
+
+    let db = Arc::new(Database::open_mem());
+    let blobs = Arc::new(BlobBridge::new(db.clone()).await.unwrap());
+    let cas = CasStore::new(blobs.clone());
+
+    // Seed an uncommitted write-ahead OwnershipTx in `nexus-wasm-db` (simulating prior crash)
+    let live_cid = cas
+        .put_verified_blob("nexus-wasm-db", "blobs/", bytes::Bytes::from_static(b"v1-live"))
+        .await
+        .unwrap();
+    let aborted_cid = cas
+        .put_verified_blob("nexus-wasm-db", "blobs/", bytes::Bytes::from_static(b"v2-aborted"))
+        .await
+        .unwrap();
+    cas.acquire_owners_batch("nexus-wasm-db", "wasmdb:demo/c1", &[live_cid.clone()])
+        .await
+        .unwrap();
+    cas.commit_manifest_cas(
+        "nexus-wasm-db",
+        "cells/demo/c1/manifest.json",
+        &serde_json::json!({"manifest": {"version": 1}}),
+        None,
+    )
+    .await
+    .unwrap();
+    cas.begin_ownership_tx(
+        "nexus-wasm-db",
+        &OwnershipTx {
+            tx_id: "boot-wal-1".into(),
+            owner_id: "wasmdb:demo/c1".into(),
+            target_manifest_key: "cells/demo/c1/manifest.json".into(),
+            target_version: 2,
+            acquired_cids: vec![aborted_cid.clone()],
+            prev_cids: vec![live_cid.clone()],
+            created_at_ms: 1,
+        },
+    )
+    .await
+    .unwrap();
+    cas.acquire_owners_batch("nexus-wasm-db", "wasmdb:demo/c1", &[aborted_cid.clone()])
+        .await
+        .unwrap();
+
+    let gw = UxGateway::new(db.clone(), blobs.clone(), GatewayConfig::default());
+    assert!(!gw.is_storage_ready());
+    let service = Service::new(gw.router());
+
+    // 1. BEFORE boot recovery completes: cell traffic MUST fail closed with 503 Service Unavailable
+    let pre_res = TestClient::get("http://127.0.0.1/cells/demo/c1")
+        .send(&service)
+        .await;
+    assert_eq!(pre_res.status_code, Some(salvo::http::StatusCode::SERVICE_UNAVAILABLE));
+
+    // 2. Run startup boot reconciliation (same path invoked at top of `UxGateway::start()`)
+    let (db_rep, _rt_rep) = gw.reconcile_storage_on_boot().await.unwrap();
+    assert_eq!(db_rep.tx_replayed, 1);
+    assert!(gw.is_storage_ready());
+    assert!(cas.get_verified_blob("nexus-wasm-db", "blobs/", &live_cid).await.is_ok());
+    assert!(cas.get_verified_blob("nexus-wasm-db", "blobs/", &aborted_cid).await.is_err());
+    assert!(blobs.list_objects("nexus-wasm-db", Some("tx/")).await.unwrap().is_empty());
+
+    // 3. AFTER boot recovery completes: cell traffic passes the boot gate (reaches IAM -> 401)
+    let post_res = TestClient::get("http://127.0.0.1/cells/demo/c1")
+        .send(&service)
+        .await;
+    assert_eq!(post_res.status_code, Some(salvo::http::StatusCode::UNAUTHORIZED));
+}
+
+/// Isolated Guest AOT `.cwasm` Instantiation & Execution Micro-Benchmark (25 fresh runs).
+#[test]
+fn aot_guest_instantiation_latency_benchmark() {
+    let crystal = CrystalEngine::new().unwrap();
+    let wat = br#"(module (func (export "add") (param i64 i64) (result i64) local.get 0 local.get 1 i64.add))"#;
+    let cwasm = crystal.compile_aot(wat).unwrap();
+
+    let mut samples_us = Vec::with_capacity(25);
+    for i in 0..25i64 {
+        let t0 = std::time::Instant::now();
+        let res = crystal.run_aot_i64(&cwasm, "add", i, 42, 100_000).unwrap();
+        let elapsed_us = t0.elapsed().as_micros();
+        assert_eq!(res, i + 42);
+        samples_us.push(elapsed_us);
+    }
+    samples_us.sort_unstable();
+    let median = samples_us[samples_us.len() / 2];
+    let min = samples_us[0];
+    let max = *samples_us.last().unwrap();
+    println!(
+        "AOT_GUEST_INSTANTIATION_US median={} min={} max={} (n={})",
+        median,
+        min,
+        max,
+        samples_us.len()
+    );
+}
