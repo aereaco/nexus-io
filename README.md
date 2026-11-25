@@ -42,15 +42,18 @@ Nexus-IO strictly separates **host microkernel primitives** from **installable g
 | **`core`** *(default)* | Pure microkernel: `runtime-wasm` (Wasmtime 51 + WASI), `nexus-db` (`db-auth`, `db-cbor`), `BlobBridge + CasStore`, `UxGateway` (HTTP/WS), `IAM + CapabilitySet`, `NexusMetrics` |
 | **`full`** | `core` + `runtime-all` + `db-all` + `net-all` + `storage-all` + `serve-all` + `ops-all` *(headless-safe; compose any profile with `gui-all` for OS-autodetected native WebView)* |
 
-| Domain | Granular Flags | Bundle Flag |
-| :--- | :--- | :--- |
-| **Runtime** | `runtime-wasm` *(in `core`)*, `runtime-oci` | `runtime-all` |
-| **Database (`nexus-db`)** | `db-auth`, `db-cbor`, `db-fts`, `db-vector`, `db-files`, `db-geo`, `db-crypto`, `db-ml`, `db-graphql`, `db-gql`, `db-pgwire`, `db-mysqlwire`, `db-sqlite` | `db-all` |
-| **Network** | `net-http3`, `net-acme`, `net-openapi`, `net-vpn` | `net-all` |
-| **Storage** | `storage-p2p`, `storage-s3` | `storage-all` |
-| **Serve** | `serve-web`, `serve-proxy` | `serve-all` |
-| **Operations** | `ops-shell`, `ops-k8s`, `ops-gpu` | `ops-all` |
-| **GUI** | `gui-webview` *(OS-autodetected: WebView2 / WKWebView / WebKitGTK / Android / iOS)* | `gui-all` |
+| Domain | Granular Flags | Bundle Flag | Maturity |
+| :--- | :--- | :--- | :--- |
+| **Runtime** | `runtime-wasm` *(in `core`)*, `runtime-oci` | `runtime-all` | **Implemented** (Wasmtime 51 + WASI, hardened OCI v2, self-verifying `NXAOT01` AOT cache) |
+| **Database (`nexus-db`)** | `db-auth`, `db-cbor`, `db-fts`, `db-vector`, `db-files`, `db-geo`, `db-crypto`, `db-ml`, `db-graphql`, `db-gql`, `db-pgwire`, `db-mysqlwire`, `db-sqlite` | `db-all` | **Implemented** (core SurrealQL/auth/CBOR) / **Partial** (wire listeners `db-pgwire`, `db-mysqlwire`, `db-sqlite` subset) |
+| **Network** | `net-http3`, `net-acme`, `net-openapi`, `net-vpn` | `net-all` | **Experimental** (`net-vpn` WireGuard, ACME/HTTP3 integration) |
+| **Storage** | `storage-p2p`, `storage-s3` | `storage-all` | **Implemented** (local CAS + `CasStore` WAL/3-state reclamation) / **Experimental** (`storage-p2p` Iroh, `storage-s3`) |
+| **Serve** | `serve-web`, `serve-proxy` | `serve-all` | **Implemented** (`serve-web` static + SPA fallback; `serve-proxy` SSRF-hardened, DNS-pinned Hyper HTTP/1.1 reverse proxy) |
+| **Operations** | `ops-shell`, `ops-k8s`, `ops-gpu` | `ops-all` | **Experimental** (Nushell CLI, K8s YAML bridge, NVML GPU telemetry) |
+| **GUI** | `gui-webview` *(OS-autodetected: WebView2 / WKWebView / WebKitGTK / Android / iOS)* | `gui-all` | **Experimental** (OS-native WebView shell) |
+| **Guest Languages & External DBs** | *(Loaded into `WasmRuntimeRegistry` — no host flags)* | — | **Guest-provided** (`quickjs.wasm`, TS transpiler Wasm, `php-cgi.wasm`, `sqlite.wasm`, `pglite.wasm`, `duckdb.wasm`, `surrealdb.wasm`) |
+
+> **Maturity definitions:** **Implemented** = functional host-side implementation with automated tests; **Partial** = working protocol subset (not full upstream parity); **Guest-provided** = supplied by an installable Wasm module rather than the host binary; **Experimental** = available for opt-in use, not yet production-hardened.
 
 ---
 

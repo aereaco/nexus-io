@@ -5,6 +5,8 @@ pub mod s3_proxy;
 pub mod cell_router;
 pub mod iam;
 pub mod native_gui;
+#[cfg(feature = "serve-proxy")]
+pub mod reverse_proxy;
 
 pub use gateway::{GatewayConfig, UxGateway};
 pub use native_gui::{

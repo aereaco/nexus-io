@@ -13,7 +13,7 @@ use crate::ux::cell_router::CellGatewayHandler;
 use crate::ux::surreal_ws::WebSocketHandler;
 use crate::ux::s3_proxy::S3ProxyHandler;
 
-/// Fail-closed middleware that blocks cell workloads with `503 Service Unavailable`
+/// Fail-closed middleware that blocks storage-dependent routes with `503 Service Unavailable`
 /// until `UxGateway::reconcile_storage_on_boot()` has completed durably.
 #[derive(Clone)]
 struct BootRecoveryGateMiddleware {
@@ -35,6 +35,35 @@ impl Handler for BootRecoveryGateMiddleware {
                 "error": "Storage boot recovery has not completed yet"
             })));
             ctrl.skip_rest();
+        }
+    }
+}
+
+/// Readiness probe (`/ready`): returns `503 Service Unavailable` until startup storage
+/// reconciliation completes, and `200 OK` once ready (distinct from `/health` liveness).
+#[derive(Clone)]
+struct ReadinessHandler {
+    storage_ready: Arc<AtomicBool>,
+}
+
+#[async_trait]
+impl Handler for ReadinessHandler {
+    async fn handle(
+        &self,
+        _req: &mut Request,
+        _depot: &mut Depot,
+        res: &mut Response,
+        _ctrl: &mut FlowCtrl,
+    ) {
+        if self.storage_ready.load(Ordering::SeqCst) {
+            res.status_code(StatusCode::OK);
+            res.render(Json(serde_json::json!({ "ready": true })));
+        } else {
+            res.status_code(StatusCode::SERVICE_UNAVAILABLE);
+            res.render(Json(serde_json::json!({
+                "ready": false,
+                "reason": "storage_boot_recovery_pending"
+            })));
         }
     }
 }
@@ -523,8 +552,14 @@ impl UxGateway {
         Ok(())
     }
 
-    /// Build the main application router
+    /// Build the main application router.
+    /// Every storage-dependent route (`/rpc`, `/sql`, `/export`, `/import`, `/key/*`, `/api/*`,
+    /// `/query`, `/cells/*`, `/s3/*`, `/graphql`, `/v2/pipeline`) is guarded by
+    /// `BootRecoveryGateMiddleware` (`503` until `reconcile_storage_on_boot()` succeeds).
     fn build_main_router(&self) -> Router {
+        let gate = BootRecoveryGateMiddleware {
+            storage_ready: self.storage_ready.clone(),
+        };
         let router = Router::new()
             // Static PWA files
             .push(Router::with_path("/").get(serve_static))
@@ -536,6 +571,7 @@ impl UxGateway {
                 let http_rpc = crate::ux::surreal_http::SurrealHttpRpcHandler { db: db.clone() };
                 let iam = crate::ux::iam::IamMiddleware::authenticated(db);
                 Router::with_path("/rpc")
+                    .hoop(gate.clone())
                     .hoop(iam)
                     .get(ws_handler)
                     .post(http_rpc)
@@ -543,6 +579,7 @@ impl UxGateway {
             // SurrealDB-compatible HTTP REST API (/sql, /signin, /signup, /export, /import, /key, /api)
             .push(
                 Router::with_path("/sql")
+                    .hoop(gate.clone())
                     .hoop(crate::ux::iam::IamMiddleware::authenticated(self.db.clone()))
                     .post(crate::ux::surreal_http::SurrealSqlHandler { db: self.db.clone() }),
             )
@@ -550,24 +587,28 @@ impl UxGateway {
             .push(Router::with_path("/signup").post(crate::ux::surreal_http::SurrealAuthHandler { db: self.db.clone(), is_signup: true }))
             .push(
                 Router::with_path("/export")
+                    .hoop(gate.clone())
                     .hoop(crate::ux::iam::IamMiddleware::authenticated(self.db.clone()))
                     .get(crate::ux::surreal_http::SurrealExportImportHandler { db: self.db.clone(), is_import: false })
                     .post(crate::ux::surreal_http::SurrealExportImportHandler { db: self.db.clone(), is_import: false }),
             )
             .push(
                 Router::with_path("/import")
+                    .hoop(gate.clone())
                     .hoop(crate::ux::iam::IamMiddleware::admin(self.db.clone()))
                     .post(crate::ux::surreal_http::SurrealExportImportHandler { db: self.db.clone(), is_import: true }),
             )
             .push(
-                Router::with_path("/key/<table:str>")
+                Router::with_path("/key/{table}")
+                    .hoop(gate.clone())
                     .hoop(crate::ux::iam::IamMiddleware::authenticated(self.db.clone()))
                     .get(crate::ux::surreal_http::SurrealKeyHandler { db: self.db.clone() })
                     .post(crate::ux::surreal_http::SurrealKeyHandler { db: self.db.clone() })
                     .delete(crate::ux::surreal_http::SurrealKeyHandler { db: self.db.clone() }),
             )
             .push(
-                Router::with_path("/key/<table:str>/<id:str>")
+                Router::with_path("/key/{table}/{id}")
+                    .hoop(gate.clone())
                     .hoop(crate::ux::iam::IamMiddleware::authenticated(self.db.clone()))
                     .get(crate::ux::surreal_http::SurrealKeyHandler { db: self.db.clone() })
                     .put(crate::ux::surreal_http::SurrealKeyHandler { db: self.db.clone() })
@@ -575,21 +616,25 @@ impl UxGateway {
                     .delete(crate::ux::surreal_http::SurrealKeyHandler { db: self.db.clone() }),
             )
             .push(
-                Router::with_path("/api/<ns:str>/<db:str>/<**path>")
+                Router::with_path("/api/{ns}/{db}/{**path}")
+                    .hoop(gate.clone())
                     .hoop(crate::ux::iam::IamMiddleware::authenticated(self.db.clone()))
                     .get(crate::ux::surreal_http::SurrealCustomApiHandler { db: self.db.clone() })
                     .post(crate::ux::surreal_http::SurrealCustomApiHandler { db: self.db.clone() })
                     .put(crate::ux::surreal_http::SurrealCustomApiHandler { db: self.db.clone() })
                     .delete(crate::ux::surreal_http::SurrealCustomApiHandler { db: self.db.clone() }),
             )
-            // Public health/readiness/version + Observability metrics
+            // Public liveness (/status, /health), storage-aware readiness (/ready), version, metrics
             .push(Router::with_path("/status").get(crate::ux::surreal_http::surreal_status))
-            .push(Router::with_path("/ready").get(crate::ux::surreal_http::surreal_ready))
+            .push(Router::with_path("/ready").get(ReadinessHandler {
+                storage_ready: self.storage_ready.clone(),
+            }))
             .push(Router::with_path("/version").get(crate::ux::surreal_http::surreal_version))
             .push(Router::with_path("/_nexus/metrics").get(serve_metrics))
             // Unified External Multi-Flavor Query API (`POST /query`, `POST /cells/:app/:cell_id/query`)
             .push(
                 Router::with_path("/query")
+                    .hoop(gate.clone())
                     .hoop(crate::ux::iam::IamMiddleware::authenticated(self.db.clone()))
                     .post(crate::ux::surreal_http::UnifiedQueryHandler {
                         db: self.db.clone(),
@@ -599,9 +644,7 @@ impl UxGateway {
             )
             .push(
                 Router::with_path("/cells/{app}/{cell_id}/query")
-                    .hoop(BootRecoveryGateMiddleware {
-                        storage_ready: self.storage_ready.clone(),
-                    })
+                    .hoop(gate.clone())
                     .hoop(crate::ux::iam::IamMiddleware::authenticated(self.db.clone()))
                     .post(crate::ux::surreal_http::UnifiedQueryHandler {
                         db: self.db.clone(),
@@ -612,11 +655,13 @@ impl UxGateway {
             // Privileged Multi-node WAL replication transport (Admin tier)
             .push(
                 Router::with_path("/_nexus/wal/entries")
+                    .hoop(gate.clone())
                     .hoop(crate::ux::iam::IamMiddleware::admin(self.db.clone()))
                     .get(crate::ux::surreal_http::WalReplicationHandler { db: self.db.clone(), is_apply: false }),
             )
             .push(
                 Router::with_path("/_nexus/wal/apply")
+                    .hoop(gate.clone())
                     .hoop(crate::ux::iam::IamMiddleware::admin(self.db.clone()))
                     .post(crate::ux::surreal_http::WalReplicationHandler { db: self.db.clone(), is_apply: true }),
             );
@@ -624,6 +669,7 @@ impl UxGateway {
         #[cfg(feature = "db-graphql")]
         let router = router.push(
             Router::with_path("/graphql")
+                .hoop(gate.clone())
                 .hoop(crate::ux::iam::IamMiddleware::authenticated(self.db.clone()))
                 .post(crate::ux::surreal_http::UnifiedQueryHandler {
                     db: self.db.clone(),
@@ -635,6 +681,7 @@ impl UxGateway {
         #[cfg(feature = "db-sqlite")]
         let router = router.push(
             Router::with_path("/v2/pipeline")
+                .hoop(gate.clone())
                 .hoop(crate::ux::iam::IamMiddleware::authenticated(self.db.clone()))
                 .post(crate::ux::surreal_http::SqliteHranaHandler { db: self.db.clone() }),
         );
@@ -648,8 +695,10 @@ impl UxGateway {
         let router = router.push(
             Router::with_path("/proxy/{upstream}/{**path}")
                 .hoop(crate::ux::iam::IamMiddleware::authenticated(self.db.clone()))
-                .get(serve_proxy_handler)
-                .post(serve_proxy_handler),
+                .get(crate::ux::reverse_proxy::ReverseProxyHandler::from_env())
+                .post(crate::ux::reverse_proxy::ReverseProxyHandler::from_env())
+                .put(crate::ux::reverse_proxy::ReverseProxyHandler::from_env())
+                .delete(crate::ux::reverse_proxy::ReverseProxyHandler::from_env()),
         );
 
         router
@@ -661,6 +710,7 @@ impl UxGateway {
                 let s3_handler = S3ProxyHandler { garage };
                 let iam = crate::ux::iam::IamMiddleware::authenticated(db);
                 Router::with_path("/s3/{**path}")
+                    .hoop(gate.clone())
                     .hoop(iam)
                     .get(s3_handler.clone())
                     .put(s3_handler.clone())
@@ -677,9 +727,7 @@ impl UxGateway {
                 };
                 let iam = crate::ux::iam::IamMiddleware::authenticated(db);
                 Router::with_path("/cells/{**path}")
-                    .hoop(BootRecoveryGateMiddleware {
-                        storage_ready: self.storage_ready.clone(),
-                    })
+                    .hoop(gate)
                     .hoop(iam)
                     .get(cell_handler.clone())
                     .post(cell_handler.clone())
@@ -687,12 +735,16 @@ impl UxGateway {
                     .delete(cell_handler)
             })
             
-            // Health check & runtime capability diagnostics
+            // Health check (liveness) & runtime capability diagnostics
             .push(Router::with_path("/health").get(health_check))
             .push(Router::with_path("/_nexus/capabilities").get(capabilities_handler))
     }
 
     /// Expose the configured Salvo router for programmatic embedding and integration tests.
+    ///
+    /// **Embedder contract:** Storage-dependent routes fail closed (`503 Service Unavailable`)
+    /// and `/ready` reports `503` until the embedder explicitly invokes
+    /// `self.reconcile_storage_on_boot().await?`.
     pub fn router(&self) -> Router {
         self.build_main_router()
     }
@@ -704,7 +756,7 @@ async fn serve_web_static(req: &mut Request, res: &mut Response) {
     let root = std::path::PathBuf::from(
         std::env::var("NEXUS_WEB_ROOT").unwrap_or_else(|_| "public".to_string()),
     );
-    let rel = req.param::<String>("**path").unwrap_or_default();
+    let rel = req.param::<String>("path").unwrap_or_default();
     if rel.contains("..") {
         res.status_code(StatusCode::BAD_REQUEST);
         return;
@@ -736,29 +788,6 @@ async fn serve_web_static(req: &mut Request, res: &mut Response) {
             res.status_code(StatusCode::NOT_FOUND);
         }
     }
-}
-
-#[cfg(feature = "serve-proxy")]
-#[handler]
-async fn serve_proxy_handler(req: &mut Request, res: &mut Response) {
-    let upstream = req.param::<String>("upstream").unwrap_or_default();
-    let allowlist = std::env::var("NEXUS_PROXY_UPSTREAMS").unwrap_or_default();
-    let allowed = allowlist
-        .split(',')
-        .map(|s| s.trim())
-        .any(|entry| !entry.is_empty() && entry.starts_with(&format!("{}=", upstream)));
-    if !allowed {
-        res.status_code(StatusCode::FORBIDDEN);
-        res.render(Json(serde_json::json!({
-            "error": format!("Upstream '{}' is not in NEXUS_PROXY_UPSTREAMS allowlist", upstream)
-        })));
-        return;
-    }
-    res.status_code(StatusCode::NOT_IMPLEMENTED);
-    res.render(Json(serde_json::json!({
-        "upstream": upstream,
-        "status": "allowlisted"
-    })));
 }
 
 #[handler]

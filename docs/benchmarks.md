@@ -25,7 +25,10 @@ Measured across **5 fresh process launches** (isolated temporary data directory 
 | :--- | :--- |
 | **Release executable size (`nexus.exe`, stripped)** | **15.87 MB** (`16,642,560` bytes) |
 | **Cold host process startup (5 fresh launches, TCP port 8080 readiness)** | **Median: `1,036.27 ms`** (range: `1,019.78 ms – 1,889.85 ms`; runs 2–5: `1,019.78 – 1,044.02 ms`; run 1 includes OS cold page cache) |
-| **Isolated guest AOT `.cwasm` instantiation + execution (25 fresh runs, `--release`)** | **Median: `114 µs` (`0.114 ms`)** (range: `71 µs – 335 µs`; measured via `aot_guest_instantiation_latency_benchmark`) |
+| **Isolated guest AOT `.cwasm` microbenchmark (`n = 200`, `--release`)** | **p50: `133 µs` (`0.133 ms`)**, **p95: `318 µs`**, range: `76 µs – 1,463 µs` (`aot_guest_instantiation_latency_benchmark`; pure AOT instantiation + `i64` export call) |
+| **End-to-end guest invocation — cold cache (delete AOT → BLAKE3 verify `cid/` → compile → WASI + `nexus_host` DB query)** | **`7.42 ms`** (`end_to_end_guest_and_concurrent_20_cell_workload_benchmark`) |
+| **End-to-end guest invocation — warm cache (`n = 25`: registry lookup → `NXAOT01` BLAKE3 verify → WASI + `nexus_host` DB query)** | **p50: `1.12 ms` (`1,119 µs`)**, **p95: `1.68 ms` (`1,679 µs`)**, range: `0.90 ms – 1.72 ms` |
+| **20-cell concurrent isolated workload (200 mixed `CREATE` + `SELECT` ops, strict zero-leakage check)** | **`79,001 ops/sec`**, **0 failures**, **p50: `62 µs`**, **p95: `104 µs`** |
 | **Idle Working Set (`WorkingSet64`, 2s settled)** | **Median: `12.02 MB`** (range: `11.93 MB – 25.14 MB`) |
 | **Idle Private Memory (`PrivateMemorySize64`, 2s settled)** | **Median: `4.43 MB`** (range: `4.18 MB – 4.70 MB`) |
 | **Rust / Cargo versions** | `rustc 1.100.0 (0ef1bc386 2026-11-09)` / `cargo 1.100.0 (3acc79c0c 2026-11-05)` |

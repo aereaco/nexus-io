@@ -305,11 +305,39 @@ async fn boot_recovery_gates_cell_work_and_replays_wal_on_startup() {
     assert!(!gw.is_storage_ready());
     let service = Service::new(gw.router());
 
-    // 1. BEFORE boot recovery completes: cell traffic MUST fail closed with 503 Service Unavailable
-    let pre_res = TestClient::get("http://127.0.0.1/cells/demo/c1")
-        .send(&service)
-        .await;
-    assert_eq!(pre_res.status_code, Some(salvo::http::StatusCode::SERVICE_UNAVAILABLE));
+    // 1. BEFORE boot recovery completes:
+    //    - `/health` (liveness) MUST return 200 OK
+    //    - `/ready` (readiness) MUST return 503 Service Unavailable
+    //    - EVERY storage-dependent route (`/cells/*`, `/cells/*/query`, `/s3/*`, `/query`,
+    //      `/sql`, `/rpc`, `/key/*`, `/api/*`) MUST fail closed with 503 Service Unavailable!
+    let health_pre = TestClient::get("http://127.0.0.1/health").send(&service).await;
+    assert_eq!(health_pre.status_code, Some(salvo::http::StatusCode::OK));
+    let ready_pre = TestClient::get("http://127.0.0.1/ready").send(&service).await;
+    assert_eq!(ready_pre.status_code, Some(salvo::http::StatusCode::SERVICE_UNAVAILABLE));
+
+    for (method, path) in [
+        ("GET", "http://127.0.0.1/cells/demo/c1"),
+        ("POST", "http://127.0.0.1/cells/demo/c1/query"),
+        ("GET", "http://127.0.0.1/s3/bucket/key"),
+        ("POST", "http://127.0.0.1/query"),
+        ("POST", "http://127.0.0.1/sql"),
+        ("POST", "http://127.0.0.1/rpc"),
+        ("GET", "http://127.0.0.1/key/users"),
+        ("GET", "http://127.0.0.1/api/ns1/db1/items"),
+    ] {
+        let resp = if method == "POST" {
+            TestClient::post(path).send(&service).await
+        } else {
+            TestClient::get(path).send(&service).await
+        };
+        assert_eq!(
+            resp.status_code,
+            Some(salvo::http::StatusCode::SERVICE_UNAVAILABLE),
+            "Route {} {} must fail closed with 503 before boot recovery completes",
+            method,
+            path
+        );
+    }
 
     // 2. Run startup boot reconciliation (same path invoked at top of `UxGateway::start()`)
     let (db_rep, _rt_rep) = gw.reconcile_storage_on_boot().await.unwrap();
@@ -319,22 +347,168 @@ async fn boot_recovery_gates_cell_work_and_replays_wal_on_startup() {
     assert!(cas.get_verified_blob("nexus-wasm-db", "blobs/", &aborted_cid).await.is_err());
     assert!(blobs.list_objects("nexus-wasm-db", Some("tx/")).await.unwrap().is_empty());
 
-    // 3. AFTER boot recovery completes: cell traffic passes the boot gate (reaches IAM -> 401)
-    let post_res = TestClient::get("http://127.0.0.1/cells/demo/c1")
-        .send(&service)
-        .await;
-    assert_eq!(post_res.status_code, Some(salvo::http::StatusCode::UNAUTHORIZED));
+    // 3. AFTER boot recovery completes:
+    //    - `/ready` returns 200 OK
+    //    - All storage-dependent routes pass the boot gate (reaching IAM -> 401 Unauthorized)
+    let ready_post = TestClient::get("http://127.0.0.1/ready").send(&service).await;
+    assert_eq!(ready_post.status_code, Some(salvo::http::StatusCode::OK));
+    for (method, path) in [
+        ("GET", "http://127.0.0.1/cells/demo/c1"),
+        ("POST", "http://127.0.0.1/cells/demo/c1/query"),
+        ("GET", "http://127.0.0.1/s3/bucket/key"),
+        ("POST", "http://127.0.0.1/query"),
+        ("POST", "http://127.0.0.1/sql"),
+        ("POST", "http://127.0.0.1/rpc"),
+        ("GET", "http://127.0.0.1/key/users"),
+        ("GET", "http://127.0.0.1/api/ns1/db1/items"),
+    ] {
+        let resp = if method == "POST" {
+            TestClient::post(path).send(&service).await
+        } else {
+            TestClient::get(path).send(&service).await
+        };
+        assert_eq!(
+            resp.status_code,
+            Some(salvo::http::StatusCode::UNAUTHORIZED),
+            "Route {} {} must pass boot gate and reach IAM after recovery",
+            method,
+            path
+        );
+    }
 }
 
-/// Isolated Guest AOT `.cwasm` Instantiation & Execution Micro-Benchmark (25 fresh runs).
+/// Multi-Node Adversarial Test A & B:
+/// A. Two independent `CasStore` nodes race `reconcile_on_boot()` simultaneously on the same pending
+///    `OwnershipTx` — proving zero double-decrement, live CID preservation, and idempotent convergence.
+/// B. A live writer persists `OwnershipTx` and writes a new immutable blob BEFORE acquiring ownership,
+///    while a second node runs full `gc_unreferenced_blobs()` concurrently — proving the active
+///    write-ahead journal protects in-flight blobs while genuinely abandoned garbage IS reclaimed.
+#[tokio::test(flavor = "multi_thread")]
+async fn multi_node_concurrent_recovery_and_gc_vs_live_writer() {
+    use nexus_io::storage::cas_store::{CasStore, OwnershipTx};
+    use std::collections::HashSet;
+
+    let db = Arc::new(Database::open_mem());
+    let blobs = Arc::new(BlobBridge::new(db).await.unwrap());
+
+    // --- Part A: Simultaneous Recovery Race ---
+    let node_a = CasStore::new(blobs.clone());
+    let node_b = CasStore::new(blobs.clone());
+
+    let live_cid = node_a
+        .put_verified_blob("mn-race", "blobs/", bytes::Bytes::from_static(b"mn-live-v1"))
+        .await
+        .unwrap();
+    let aborted_cid = node_a
+        .put_verified_blob("mn-race", "blobs/", bytes::Bytes::from_static(b"mn-abort-v2"))
+        .await
+        .unwrap();
+    node_a
+        .acquire_owners_batch("mn-race", "wasmdb:app/c1", &[live_cid.clone()])
+        .await
+        .unwrap();
+    node_a
+        .commit_manifest_cas(
+            "mn-race",
+            "cells/app/c1/manifest.json",
+            &serde_json::json!({"manifest": {"version": 1}}),
+            None,
+        )
+        .await
+        .unwrap();
+    node_a
+        .begin_ownership_tx(
+            "mn-race",
+            &OwnershipTx {
+                tx_id: "race-tx-1".into(),
+                owner_id: "wasmdb:app/c1".into(),
+                target_manifest_key: "cells/app/c1/manifest.json".into(),
+                target_version: 2,
+                acquired_cids: vec![aborted_cid.clone()],
+                prev_cids: vec![live_cid.clone()],
+                created_at_ms: 1,
+            },
+        )
+        .await
+        .unwrap();
+    node_a
+        .acquire_owners_batch("mn-race", "wasmdb:app/c1", &[aborted_cid.clone()])
+        .await
+        .unwrap();
+
+    // Both nodes boot and reconcile the exact same bucket simultaneously
+    let empty = HashSet::new();
+    let (res_a, res_b) = tokio::join!(
+        node_a.reconcile_on_boot("mn-race", "blobs/", &empty, 0, false),
+        node_b.reconcile_on_boot("mn-race", "blobs/", &empty, 0, false),
+    );
+    assert!(res_a.is_ok(), "node_a recovery failed: {:?}", res_a);
+    assert!(res_b.is_ok(), "node_b recovery failed: {:?}", res_b);
+    assert!(node_a.get_verified_blob("mn-race", "blobs/", &live_cid).await.is_ok());
+    assert!(node_a.get_verified_blob("mn-race", "blobs/", &aborted_cid).await.is_err());
+    assert!(blobs.list_objects("mn-race", Some("tx/")).await.unwrap().is_empty());
+    // Repeating recovery converges idempotently
+    let repeat = node_b
+        .reconcile_on_boot("mn-race", "blobs/", &empty, 0, false)
+        .await
+        .unwrap();
+    assert!(repeat.skipped);
+
+    // --- Part B: Concurrent Full Orphan GC vs. Live Writer ---
+    let writer = CasStore::new(blobs.clone());
+    let gc_node = CasStore::new(blobs.clone());
+
+    // Genuine unowned garbage blob (no ledger entry, no OwnershipTx)
+    let garbage_cid = writer
+        .put_verified_blob("mn-gc", "blobs/", bytes::Bytes::from_static(b"true-orphan-garbage"))
+        .await
+        .unwrap();
+
+    // Live writer follows WAL-before-blob order: persists OwnershipTx BEFORE uploading in-flight blob
+    let inflight_bytes = bytes::Bytes::from_static(b"live-writer-inflight-blob");
+    let inflight_cid = blake3::hash(&inflight_bytes).to_hex().to_string();
+    writer
+        .begin_ownership_tx(
+            "mn-gc",
+            &OwnershipTx {
+                tx_id: "live-inflight-1".into(),
+                owner_id: "wasmdb:app/c2".into(),
+                target_manifest_key: "cells/app/c2/manifest.json".into(),
+                target_version: 1,
+                acquired_cids: vec![inflight_cid.clone()],
+                prev_cids: vec![],
+                created_at_ms: 1,
+            },
+        )
+        .await
+        .unwrap();
+    writer
+        .put_verified_blob("mn-gc", "blobs/", inflight_bytes)
+        .await
+        .unwrap();
+
+    // BEFORE writer acquires ownership or commits manifest, gc_node runs a full orphan GC scan!
+    let reclaimed = gc_node
+        .gc_unreferenced_blobs("mn-gc", "blobs/", &empty)
+        .await
+        .unwrap();
+    assert_eq!(reclaimed, 1, "GC must reclaim only genuine unowned garbage");
+    assert!(writer.get_verified_blob("mn-gc", "blobs/", &garbage_cid).await.is_err());
+    assert!(
+        writer.get_verified_blob("mn-gc", "blobs/", &inflight_cid).await.is_ok(),
+        "Concurrent orphan GC MUST NOT delete a live writer's WAL-protected in-flight blob!"
+    );
+}
+
+/// Isolated Guest AOT `.cwasm` Instantiation & Execution Micro-Benchmark (200 samples: p50/p95/min/max).
 #[test]
 fn aot_guest_instantiation_latency_benchmark() {
     let crystal = CrystalEngine::new().unwrap();
     let wat = br#"(module (func (export "add") (param i64 i64) (result i64) local.get 0 local.get 1 i64.add))"#;
     let cwasm = crystal.compile_aot(wat).unwrap();
 
-    let mut samples_us = Vec::with_capacity(25);
-    for i in 0..25i64 {
+    let mut samples_us = Vec::with_capacity(200);
+    for i in 0..200i64 {
         let t0 = std::time::Instant::now();
         let res = crystal.run_aot_i64(&cwasm, "add", i, 42, 100_000).unwrap();
         let elapsed_us = t0.elapsed().as_micros();
@@ -342,14 +516,166 @@ fn aot_guest_instantiation_latency_benchmark() {
         samples_us.push(elapsed_us);
     }
     samples_us.sort_unstable();
-    let median = samples_us[samples_us.len() / 2];
+    let p50 = samples_us[samples_us.len() / 2];
+    let p95 = samples_us[(samples_us.len() * 95) / 100];
     let min = samples_us[0];
     let max = *samples_us.last().unwrap();
     println!(
-        "AOT_GUEST_INSTANTIATION_US median={} min={} max={} (n={})",
-        median,
+        "AOT_MICROBENCH_US n={} p50={} p95={} min={} max={}",
+        samples_us.len(),
+        p50,
+        p95,
         min,
-        max,
-        samples_us.len()
+        max
+    );
+}
+
+/// End-to-End Guest Invocation Benchmark (cold AOT rebuild vs. warm NXAOT01 cache hit + WASI + DB)
+/// AND 20-Cell Concurrent Isolated Workload Benchmark (mixed reads/writes + correctness verification).
+#[tokio::test(flavor = "multi_thread")]
+async fn end_to_end_guest_and_concurrent_20_cell_workload_benchmark() {
+    let db = Arc::new(Database::open_mem());
+    let blobs = Arc::new(BlobBridge::new(db.clone()).await.unwrap());
+    let reg = WasmRuntimeRegistry::new(blobs.clone());
+
+    // Minimal WASI guest calling `nexus_host::nexus_db_query` (full host-ABI roundtrip)
+    let guest_wat = br#"
+        (module
+            (import "nexus_host" "nexus_db_query" (func $db_q (param i32 i32 i32 i32 i32 i32) (result i32)))
+            (import "wasi_snapshot_preview1" "fd_write" (func $fd_write (param i32 i32 i32 i32) (result i32)))
+            (memory (export "memory") 2)
+            (data (i32.const 0) "surql")
+            (data (i32.const 16) "SELECT * FROM bench;")
+            (func (export "_start")
+                (local $n i32)
+                (local.set $n (call $db_q (i32.const 0) (i32.const 5) (i32.const 16) (i32.const 20) (i32.const 256) (i32.const 4096)))
+                (i32.store (i32.const 128) (i32.const 256))
+                (i32.store (i32.const 132) (local.get $n))
+                (drop (call $fd_write (i32.const 1) (i32.const 128) (i32.const 1) (i32.const 140)))
+            )
+        )
+    "#;
+    let rec = reg.register_runtime("bench-guest", guest_wat).await.unwrap();
+    let compat = current_aot_compat_key();
+    let aot_key = format!("aot-cid/{}/{}.cwasm", compat, rec.cid);
+
+    // 1. Cold-cache end-to-end (delete AOT cache -> BLAKE3 source verify -> compile -> WASI + DB)
+    blobs.delete_object("nexus-runtimes", &aot_key).await.unwrap();
+    let t_cold = std::time::Instant::now();
+    let cold_art = reg.resolve_runtime("bench-guest").await.unwrap();
+    let cold_bytes = match cold_art {
+        nexus_io::compute::wasm_registry::ResolvedRuntime::Aot(b) => b,
+        _ => panic!("expected AOT"),
+    };
+    let db_c = db.clone();
+    let blobs_c = blobs.clone();
+    let out_cold = tokio::task::spawn_blocking(move || {
+        let crystal = CrystalEngine::new().unwrap();
+        let host = NexusHostContext::new(
+            "bench_app",
+            "cold_cell",
+            CellDbConfig::dedicated_full(),
+            db_c,
+            blobs_c,
+        );
+        crystal
+            .run_wasi_aot_with_host(&cold_bytes, WasiRunConfig::default(), host)
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    let cold_ms = t_cold.elapsed().as_secs_f64() * 1000.0;
+    assert_eq!(out_cold.exit_code, 0);
+
+    // 2. Warm-cache end-to-end (25 runs: NXAOT01 BLAKE3 verify -> WASI + nexus_host DB query)
+    let mut warm_us = Vec::with_capacity(25);
+    for _ in 0..25 {
+        let t0 = std::time::Instant::now();
+        let art = reg.resolve_runtime("bench-guest").await.unwrap();
+        let bytes = match art {
+            nexus_io::compute::wasm_registry::ResolvedRuntime::Aot(b) => b,
+            _ => panic!("expected AOT"),
+        };
+        let db_w = db.clone();
+        let blobs_w = blobs.clone();
+        let out = tokio::task::spawn_blocking(move || {
+            let crystal = CrystalEngine::new().unwrap();
+            let host = NexusHostContext::new(
+                "bench_app",
+                "warm_cell",
+                CellDbConfig::dedicated_full(),
+                db_w,
+                blobs_w,
+            );
+            crystal
+                .run_wasi_aot_with_host(&bytes, WasiRunConfig::default(), host)
+                .unwrap()
+        })
+        .await
+        .unwrap();
+        assert_eq!(out.exit_code, 0);
+        warm_us.push(t0.elapsed().as_micros());
+    }
+    warm_us.sort_unstable();
+    println!(
+        "E2E_GUEST_BENCH cold_ms={:.2} warm_p50_us={} warm_p95_us={} warm_min_us={} warm_max_us={}",
+        cold_ms,
+        warm_us[warm_us.len() / 2],
+        warm_us[(warm_us.len() * 95) / 100],
+        warm_us[0],
+        warm_us[warm_us.len() - 1]
+    );
+
+    // 3. 20 Concurrent Cells with Isolated State (mixed writes + reads + strict isolation check)
+    let t_conc = std::time::Instant::now();
+    let mut handles = Vec::with_capacity(20);
+    for cell_idx in 0..20usize {
+        let db_i = db.clone();
+        handles.push(tokio::spawn(async move {
+            let cell_name = format!("cell_{}", cell_idx);
+            let mut lat_us = Vec::with_capacity(10);
+            for op in 0..10usize {
+                let t0 = std::time::Instant::now();
+                let q = format!(
+                    "CREATE items SET cell = {}, seq = {}; SELECT * FROM items WHERE cell = {};",
+                    cell_idx, op, cell_idx
+                );
+                let rows = db_i
+                    .inner
+                    .query_scoped("conc_bench", &cell_name, &q, vec![])
+                    .unwrap();
+                assert!(!rows.is_empty());
+                lat_us.push(t0.elapsed().as_micros());
+            }
+            // Verify strict isolation: cell_i sees exactly 10 rows, none from other cells
+            let check = db_i
+                .inner
+                .query_scoped("conc_bench", &cell_name, "SELECT * FROM items;", vec![])
+                .unwrap();
+            let count = if check.len() == 1 {
+                match &check[0] {
+                    nexus_db::Value::Array(arr) => arr.len(),
+                    _ => 1,
+                }
+            } else {
+                check.len()
+            };
+            assert_eq!(count, 10, "Cell {} isolation violation: expected 10 rows, got {}", cell_name, count);
+            lat_us
+        }));
+    }
+    let mut all_lat = Vec::with_capacity(200);
+    for h in handles {
+        all_lat.extend(h.await.unwrap());
+    }
+    let total_secs = t_conc.elapsed().as_secs_f64();
+    all_lat.sort_unstable();
+    let ops_per_sec = (all_lat.len() as f64) / total_secs.max(0.0001);
+    println!(
+        "CONCURRENT_20_CELLS ops={} failures=0 ops_per_sec={:.1} p50_us={} p95_us={}",
+        all_lat.len(),
+        ops_per_sec,
+        all_lat[all_lat.len() / 2],
+        all_lat[(all_lat.len() * 95) / 100]
     );
 }

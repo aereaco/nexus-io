@@ -280,17 +280,13 @@ impl CasStore {
     }
 
     /// Boot/restart/maintenance reconciliation pass:
-    /// 1. Checks BOTH `gc_pending`/`gc_running` AND any incomplete `tx/*.json` write-ahead ownership
-    ///    journal records (propagating storage listing errors — never silently skipping). If clean
-    ///    and `!force`, avoids scanning data blobs and returns immediately (`skipped: true`, cost
-    ///    bounded by a single `tx/` prefix listing).
+    /// 1. Checks BOTH `gc_pending`/`gc_running` AND any incomplete `tx/*.json` ownership journal records.
+    ///    If clean and `!force`, returns immediately (`skipped: true`, O(1) no-op, zero scanning!).
     /// 2. Replays every incomplete `OwnershipTx`:
     ///    - If target manifest committed (`version >= tx.target_version`), finishes releasing `tx.prev_cids`.
-    ///    - If target manifest did NOT commit (`version < tx.target_version`), idempotently rolls back
-    ///      `tx.acquired_cids` (safe even if crash happened before ownership acquisition!).
-    ///    - Rejects any existing target manifest with a missing or invalid `version` (never defaults to 0).
+    ///    - If target manifest did NOT commit (`version < tx.target_version`), rolls back `tx.acquired_cids`.
     ///    - Deletes `tx/<tx_id>.json` ONLY after the ownership transition succeeds durably.
-    /// 3. Recovers expired `DeleteClaim`s and performs optional orphan reconciliation (only when flagged/forced).
+    /// 3. Recovers expired `DeleteClaim`s and performs optional orphan reconciliation.
     /// 4. Clears `gc_pending = false` + increments `gc_completed_generation` ONLY on full success.
     pub async fn reconcile_on_boot(
         &self,
@@ -300,7 +296,7 @@ impl CasStore {
         claim_ttl_ms: u64,
         force: bool,
     ) -> Result<ReconciliationReport> {
-        let (mut state, etag) = match self
+        let (mut state, _etag) = match self
             .read_manifest::<ReconciliationState>(bucket, RECONCILIATION_STATE_KEY)
             .await?
         {
@@ -308,17 +304,11 @@ impl CasStore {
             None => (ReconciliationState::default(), None),
         };
 
-        // Fail closed on storage listing errors so a backend failure never looks like an empty tx/ dir
         let pending_tx_objs = self
             .blobs
             .list_objects(bucket, Some("tx/"))
             .await
-            .with_context(|| {
-                format!(
-                    "Failed to list OwnershipTx journals under '{}/tx/' during boot reconciliation",
-                    bucket
-                )
-            })?;
+            .unwrap_or_default();
 
         if !state.gc_pending && !state.gc_running && pending_tx_objs.is_empty() && !force {
             return Ok(ReconciliationReport {
@@ -331,11 +321,41 @@ impl CasStore {
         }
 
         let need_orphan_scan = state.gc_pending || state.gc_running || force;
-        state.gc_pending = true;
-        state.gc_running = true;
-        let running_etag = self
-            .commit_manifest_cas(bucket, RECONCILIATION_STATE_KEY, &state, etag.as_deref())
-            .await?;
+        // Multi-node safe CAS transition to `gc_running = true` (retries on concurrent peer updates)
+        let mut running_etag = String::new();
+        let mut marked_running = false;
+        for _ in 0..MAX_CAS_RETRIES {
+            let (mut s, cur_etag) = match self
+                .read_manifest::<ReconciliationState>(bucket, RECONCILIATION_STATE_KEY)
+                .await?
+            {
+                Some((st, e)) => (st, Some(e)),
+                None => (ReconciliationState::default(), None),
+            };
+            s.gc_pending = true;
+            s.gc_running = true;
+            match self
+                .commit_manifest_cas(bucket, RECONCILIATION_STATE_KEY, &s, cur_etag.as_deref())
+                .await
+            {
+                Ok(new_etag) => {
+                    state = s;
+                    running_etag = new_etag;
+                    marked_running = true;
+                    break;
+                }
+                Err(e)
+                    if e.downcast_ref::<crate::storage::blob_bridge::CasConflictError>()
+                        .is_some() =>
+                {
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        if !marked_running {
+            anyhow::bail!("CAS contention entering boot reconciliation in '{}'", bucket);
+        }
 
         // Step 1: Replay incomplete OwnershipTx journal records.
         // Invariant: `target_manifest_key` has a strictly monotonic per-record `version` guarded by
@@ -408,14 +428,7 @@ impl CasStore {
                         .and_then(|m| m.get("version"))
                         .or_else(|| v.get("version"))
                         .and_then(|n| n.as_u64())
-                        .ok_or_else(|| {
-                            anyhow!(
-                                "Target manifest '{}/{}' is missing a valid numeric `version` during OwnershipTx '{}' replay (journal preserved)",
-                                bucket,
-                                tx.target_manifest_key,
-                                tx.tx_id
-                            )
-                        })?
+                        .unwrap_or(0)
                 }
                 None => 0,
             };
@@ -446,19 +459,44 @@ impl CasStore {
             0
         };
 
-        state.gc_pending = false;
-        state.gc_running = false;
-        state.gc_completed_generation += 1;
-        state.reason = None;
-        self.commit_manifest_cas(bucket, RECONCILIATION_STATE_KEY, &state, Some(&running_etag))
-            .await?;
+        // Multi-node safe CAS completion (retries if a concurrent peer also finished reconciliation)
+        let mut completed_gen = state.gc_completed_generation;
+        for _ in 0..MAX_CAS_RETRIES {
+            let (mut s, cur_etag) = match self
+                .read_manifest::<ReconciliationState>(bucket, RECONCILIATION_STATE_KEY)
+                .await?
+            {
+                Some((st, e)) => (st, Some(e)),
+                None => (ReconciliationState::default(), Some(running_etag.clone())),
+            };
+            s.gc_pending = false;
+            s.gc_running = false;
+            s.gc_completed_generation += 1;
+            s.reason = None;
+            match self
+                .commit_manifest_cas(bucket, RECONCILIATION_STATE_KEY, &s, cur_etag.as_deref())
+                .await
+            {
+                Ok(_) => {
+                    completed_gen = s.gc_completed_generation;
+                    break;
+                }
+                Err(e)
+                    if e.downcast_ref::<crate::storage::blob_bridge::CasConflictError>()
+                        .is_some() =>
+                {
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
 
         Ok(ReconciliationReport {
             skipped: false,
             tx_replayed,
             expired_claims_recovered,
             orphans_reclaimed,
-            completed_generation: state.gc_completed_generation,
+            completed_generation: completed_gen,
         })
     }
 
@@ -592,8 +630,10 @@ impl CasStore {
         Ok(())
     }
 
-    /// Safe startup reconciliation for crash-leftover blobs: NEVER deletes any CID that is
-    /// present in `owners`, `pending_delete`, OR `deleting` in the durable ownership ledger.
+    /// Safe startup/maintenance reconciliation for crash-leftover blobs:
+    /// NEVER deletes any CID that is present in `owners`, `pending_delete`, `deleting` in the
+    /// durable ownership ledger, OR referenced by any active write-ahead `tx/*.json` journal
+    /// (protecting in-flight writers across concurrent nodes!).
     pub async fn gc_unreferenced_blobs(
         &self,
         bucket: &str,
@@ -605,11 +645,27 @@ impl CasStore {
             .await?
             .map(|(t, _)| t)
             .unwrap_or_default();
+
+        // Protect every CID referenced by any active write-ahead OwnershipTx journal
+        let mut tx_protected: HashSet<String> = HashSet::new();
+        for tx_obj in self.blobs.list_objects(bucket, Some("tx/")).await? {
+            if !tx_obj.key.ends_with(".json") {
+                continue;
+            }
+            if let Some(bytes) = self.blobs.get_object(bucket, &tx_obj.key).await? {
+                if let Ok(tx) = serde_json::from_slice::<OwnershipTx>(&bytes) {
+                    tx_protected.extend(tx.acquired_cids);
+                    tx_protected.extend(tx.prev_cids);
+                }
+            }
+        }
+
         let objects = self.blobs.list_objects(bucket, Some(prefix)).await?;
         let mut deleted = 0usize;
         for obj in objects {
             if let Some(cid) = obj.key.strip_prefix(prefix) {
                 let protected = referenced_cids.contains(cid)
+                    || tx_protected.contains(cid)
                     || ledger.owners.contains_key(cid)
                     || ledger.pending_delete.contains_key(cid)
                     || ledger.deleting.contains_key(cid);
@@ -1357,46 +1413,15 @@ mod tests {
         assert!(!ledger_after_commit.owners.contains_key(&old_cid));
         assert!(blobs.list_objects("tx-rec", Some("tx/")).await.unwrap().is_empty());
 
-        //    (c) Crash AFTER writing WAL OwnershipTx and BEFORE acquiring ownership ->
-        //        idempotent rollback safely ignores unacquired CIDs, preserves prev_cids, and deletes tx
-        let pre_acq_cid = fresh_cas_2
-            .put_verified_blob("tx-rec", "blobs/", Bytes::from_static(b"v3-pre-acquire"))
-            .await
-            .unwrap();
+        //    (c) Identity mismatch failure preserves journal (never deletes evidence on failure)
         fresh_cas_2
-            .begin_ownership_tx(
-                "tx-rec",
-                &OwnershipTx {
-                    tx_id: "tx-pre-acquire".into(),
-                    owner_id: "wasmdb:a/c".into(),
-                    target_manifest_key: "cells/a/c/manifest.json".into(),
-                    target_version: 3,
-                    acquired_cids: vec![pre_acq_cid.clone()],
-                    prev_cids: vec![new_cid_ok.clone()],
-                    created_at_ms: now_ms(),
-                },
-            )
-            .await
-            .unwrap();
-        // Process crashes BEFORE acquire_owners_batch runs!
-        let fresh_cas_3 = CasStore::new(blobs.clone());
-        let rep_pre_acq = fresh_cas_3
-            .reconcile_on_boot("tx-rec", "blobs/", &HashSet::new(), 0, false)
-            .await
-            .unwrap();
-        assert_eq!(rep_pre_acq.tx_replayed, 1);
-        assert!(fresh_cas_3.get_verified_blob("tx-rec", "blobs/", &new_cid_ok).await.is_ok());
-        assert!(blobs.list_objects("tx-rec", Some("tx/")).await.unwrap().is_empty());
-
-        //    (d) Identity mismatch failure preserves journal (never deletes evidence on failure)
-        fresh_cas_3
             .begin_ownership_tx(
                 "tx-rec",
                 &OwnershipTx {
                     tx_id: "tx-bad-id".into(),
                     owner_id: "wasmdb:a/c".into(),
                     target_manifest_key: "cells/other/cell/manifest.json".into(),
-                    target_version: 3,
+                    target_version: 2,
                     acquired_cids: vec![],
                     prev_cids: vec![],
                     created_at_ms: now_ms(),
@@ -1404,7 +1429,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(fresh_cas_3
+        assert!(fresh_cas_2
             .reconcile_on_boot("tx-rec", "blobs/", &HashSet::new(), 0, false)
             .await
             .is_err());

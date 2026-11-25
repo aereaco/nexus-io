@@ -414,24 +414,23 @@ impl WasmDbMount {
             );
         }
 
-        // Recoverable Write-Ahead Ownership Transaction:
-        // 1. Write new content-addressed blobs
-        // 2. Persist OwnershipTx intent journal FIRST (true WAL: closes crash window before acquire)
-        // 3. Acquire ownership of all NEW CIDs BEFORE committing manifest
-        // 4. Atomically commit WasmDbCellRecord (manifest + expired/released lease) using live ETag
-        // 5. Release superseded OLD CIDs via 3-state Drop & finalize OwnershipTx
+        // Recoverable Write-Ahead Ownership Transaction (GC-safe across concurrent nodes):
+        // 1. Read & hash new files in memory to compute content-addressed BLAKE3 CIDs
+        // 2. Persist OwnershipTx intent journal FIRST (protects every in-flight CID from
+        //    both crash-before-acquire AND concurrent full orphan GC on another node!)
+        // 3. Write new content-addressed blobs
+        // 4. Acquire ownership of all NEW CIDs BEFORE committing manifest
+        // 5. Atomically commit WasmDbCellRecord (manifest + expired/released lease) using live ETag
+        // 6. Release superseded OLD CIDs via 3-state Drop & finalize OwnershipTx
         let commit_res: Result<()> = async {
             let walked = collect_dir_files(&work_dir, &work_dir).await?;
+            let mut staged_blobs: Vec<(String, String, Bytes)> = Vec::with_capacity(walked.len());
             let mut next_files = BTreeMap::new();
             for (rel_path, full_path) in walked {
                 let bytes = tokio::fs::read(&full_path).await?;
-                let cid = cas
-                    .put_verified_blob(WASM_DB_BUCKET, "blobs/", Bytes::from(bytes))
-                    .await
-                    .with_context(|| {
-                        format!("Failed to persist Wasm DB file '{}' for {}/{}", rel_path, app, cell_id)
-                    })?;
-                next_files.insert(rel_path, cid);
+                let cid = blake3::hash(&bytes).to_hex().to_string();
+                next_files.insert(rel_path.clone(), cid.clone());
+                staged_blobs.push((rel_path, cid, Bytes::from(bytes)));
             }
 
             let owner_id = format!("wasmdb:{}/{}", app, cell_id);
@@ -440,7 +439,8 @@ impl WasmDbMount {
             let newly_added: Vec<String> = next_cids.difference(&prev_cids).cloned().collect();
             let superseded: Vec<String> = prev_cids.difference(&next_cids).cloned().collect();
 
-            // Step 2 (WAL): Persist recoverable OwnershipTx intent journal BEFORE acquiring ownership
+            // Step 2 (WAL): Persist OwnershipTx BEFORE writing blobs or acquiring ownership
+            // so no unowned blob ever exists in storage without a protective journal entry.
             let tx_id = uuid::Uuid::new_v4().simple().to_string();
             let tx = OwnershipTx {
                 tx_id: tx_id.clone(),
@@ -453,7 +453,18 @@ impl WasmDbMount {
             };
             cas.begin_ownership_tx(WASM_DB_BUCKET, &tx).await?;
 
-            // Step 3: Acquire ownership of NEW CIDs BEFORE committing manifest
+            // Step 3: Write new content-addressed blobs (already protected by OwnershipTx)
+            for (rel_path, expected_cid, bytes) in staged_blobs {
+                let stored_cid = cas
+                    .put_verified_blob(WASM_DB_BUCKET, "blobs/", bytes)
+                    .await
+                    .with_context(|| {
+                        format!("Failed to persist Wasm DB file '{}' for {}/{}", rel_path, app, cell_id)
+                    })?;
+                debug_assert_eq!(stored_cid, expected_cid);
+            }
+
+            // Step 4: Acquire ownership of NEW CIDs BEFORE committing manifest
             if let Err(e) = cas
                 .acquire_owners_batch(WASM_DB_BUCKET, &owner_id, &newly_added)
                 .await

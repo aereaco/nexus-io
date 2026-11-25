@@ -103,10 +103,17 @@ storage-s3 = ["dep:s3s"]
 storage-all = ["storage-p2p", "storage-s3"]
 
 # =============================================================================
-# Domain 5: Serve (Nexus-UX Web Server & Reverse Proxy)
+# Domain 5: Serve (Nexus-UX Web Server & Hardened Hyper Reverse Proxy)
 # =============================================================================
 serve-web = []
-serve-proxy = []
+serve-proxy = [
+    "dep:hyper",
+    "dep:hyper-util",
+    "dep:http-body-util",
+    "dep:tokio-rustls",
+    "dep:rustls",
+    "dep:webpki-roots",
+]
 serve-all = ["serve-web", "serve-proxy"]
 
 # =============================================================================
