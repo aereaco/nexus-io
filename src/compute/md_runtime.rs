@@ -355,8 +355,8 @@ policy: elastic
 
 ## Counter Service
 
-```sql
-CREATE TABLE IF NOT EXISTS metrics (label TEXT, val INT)
+```surql
+DEFINE TABLE IF NOT EXISTS metrics SCHEMALESS;
 ```
 
 ```js

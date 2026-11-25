@@ -27,6 +27,8 @@ profile-core = [
 
 profile-app = [
     "profile-core",
+    "oci-registry",
+    "sql-compat",
     "js-runtime",
     "ts-compiler",
     "p2p-storage",
@@ -99,6 +101,16 @@ profile-ios = [
 # Granular capability flags
 database = []
 gateway = []
+oci-registry = [
+    "dep:hyper",
+    "dep:hyper-util",
+    "dep:http-body-util",
+    "dep:tokio-rustls",
+    "dep:rustls",
+    "dep:webpki-roots",
+    "dep:sha2",
+]
+sql-compat = ["dep:sqlparser"]
 js-runtime = ["js-native"]
 js-native = ["dep:quickrs-core"]
 cells = []
@@ -139,7 +151,7 @@ surrealdb-ref = ["dep:surrealdb"]
 # 1. The Mind (State — MIT-licensed nexus-db by default; optional surrealdb-ref for differential tests)
 nexus-db = { path = "crates/nexus-db", default-features = false, features = ["auth", "cbor"] }
 surrealdb = { version = "4.0.1", optional = true, default-features = false, features = ["kv-mem"] }
-sqlparser = "0.64.0"
+sqlparser = { version = "0.64.0", optional = true }
 tokio = { version = "1.0", features = ["rt-multi-thread", "net", "io-util", "sync", "time", "fs", "macros", "signal"] }
 
 # 2. The Nerves (Optional Interactive Nushell — gated behind `shell`)
@@ -174,15 +186,15 @@ boringtun = { version = "0.7.1", optional = true }
 # Networking & UX Gateway (Salvo — lean Core default; QUIC/ACME/OpenAPI enabled in profile-app+)
 salvo = { version = "1.1.1", features = ["rustls", "websocket"] }
 
-# Networking & Async Utils (reused from Salvo/Nexus-DB graph for OCI Distribution v2 pull)
+# Networking & Async Utils (OCI Distribution v2 client gated behind `oci-registry`)
 tokio-util = { version = "0.7", features = ["codec"] }
-hyper = { version = "1", features = ["client", "http1"] }
-hyper-util = { version = "0.1", features = ["tokio"] }
-http-body-util = "0.1"
-tokio-rustls = "0.26"
-rustls = "0.23"
-webpki-roots = "1.0"
-sha2 = "0.10"
+hyper = { version = "1", optional = true, features = ["client", "http1"] }
+hyper-util = { version = "0.1", optional = true, features = ["tokio"] }
+http-body-util = { version = "0.1", optional = true }
+tokio-rustls = { version = "0.26", optional = true }
+rustls = { version = "0.23", optional = true }
+webpki-roots = { version = "1.0", optional = true }
+sha2 = { version = "0.10", optional = true }
 bytes = "1.5"
 base64 = "0.22"
 

@@ -159,7 +159,7 @@ impl Handler for CellGatewayHandler {
 
         // POST /cells/_runtimes/pull -> pull Wasm runtime + optional Nexus policy from any OCI v2 registry
         // Body: { "reference": "@aerea/quickjs:1.0", "name": "quickjs" (optional) }
-        #[cfg(feature = "wasm-runtime")]
+        #[cfg(all(feature = "wasm-runtime", feature = "oci-registry"))]
         if req.method() == &Method::POST && req.uri().path().trim_end_matches('/') == "/cells/_runtimes/pull" {
             let body: serde_json::Value = match req.parse_json().await {
                 Ok(v) => v,

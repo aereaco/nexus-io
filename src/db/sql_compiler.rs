@@ -1,9 +1,12 @@
 use anyhow::{anyhow, Result};
+#[cfg(feature = "sql-compat")]
 use sqlparser::ast::{
     Assignment, AssignmentTarget, BinaryOperator, Expr, ObjectName, Query, SelectItem, SetExpr,
     Statement, TableFactor, Value as SqlValue, Values,
 };
+#[cfg(feature = "sql-compat")]
 use sqlparser::dialect::{Dialect, MySqlDialect, PostgreSqlDialect, SQLiteDialect};
+#[cfg(feature = "sql-compat")]
 use sqlparser::parser::Parser;
 use nexus_db::Value as DbValue;
 
@@ -28,6 +31,20 @@ pub fn compile_sqlite_to_surql(sql: &str, args: Vec<DbValue>) -> Result<Compiled
 }
 
 /// Unified multi-dialect SQL → SurrealQL compiler (`Sqlite`, `Postgres`, `Mysql`).
+#[cfg(not(feature = "sql-compat"))]
+pub fn compile_sql_to_surql(
+    dialect: SqlDialect,
+    _sql: &str,
+    _args: Vec<DbValue>,
+) -> Result<CompiledSql> {
+    Err(anyhow!(
+        "Relational SQL transpilation ({:?} -> SurrealQL) requires `--features sql-compat` (or run a real Wasm DB engine via `CellDbMode::WasmEngine`)",
+        dialect
+    ))
+}
+
+/// Unified multi-dialect SQL → SurrealQL compiler (`Sqlite`, `Postgres`, `Mysql`).
+#[cfg(feature = "sql-compat")]
 pub fn compile_sql_to_surql(
     dialect: SqlDialect,
     sql: &str,
@@ -78,6 +95,13 @@ pub fn compile_sql_to_surql(
     })
 }
 
+#[cfg(feature = "sql-compat")]
+use ast_helpers::compile_statement;
+
+#[cfg(feature = "sql-compat")]
+mod ast_helpers {
+use super::*;
+
 fn table_name(name: &ObjectName) -> String {
     name.0
         .last()
@@ -85,7 +109,7 @@ fn table_name(name: &ObjectName) -> String {
         .unwrap_or_else(|| name.to_string())
 }
 
-fn compile_statement(
+pub(super) fn compile_statement(
     stmt: &Statement,
     args: &[DbValue],
     param_idx: &mut usize,
@@ -345,6 +369,7 @@ fn compile_expr(
         other => Ok(other.to_string()),
     }
 }
+} // mod ast_helpers
 
 /// Unified multi-flavor query executor shared identically by internal `CellManager` (`ctx.db.query`)
 /// and external `UxGateway` (`POST /query`, `POST /cells/:app/:id/query`, `POST /graphql`).
@@ -408,7 +433,7 @@ pub fn execute_unified_query(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "sql-compat"))]
 mod tests {
     use super::*;
 

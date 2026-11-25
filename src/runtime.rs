@@ -62,6 +62,8 @@ impl CapabilityRegistry {
         reg("unified-multi-flavor-query", true);
         reg("gateway", true);
         reg("wasm-runtime", cfg!(feature = "wasm-runtime"));
+        reg("oci-registry", cfg!(feature = "oci-registry"));
+        reg("sql-compat", cfg!(feature = "sql-compat"));
         reg("js-wasm", cfg!(feature = "wasm-runtime"));
         reg("js-native", cfg!(feature = "js-native"));
         reg("ts-compiler", cfg!(feature = "ts-compiler"));
