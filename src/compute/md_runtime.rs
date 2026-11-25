@@ -383,15 +383,18 @@ function record(m) {
                     assert_eq!(nodes[0].cell_id, "counter_service");
                     assert_eq!(nodes[0].wasm_refs, vec!["s3://crystals/pricing.wasm"]);
 
-                    let out = manager
-                        .eval_in_cell(
-                            "semantic_demo",
-                            "counter_service",
-                            r#"record({ label: "req", val: 7 })"#,
-                        )
-                        .await
-                        .unwrap();
-                    assert_eq!(out, "1");
+                    #[cfg(feature = "js-native")]
+                    {
+                        let out = manager
+                            .eval_in_cell(
+                                "semantic_demo",
+                                "counter_service",
+                                r#"record({ label: "req", val: 7 })"#,
+                            )
+                            .await
+                            .unwrap();
+                        assert_eq!(out, "1");
+                    }
 
             #[cfg(all(feature = "wasm-runtime", not(target_os = "ios")))]
             {

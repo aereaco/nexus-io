@@ -1,7 +1,11 @@
-use anyhow::Result;
+use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
+use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
+use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use tokio::sync::{Mutex, RwLock};
 
 use crate::compute::crystal::{CrystalEngine, WasiRunConfig};
 use crate::compute::wasm_registry::{ResolvedRuntime, WasmRuntimeRegistry};
@@ -9,20 +13,72 @@ use crate::storage::BlobBridge;
 
 pub const WASM_DB_BUCKET: &str = "nexus-wasm-db";
 
-/// Executes queries against a Wasmtime-hosted database engine (`CellDbMode::WasmEngine`, e.g.
-/// `sqlite.wasm`, `pglite.wasm`, `duckdb.wasm`, `nexus-db.wasm`) with automatic virtual filesystem
-/// hydration and persistence backed by `BlobBridge`.
-///
-/// Every Wasm DB engine sees a capability-scoped directory mounted at `mount_path` (e.g. `/data`),
-/// receives `NEXUS_DB_ENGINE`, `NEXUS_DB_FLAVOR`, `NEXUS_DB_QUERY`, `NEXUS_DB_MOUNT`, and the query
-/// payload on `stdin`, and returns JSON results on `stdout`.
-pub struct WasmDbMount;
+/// Multi-file virtual filesystem manifest persisted per `(app, cell_id)` in `BlobBridge`.
+/// Preserves full directory hierarchies, SQLite `-wal`/`-shm`/`-journal` files, and
+/// PostgreSQL/PGlite `PGDATA` trees across elastic hibernation and node restarts.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WasmDbFsManifest {
+    pub version: u64,
+    /// Relative POSIX path inside `mount_path` (e.g. `"main.db"`, `"main.db-wal"`, `"pgdata/PG_VERSION"`)
+    /// mapped to its content-addressed BLAKE3 CID in `BlobBridge`.
+    pub files: BTreeMap<String, String>,
+}
+
+/// Production-grade Wasmtime-hosted database mount for `CellDbMode::WasmEngine`
+/// (`sqlite.wasm`, `pglite.wasm`, `duckdb.wasm`, `nexus-db.wasm`):
+/// - Reuses a single shared `Arc<CrystalEngine>` (with compiled `Module` caching) — never recreates
+///   a Wasmtime `Engine` per query.
+/// - Serializes concurrent read/modify/write queries per `(app, cell_id)` via an async mutex.
+/// - Hydrates and atomically commits the entire multi-file virtual directory tree (DB + WAL + journals)
+///   to `BlobBridge`, strictly propagating all persistence errors (never silently dropping writes).
+#[derive(Clone)]
+pub struct WasmDbMount {
+    crystal: Arc<CrystalEngine>,
+    cell_locks: Arc<RwLock<HashMap<(String, String), Arc<Mutex<()>>>>>,
+}
 
 impl WasmDbMount {
-    /// Execute a query against a Wasm-hosted DB engine for `(app, cell_id)`, hydrating persisted
-    /// state from `BlobBridge` before execution and flushing modified state back afterward.
+    pub fn new(crystal: Arc<CrystalEngine>) -> Self {
+        Self {
+            crystal,
+            cell_locks: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    async fn cell_lock(&self, app: &str, cell_id: &str) -> Arc<Mutex<()>> {
+        let key = (app.to_string(), cell_id.to_string());
+        if let Some(lock) = self.cell_locks.read().await.get(&key).cloned() {
+            return lock;
+        }
+        let mut guard = self.cell_locks.write().await;
+        guard
+            .entry(key)
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
+    /// Read the current multi-file manifest for `(app, cell_id)` from `BlobBridge`.
+    pub async fn read_manifest(
+        blobs: &Arc<BlobBridge>,
+        app: &str,
+        cell_id: &str,
+    ) -> Result<WasmDbFsManifest> {
+        let manifest_key = format!("cells/{}/{}/manifest.json", app, cell_id);
+        match blobs.get_object(WASM_DB_BUCKET, &manifest_key).await? {
+            Some(bytes) => serde_json::from_slice(&bytes)
+                .with_context(|| format!("Corrupted WasmDbFsManifest for {}/{}", app, cell_id)),
+            None => Ok(WasmDbFsManifest::default()),
+        }
+    }
+
+    /// Execute a query against a Wasm-hosted DB engine for `(app, cell_id)` with:
+    /// 1. Per-cell serialization lock (preventing concurrent read/modify/write races),
+    /// 2. Full multi-file directory hydration from `BlobBridge`,
+    /// 3. Shared `CrystalEngine` execution with fuel metering,
+    /// 4. Strict multi-file flush & atomic manifest commit back to `BlobBridge`.
     #[allow(clippy::too_many_arguments)]
     pub async fn execute_query(
+        &self,
         blobs: &Arc<BlobBridge>,
         registry: &WasmRuntimeRegistry,
         app: &str,
@@ -34,15 +90,19 @@ impl WasmDbMount {
         query: &str,
         fuel_limit: u64,
     ) -> Result<JsonValue> {
-        // Resolve the Wasm DB engine by CID first, falling back to logical engine name
+        // 1. Serialize all concurrent queries on the same `(app, cell_id)`
+        let lock = self.cell_lock(app, cell_id).await;
+        let _guard = lock.lock().await;
+
+        // 2. Resolve Wasm/AOT DB engine module
         let resolved = match registry.resolve_runtime(module_cid).await {
             Ok(r) => r,
             Err(_) => registry.resolve_runtime(engine_name).await?,
         };
 
-        // Hydrate scoped virtual DB workspace from BlobBridge
+        // 3. Hydrate entire multi-file virtual directory tree from BlobBridge
         let _ = blobs.create_bucket(WASM_DB_BUCKET).await;
-        let state_key = format!("cells/{}/{}/state.bin", app, cell_id);
+        let prev_manifest = Self::read_manifest(blobs, app, cell_id).await?;
         let work_dir = std::env::temp_dir().join(format!(
             "nexus_wasmdb_{}_{}_{}",
             sanitize(app),
@@ -50,11 +110,28 @@ impl WasmDbMount {
             uuid::Uuid::new_v4().simple()
         ));
         tokio::fs::create_dir_all(&work_dir).await?;
-        let state_file = work_dir.join("state.bin");
-        if let Some(existing) = blobs.get_object(WASM_DB_BUCKET, &state_key).await? {
-            tokio::fs::write(&state_file, &existing).await?;
+
+        for (rel_path, cid) in &prev_manifest.files {
+            let dest = safe_join(&work_dir, rel_path)?;
+            if let Some(parent) = dest.parent() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+            let data = blobs
+                .get_object(WASM_DB_BUCKET, &format!("blobs/{}", cid))
+                .await?
+                .ok_or_else(|| {
+                    anyhow!(
+                        "Missing Wasm DB blob '{}' for file '{}' in {}/{}",
+                        cid,
+                        rel_path,
+                        app,
+                        cell_id
+                    )
+                })?;
+            tokio::fs::write(&dest, &data).await?;
         }
 
+        // 4. Execute WASI DB engine on the shared `CrystalEngine` (with Module cache)
         let mount = if mount_path.is_empty() {
             "/data".to_string()
         } else {
@@ -75,8 +152,8 @@ impl WasmDbMount {
             fuel_limit,
         };
 
-        let out = tokio::task::spawn_blocking(move || -> Result<_> {
-            let crystal = CrystalEngine::new()?;
+        let crystal = self.crystal.clone();
+        let exec_res = tokio::task::spawn_blocking(move || -> Result<_> {
             match resolved {
                 ResolvedRuntime::Aot(aot) => crystal.run_wasi_p1_aot(&aot, cfg),
                 #[cfg(not(target_os = "ios"))]
@@ -87,17 +164,22 @@ impl WasmDbMount {
                 }
             }
         })
-        .await??;
+        .await;
 
-        // Flush updated DB state file back into BlobBridge for elastic hibernation & mesh sync
-        if let Ok(updated) = tokio::fs::read(&state_file).await {
-            let _ = blobs
-                .put_object(WASM_DB_BUCKET, &state_key, Bytes::from(updated))
-                .await;
-        }
-        let _ = tokio::fs::remove_dir_all(&work_dir).await;
+        let out = match exec_res {
+            Ok(Ok(o)) => o,
+            Ok(Err(e)) => {
+                let _ = tokio::fs::remove_dir_all(&work_dir).await;
+                return Err(e);
+            }
+            Err(join_err) => {
+                let _ = tokio::fs::remove_dir_all(&work_dir).await;
+                return Err(anyhow!("Wasm DB worker panicked: {}", join_err));
+            }
+        };
 
         if out.exit_code != 0 {
+            let _ = tokio::fs::remove_dir_all(&work_dir).await;
             let err_msg = String::from_utf8_lossy(&out.stderr);
             anyhow::bail!(
                 "Wasm DB engine '{}' exited with code {}: {}",
@@ -107,6 +189,55 @@ impl WasmDbMount {
             );
         }
 
+        // 5. Walk entire workspace dir, persist all files content-addressed, and atomically commit manifest.
+        // Every persistence error is strictly propagated (never silently ignored).
+        let commit_res: Result<()> = async {
+            let walked = collect_dir_files(&work_dir, &work_dir).await?;
+            let mut next_files = BTreeMap::new();
+            for (rel_path, full_path) in walked {
+                let bytes = tokio::fs::read(&full_path).await?;
+                let cid = blake3::hash(&bytes).to_hex().to_string();
+                let unchanged = prev_manifest
+                    .files
+                    .get(&rel_path)
+                    .map(|prev_cid| prev_cid == &cid)
+                    .unwrap_or(false);
+                if !unchanged {
+                    blobs
+                        .put_object(WASM_DB_BUCKET, &format!("blobs/{}", cid), Bytes::from(bytes))
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "Failed to persist Wasm DB file '{}' (cid={}) for {}/{}",
+                                rel_path, cid, app, cell_id
+                            )
+                        })?;
+                }
+                next_files.insert(rel_path, cid);
+            }
+
+            let next_manifest = WasmDbFsManifest {
+                version: prev_manifest.version + 1,
+                files: next_files,
+            };
+            let manifest_bytes = serde_json::to_vec(&next_manifest)?;
+            let manifest_key = format!("cells/{}/{}/manifest.json", app, cell_id);
+            blobs
+                .put_object(WASM_DB_BUCKET, &manifest_key, Bytes::from(manifest_bytes))
+                .await
+                .with_context(|| {
+                    format!(
+                        "Failed to commit WasmDbFsManifest v{} for {}/{}",
+                        next_manifest.version, app, cell_id
+                    )
+                })?;
+            Ok(())
+        }
+        .await;
+
+        let _ = tokio::fs::remove_dir_all(&work_dir).await;
+        commit_res?;
+
         let stdout_str = String::from_utf8_lossy(&out.stdout).trim().to_string();
         if stdout_str.is_empty() {
             Ok(JsonValue::Array(Vec::new()))
@@ -114,25 +245,43 @@ impl WasmDbMount {
             Ok(serde_json::from_str(&stdout_str).unwrap_or(JsonValue::String(stdout_str)))
         }
     }
+}
 
-    /// Snapshot/export the current Wasm DB state blob for `(app, cell_id)` from `BlobBridge`.
-    pub async fn export_state(blobs: &Arc<BlobBridge>, app: &str, cell_id: &str) -> Result<Option<Bytes>> {
-        let state_key = format!("cells/{}/{}/state.bin", app, cell_id);
-        blobs.get_object(WASM_DB_BUCKET, &state_key).await
+fn safe_join(root: &Path, rel: &str) -> Result<PathBuf> {
+    let mut out = root.to_path_buf();
+    for comp in Path::new(rel).components() {
+        match comp {
+            std::path::Component::Normal(part) => out.push(part),
+            std::path::Component::CurDir => {}
+            _ => anyhow::bail!("Illegal path component in Wasm DB manifest: '{}'", rel),
+        }
     }
+    Ok(out)
+}
 
-    /// Import a Wasm DB state blob for `(app, cell_id)` into `BlobBridge` (e.g. during mesh sync).
-    pub async fn import_state(
-        blobs: &Arc<BlobBridge>,
-        app: &str,
-        cell_id: &str,
-        data: Bytes,
-    ) -> Result<()> {
-        let _ = blobs.create_bucket(WASM_DB_BUCKET).await;
-        let state_key = format!("cells/{}/{}/state.bin", app, cell_id);
-        blobs.put_object(WASM_DB_BUCKET, &state_key, data).await?;
-        Ok(())
-    }
+fn collect_dir_files<'a>(
+    root: &'a Path,
+    dir: &'a Path,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<(String, PathBuf)>>> + Send + 'a>> {
+    Box::pin(async move {
+        let mut results = Vec::new();
+        let mut entries = tokio::fs::read_dir(dir).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            let meta = entry.metadata().await?;
+            if meta.is_dir() {
+                results.extend(collect_dir_files(root, &path).await?);
+            } else if meta.is_file() {
+                let rel = path
+                    .strip_prefix(root)
+                    .map_err(|e| anyhow!("Strip prefix error: {}", e))?
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                results.push((rel, path));
+            }
+        }
+        Ok(results)
+    })
 }
 
 fn sanitize(s: &str) -> String {
@@ -151,9 +300,8 @@ mod tests {
         let db = Arc::new(Database::open_mem());
         let blobs = Arc::new(BlobBridge::new(db).await.unwrap());
         let registry = WasmRuntimeRegistry::new(blobs.clone());
+        let mount = WasmDbMount::new(Arc::new(CrystalEngine::new().unwrap()));
 
-        // Minimal WASI DB guest module (protocol-compatible with sqlite.wasm / pglite.wasm)
-        // writing a JSON query result to stdout via `fd_write(1, ...)`
         let db_engine_wat = br#"
             (module
                 (import "wasi_snapshot_preview1" "fd_write"
@@ -171,22 +319,174 @@ mod tests {
         let rec = registry.register_runtime("pglite", db_engine_wat).await.unwrap();
         assert!(rec.aot_cached);
 
-        let result = WasmDbMount::execute_query(
-            &blobs,
-            &registry,
-            "shop",
-            "orders",
-            "pglite",
-            &rec.cid,
-            "/data",
-            "postgres",
-            "SELECT 1",
-            1_000_000,
-        )
-        .await
-        .unwrap();
+        let result = mount
+            .execute_query(
+                &blobs,
+                &registry,
+                "shop",
+                "orders",
+                "pglite",
+                &rec.cid,
+                "/data",
+                "postgres",
+                "SELECT 1",
+                1_000_000,
+            )
+            .await
+            .unwrap();
 
         assert_eq!(result[0]["engine"], "pglite-wasm");
         assert_eq!(result[0]["ok"], true);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn wasm_db_mount_survives_concurrent_queries_multi_file_wal_and_restart_recovery() {
+        let db = Arc::new(Database::open_mem());
+        let blobs = Arc::new(BlobBridge::new(db).await.unwrap());
+        let registry = WasmRuntimeRegistry::new(blobs.clone());
+        let mount = WasmDbMount::new(Arc::new(CrystalEngine::new().unwrap()));
+
+        // Real WASI Preview 1 multi-file stateful DB guest:
+        // 1. Opens `counter.db` in preopened dir fd=3 (O_CREAT), reads 1-byte counter (default 0),
+        //    increments it by 1, rewrites `counter.db` (O_TRUNC).
+        // 2. Opens `wal.log` in preopened dir fd=3 (O_CREAT | FD_APPEND), appends 1 byte ('W').
+        // 3. Writes the ASCII digit of the new counter value to stdout.
+        let stateful_db_wat = br#"
+            (module
+                (import "wasi_snapshot_preview1" "path_open"
+                    (func $path_open (param i32 i32 i32 i32 i32 i64 i64 i32 i32) (result i32)))
+                (import "wasi_snapshot_preview1" "fd_read"
+                    (func $fd_read (param i32 i32 i32 i32) (result i32)))
+                (import "wasi_snapshot_preview1" "fd_write"
+                    (func $fd_write (param i32 i32 i32 i32) (result i32)))
+                (import "wasi_snapshot_preview1" "fd_close"
+                    (func $fd_close (param i32) (result i32)))
+                (memory (export "memory") 1)
+                (data (i32.const 100) "counter.db")
+                (data (i32.const 120) "wal.log")
+                (data (i32.const 140) "W")
+                (func (export "_start")
+                    (local $fd i32)
+                    (local $cnt i32)
+                    ;; 1. Open counter.db for read (oflags=1 O_CREAT, rights_base=0x42 READ|WRITE)
+                    (drop (call $path_open
+                        (i32.const 3) (i32.const 0)
+                        (i32.const 100) (i32.const 10)
+                        (i32.const 1) (i64.const 66) (i64.const 66) (i32.const 0)
+                        (i32.const 200)))
+                    (local.set $fd (i32.load (i32.const 200)))
+                    ;; Read 1 byte into offset 210
+                    (i32.store8 (i32.const 210) (i32.const 0))
+                    (i32.store (i32.const 0) (i32.const 210))
+                    (i32.store (i32.const 4) (i32.const 1))
+                    (drop (call $fd_read (local.get $fd) (i32.const 0) (i32.const 1) (i32.const 204)))
+                    (drop (call $fd_close (local.get $fd)))
+                    (local.set $cnt (i32.add (i32.load8_u (i32.const 210)) (i32.const 1)))
+
+                    ;; 2. Re-open counter.db with O_CREAT|O_TRUNC (oflags=9) and write new count byte
+                    (drop (call $path_open
+                        (i32.const 3) (i32.const 0)
+                        (i32.const 100) (i32.const 10)
+                        (i32.const 9) (i64.const 66) (i64.const 66) (i32.const 0)
+                        (i32.const 200)))
+                    (local.set $fd (i32.load (i32.const 200)))
+                    (i32.store8 (i32.const 210) (local.get $cnt))
+                    (i32.store (i32.const 0) (i32.const 210))
+                    (i32.store (i32.const 4) (i32.const 1))
+                    (drop (call $fd_write (local.get $fd) (i32.const 0) (i32.const 1) (i32.const 204)))
+                    (drop (call $fd_close (local.get $fd)))
+
+                    ;; 3. Open wal.log with O_CREAT (oflags=1) and FD_APPEND (fdflags=1), append 'W'
+                    (drop (call $path_open
+                        (i32.const 3) (i32.const 0)
+                        (i32.const 120) (i32.const 7)
+                        (i32.const 1) (i64.const 66) (i64.const 66) (i32.const 1)
+                        (i32.const 200)))
+                    (local.set $fd (i32.load (i32.const 200)))
+                    (i32.store (i32.const 0) (i32.const 140))
+                    (i32.store (i32.const 4) (i32.const 1))
+                    (drop (call $fd_write (local.get $fd) (i32.const 0) (i32.const 1) (i32.const 204)))
+                    (drop (call $fd_close (local.get $fd)))
+
+                    ;; 4. Write ASCII count digit ('0' + cnt) to stdout
+                    (i32.store8 (i32.const 220) (i32.add (i32.const 48) (local.get $cnt)))
+                    (i32.store (i32.const 0) (i32.const 220))
+                    (i32.store (i32.const 4) (i32.const 1))
+                    (drop (call $fd_write (i32.const 1) (i32.const 0) (i32.const 1) (i32.const 204)))
+                )
+            )
+        "#;
+
+        let rec = registry
+            .register_runtime("sqlite-stateful", stateful_db_wat)
+            .await
+            .unwrap();
+
+        // Fire 8 concurrent queries against the exact same cell DB
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let m = mount.clone();
+            let b = blobs.clone();
+            let r = registry.clone();
+            let cid = rec.cid.clone();
+            handles.push(tokio::spawn(async move {
+                m.execute_query(
+                    &b,
+                    &r,
+                    "ledger",
+                    "acct_1",
+                    "sqlite-stateful",
+                    &cid,
+                    "/data",
+                    "sqlite",
+                    "UPDATE counter SET n = n + 1",
+                    5_000_000,
+                )
+                .await
+                .unwrap()
+            }));
+        }
+        let mut seen = Vec::new();
+        for h in handles {
+            let v = h.await.unwrap();
+            seen.push(v.as_i64().unwrap());
+        }
+        seen.sort();
+        // Per-cell mutex guarantees strictly serialized 1..=8 with zero lost updates
+        assert_eq!(seen, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+
+        // Verify multi-file manifest persisted BOTH counter.db AND wal.log (with 8 WAL entries)
+        let manifest = WasmDbMount::read_manifest(&blobs, "ledger", "acct_1")
+            .await
+            .unwrap();
+        assert_eq!(manifest.version, 8);
+        assert!(manifest.files.contains_key("counter.db"));
+        let wal_cid = manifest.files.get("wal.log").expect("wal.log persisted");
+        let wal_bytes = blobs
+            .get_object(WASM_DB_BUCKET, &format!("blobs/{}", wal_cid))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(wal_bytes.len(), 8);
+
+        // Simulate full node restart: brand-new WasmDbMount & WasmRuntimeRegistry over same BlobBridge
+        let fresh_registry = WasmRuntimeRegistry::new(blobs.clone());
+        let fresh_mount = WasmDbMount::new(Arc::new(CrystalEngine::new().unwrap()));
+        let after_restart = fresh_mount
+            .execute_query(
+                &blobs,
+                &fresh_registry,
+                "ledger",
+                "acct_1",
+                "sqlite-stateful",
+                &rec.cid,
+                "/data",
+                "sqlite",
+                "UPDATE counter SET n = n + 1",
+                5_000_000,
+            )
+            .await
+            .unwrap();
+        assert_eq!(after_restart.as_i64(), Some(9));
     }
 }

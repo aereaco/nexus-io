@@ -2,6 +2,7 @@ pub mod cell;
 #[cfg(feature = "shell")]
 pub mod command;
 pub mod transformer;
+#[cfg(feature = "js-native")]
 pub mod wintercg;
 
 /// Direct `nexus_db::Value` -> `quickrs_core::value::Value` conversion (no `serde_json` hop).

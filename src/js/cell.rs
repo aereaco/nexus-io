@@ -1,6 +1,9 @@
 use anyhow::Result;
+#[cfg(feature = "js-native")]
 use quickrs_core::context::Context;
+#[cfg(feature = "js-native")]
 use quickrs_core::object::{PropFlags, Property};
+#[cfg(feature = "js-native")]
 use quickrs_core::value::{JsResult, PropKey, Value as JsValue};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -8,7 +11,9 @@ use std::time::{Duration, Instant};
 use nexus_db::Value as DbValue;
 use tokio::sync::RwLock;
 
-use crate::db::sql_compiler::{compile_sql_to_surql, execute_unified_query, SqlDialect};
+#[cfg(feature = "js-native")]
+use crate::db::sql_compiler::{compile_sql_to_surql, SqlDialect};
+use crate::db::sql_compiler::execute_unified_query;
 use crate::db::StateEngine;
 use crate::storage::BlobBridge;
 
@@ -260,6 +265,7 @@ struct ActiveCell {
     last_active: Instant,
 }
 
+#[cfg(feature = "js-native")]
 struct CellScope {
     engine: Arc<dyn StateEngine>,
     app: String,
@@ -267,19 +273,24 @@ struct CellScope {
     db_config: CellDbConfig,
 }
 
+#[cfg(feature = "js-native")]
 thread_local! {
     static ACTIVE_CELL_SCOPE: std::cell::RefCell<Option<CellScope>> = std::cell::RefCell::new(None);
 }
 
 /// Unified `CellManager` actor pool supporting both `pinned` and `elastic` (`celld`) cells
-/// on top of `StateEngine` (`nexus-db`) + `BlobBridge` + `quickrs-core` + `oxc`, with
-/// declarative per-cell `CellDbConfig` (topology mode, query flavors, and connection transports).
+/// on top of Wasmtime (`CrystalEngine`, `WasmRuntimeRegistry`, `WasmDbMount`), `StateEngine` (`nexus-db`),
+/// and `BlobBridge`, with declarative per-cell `CellDbConfig` (topology mode, query flavors, transports).
 #[derive(Clone)]
 pub struct CellManager {
     engine: Arc<dyn StateEngine>,
     blobs: Arc<BlobBridge>,
     #[cfg(feature = "wasm-runtime")]
+    crystal: Arc<crate::compute::crystal::CrystalEngine>,
+    #[cfg(feature = "wasm-runtime")]
     runtimes: crate::compute::wasm_registry::WasmRuntimeRegistry,
+    #[cfg(feature = "wasm-runtime")]
+    wasm_db: crate::compute::wasm_db::WasmDbMount,
     active: Arc<RwLock<HashMap<CellKey, ActiveCell>>>,
     db_configs: Arc<RwLock<HashMap<CellKey, CellDbConfig>>>,
 }
@@ -287,12 +298,23 @@ pub struct CellManager {
 impl CellManager {
     pub fn new(engine: Arc<dyn StateEngine>, blobs: Arc<BlobBridge>) -> Self {
         #[cfg(feature = "wasm-runtime")]
+        let crystal = Arc::new(
+            crate::compute::crystal::CrystalEngine::new()
+                .expect("failed to initialize shared Wasmtime CrystalEngine"),
+        );
+        #[cfg(feature = "wasm-runtime")]
         let runtimes = crate::compute::wasm_registry::WasmRuntimeRegistry::new(blobs.clone());
+        #[cfg(feature = "wasm-runtime")]
+        let wasm_db = crate::compute::wasm_db::WasmDbMount::new(crystal.clone());
         Self {
             engine,
             blobs,
             #[cfg(feature = "wasm-runtime")]
+            crystal,
+            #[cfg(feature = "wasm-runtime")]
             runtimes,
+            #[cfg(feature = "wasm-runtime")]
+            wasm_db,
             active: Arc::new(RwLock::new(HashMap::new())),
             db_configs: Arc::new(RwLock::new(HashMap::new())),
         }
@@ -526,19 +548,21 @@ impl CellManager {
             mount_path,
         } = &cfg.mode
         {
-            return crate::compute::wasm_db::WasmDbMount::execute_query(
-                &self.blobs,
-                &self.runtimes,
-                app,
-                cell_id,
-                engine,
-                module_cid,
-                mount_path,
-                flavor,
-                query,
-                50_000_000,
-            )
-            .await;
+            return self
+                .wasm_db
+                .execute_query(
+                    &self.blobs,
+                    &self.runtimes,
+                    app,
+                    cell_id,
+                    engine,
+                    module_cid,
+                    mount_path,
+                    flavor,
+                    query,
+                    50_000_000,
+                )
+                .await;
         }
 
         let nexus = self
@@ -619,7 +643,7 @@ impl CellManager {
             self.engine.clone(),
             self.blobs.clone(),
         );
-        let crystal = crate::compute::crystal::CrystalEngine::new()?;
+        let crystal = self.crystal.clone();
 
         match workload {
             CellWorkload::WasiCgi {
@@ -739,8 +763,9 @@ impl CellManager {
             .await
     }
 
-    /// Execute a request/expression inside the scoped cell with `ctx.storage.sql`, `ctx.storage` KV,
-    /// and `ctx.storage.surreal` bound directly to `(app, cell_id)`.
+    /// Execute a request/expression inside the scoped cell (requires `js-native` compatibility feature;
+    /// for Wasmtime cells use `wake_js_wasm` / `wake_workload` + `invoke_http`).
+    #[cfg(feature = "js-native")]
     pub async fn eval_in_cell(&self, app: &str, cell_id: &str, expr: &str) -> Result<String> {
         let key = CellKey {
             app: app.to_string(),
@@ -801,6 +826,15 @@ impl CellManager {
                 Err(e) => Err(anyhow::anyhow!("Cell execution error: {:?}", e)),
             }
         })
+    }
+
+    #[cfg(not(feature = "js-native"))]
+    pub async fn eval_in_cell(&self, app: &str, cell_id: &str, _expr: &str) -> Result<String> {
+        anyhow::bail!(
+            "Native QuickJS (`js-native`) is disabled in `profile-core`. Run cell {}/{} via Wasmtime (`wake_js_wasm` / `wake_workload` + `invoke_http`) or enable `--features js-native`.",
+            app,
+            cell_id
+        )
     }
 
     /// Transactionally hibernate an `Elastic` cell:
@@ -864,7 +898,14 @@ impl CellManager {
     }
 }
 
-fn create_cell_context() -> Context {
+#[cfg(feature = "js-native")]
+use native_js::{create_cell_context, js_val_to_string};
+
+#[cfg(feature = "js-native")]
+mod native_js {
+use super::*;
+
+pub(super) fn create_cell_context() -> Context {
     let mut ctx = Context::new();
     let global = ctx.global();
 
@@ -915,7 +956,7 @@ fn create_cell_context() -> Context {
     );
 
     // Install WinterCG Web Standard globals (`Request`, `Response`, `Headers`, `URL`, `crypto`, `TextEncoder`/`TextDecoder`, `Deno.openKv`)
-    super::wintercg::install_wintercg_globals(&mut ctx);
+    super::super::wintercg::install_wintercg_globals(&mut ctx);
 
     ctx
 }
@@ -931,7 +972,7 @@ fn js_to_db(val: &JsValue) -> DbValue {
     }
 }
 
-fn js_val_to_string(val: &JsValue) -> String {
+pub(super) fn js_val_to_string(val: &JsValue) -> String {
     match val {
         JsValue::Undefined | JsValue::Uninitialized => "undefined".to_string(),
         JsValue::Null => "null".to_string(),
@@ -1066,7 +1107,7 @@ fn run_cell_query(
 
     match rows {
         Ok(list) => {
-            let items: Vec<JsValue> = list.into_iter().map(|v| super::surreal_to_js(ctx, v)).collect();
+            let items: Vec<JsValue> = list.into_iter().map(|v| super::super::surreal_to_js(ctx, v)).collect();
             Ok(JsValue::Object(ctx.new_array_from(items)))
         }
         Err(e) => {
@@ -1094,7 +1135,7 @@ fn cell_kv_get_cb(
     };
     let rt = tokio::runtime::Handle::current();
     match rt.block_on(async move { engine.kv_get(&app, &cell_id, &key).await }) {
-        Ok(Some(v)) => Ok(super::surreal_to_js(ctx, v)),
+        Ok(Some(v)) => Ok(super::super::surreal_to_js(ctx, v)),
         _ => Ok(JsValue::Undefined),
     }
 }
@@ -1135,12 +1176,14 @@ fn cell_kv_delete_cb(
     let _ = rt.block_on(async move { engine.kv_delete(&app, &cell_id, &key).await });
     Ok(JsValue::Undefined)
 }
+} // mod native_js
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::db::Database;
 
+    #[cfg(feature = "js-native")]
     #[test]
     fn elastic_cell_supports_sqlite_api_surrealql_and_hibernation() {
         std::thread::Builder::new()
@@ -1374,5 +1417,92 @@ mod tests {
             .unwrap();
         assert_eq!(rows[0]["db"], "sqlite-wasm");
         assert_eq!(rows[0]["rows"], 3);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_isolated_cells_hibernate_and_recover_without_leakage() {
+        let db = Arc::new(Database::open_mem());
+        let blobs = Arc::new(BlobBridge::new(db.clone()).await.unwrap());
+        let manager = CellManager::new(db.clone(), blobs.clone());
+
+        // Spawn 6 concurrent elastic cells, each writing unique isolated state into its own DB,
+        // hibernating to BlobBridge, and waking back up to verify zero cross-cell leakage.
+        let mut tasks = Vec::new();
+        for idx in 0..6u32 {
+            let mgr = manager.clone();
+            tasks.push(tokio::spawn(async move {
+                let app = "multi_tenant";
+                let cell_id = format!("tenant_{}", idx);
+                let secret = format!("secret_payload_{}", idx);
+
+                mgr.wake_workload(
+                    app,
+                    &cell_id,
+                    CellPolicy::elastic_default(),
+                    CellWorkload::WasiModule {
+                        module_bytes: Vec::new(),
+                        args: Vec::new(),
+                        env: Vec::new(),
+                        preopen_dirs: Vec::new(),
+                        fuel_limit: 1_000_000,
+                    },
+                )
+                .await
+                .unwrap();
+
+                // Write isolated record into this cell's scoped DB
+                mgr.query_cell(
+                    app,
+                    &cell_id,
+                    CellDbTransport::Internal,
+                    "surql",
+                    &format!("CREATE item:1 SET owner = '{}', val = {}", secret, idx),
+                    Vec::new(),
+                    None,
+                )
+                .await
+                .unwrap();
+
+                // Hibernate (exports snapshot to BlobBridge & releases CAS lease)
+                mgr.hibernate(app, &cell_id).await.unwrap();
+
+                // Re-wake on a fresh lease (hydrates snapshot from BlobBridge) and verify exact isolation
+                mgr.ensure_awake(app, &cell_id).await.unwrap();
+                let res = mgr
+                    .query_cell(
+                        app,
+                        &cell_id,
+                        CellDbTransport::Internal,
+                        "surql",
+                        "SELECT owner, val FROM item",
+                        Vec::new(),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                let text = res.to_string();
+                assert!(
+                    text.contains(&secret),
+                    "tenant {} lost state after hibernation: {}",
+                    idx,
+                    text
+                );
+                // Ensure no other tenant's secret leaked into this cell
+                for other in 0..6u32 {
+                    if other != idx {
+                        assert!(
+                            !text.contains(&format!("secret_payload_{}", other)),
+                            "cross-cell leakage from {} into {}",
+                            other,
+                            idx
+                        );
+                    }
+                }
+            }));
+        }
+
+        for t in tasks {
+            t.await.unwrap();
+        }
     }
 }

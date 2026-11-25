@@ -77,13 +77,13 @@ mod tests {
                         lease_bucket: "analytics-cells".to_string(),
                     };
 
+                    use crate::db::StateEngine;
                     for id in ["c1", "c2"] {
                         manager
                             .wake("analytics_app", id, policy.clone(), String::new())
                             .await
                             .unwrap();
-                        manager
-                            .eval_in_cell("analytics_app", id, r#"ctx.storage.put("k1", "v1")"#)
+                        db.kv_put("analytics_app", id, "k1", nexus_db::Value::String("v1".to_string()))
                             .await
                             .unwrap();
                         manager.hibernate("analytics_app", id).await.unwrap();

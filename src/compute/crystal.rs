@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Result};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use wasmtime::{Caller, Config, Engine, Instance, Linker, Module, Store};
 use wasmtime_wasi::p1::{self, WasiP1Ctx};
 use wasmtime_wasi::p2::pipe::{MemoryInputPipe, MemoryOutputPipe};
@@ -106,6 +106,7 @@ pub struct WasiCgiResponse {
 ///   zero ambient OS access, scoped virtual filesystem mounts, and deterministic fuel metering.
 pub struct CrystalEngine {
     engine: Engine,
+    module_cache: RwLock<HashMap<String, Module>>,
 }
 
 impl CrystalEngine {
@@ -113,7 +114,33 @@ impl CrystalEngine {
         let mut config = Config::new();
         config.consume_fuel(true);
         let engine = Engine::new(&config).map_err(wt_err)?;
-        Ok(Self { engine })
+        Ok(Self {
+            engine,
+            module_cache: RwLock::new(HashMap::new()),
+        })
+    }
+
+    /// Resolve a cached `Module` by BLAKE3 hash of its AOT `.cwasm` bytes, deserializing only on first use.
+    fn get_or_deserialize_aot(&self, aot_bytes: &[u8]) -> Result<Module> {
+        let key = format!("aot:{}", blake3::hash(aot_bytes).to_hex());
+        if let Some(m) = self.module_cache.read().unwrap().get(&key).cloned() {
+            return Ok(m);
+        }
+        let module = unsafe { Module::deserialize(&self.engine, aot_bytes).map_err(wt_err)? };
+        self.module_cache.write().unwrap().insert(key, module.clone());
+        Ok(module)
+    }
+
+    /// Resolve a cached `Module` by BLAKE3 hash of raw `.wasm`/`.wat` bytes, compiling only on first use.
+    #[cfg(not(target_os = "ios"))]
+    fn get_or_compile_wasm(&self, wasm_or_wat: &[u8]) -> Result<Module> {
+        let key = format!("wasm:{}", blake3::hash(wasm_or_wat).to_hex());
+        if let Some(m) = self.module_cache.read().unwrap().get(&key).cloned() {
+            return Ok(m);
+        }
+        let module = Module::new(&self.engine, wasm_or_wat).map_err(wt_err)?;
+        self.module_cache.write().unwrap().insert(key, module.clone());
+        Ok(module)
     }
 
     /// Pre-compile a `.wasm` or `.wat` module ahead-of-time into native `.cwasm` bytes
@@ -159,7 +186,7 @@ impl CrystalEngine {
     /// stdio pipes, argv, env vars, preopened directories, and deterministic fuel metering.
     #[cfg(not(target_os = "ios"))]
     pub fn run_wasi_p1(&self, wasm_or_wat: &[u8], cfg: WasiRunConfig) -> Result<WasiRunOutput> {
-        let module = Module::new(&self.engine, wasm_or_wat).map_err(wt_err)?;
+        let module = self.get_or_compile_wasm(wasm_or_wat)?;
         self.exec_wasi_p1_module(&module, cfg, None)
     }
 
@@ -172,13 +199,13 @@ impl CrystalEngine {
         cfg: WasiRunConfig,
         host: NexusHostContext,
     ) -> Result<WasiRunOutput> {
-        let module = Module::new(&self.engine, wasm_or_wat).map_err(wt_err)?;
+        let module = self.get_or_compile_wasm(wasm_or_wat)?;
         self.exec_wasi_p1_module(&module, cfg, Some(host))
     }
 
     /// Execute a pre-compiled AOT `.cwasm` WASI Preview 1 module (works on all 5 platforms including iOS).
     pub fn run_wasi_p1_aot(&self, aot_bytes: &[u8], cfg: WasiRunConfig) -> Result<WasiRunOutput> {
-        let module = unsafe { Module::deserialize(&self.engine, aot_bytes).map_err(wt_err)? };
+        let module = self.get_or_deserialize_aot(aot_bytes)?;
         self.exec_wasi_p1_module(&module, cfg, None)
     }
 
@@ -189,7 +216,7 @@ impl CrystalEngine {
         cfg: WasiRunConfig,
         host: NexusHostContext,
     ) -> Result<WasiRunOutput> {
-        let module = unsafe { Module::deserialize(&self.engine, aot_bytes).map_err(wt_err)? };
+        let module = self.get_or_deserialize_aot(aot_bytes)?;
         self.exec_wasi_p1_module(&module, cfg, Some(host))
     }
 

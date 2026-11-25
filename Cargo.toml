@@ -21,13 +21,13 @@ profile-core = [
     "database",
     "gateway",
     "wasm-runtime",
-    "js-runtime",
     "cells",
     "iam",
 ]
 
 profile-app = [
     "profile-core",
+    "js-runtime",
     "ts-compiler",
     "p2p-storage",
     "s3-gateway",

@@ -53,6 +53,11 @@ pub fn transform_ts_to_js(source: &str) -> Result<String> {
 
 #[cfg(not(feature = "ts-compiler"))]
 pub fn transform_ts_to_js(source: &str) -> Result<String> {
+    if is_likely_ts(source) {
+        anyhow::bail!(
+            "TypeScript transpilation requires the `ts-compiler` feature (OXC) or pre-transpiled JavaScript in `profile-core`"
+        );
+    }
     Ok(source.to_string())
 }
 
