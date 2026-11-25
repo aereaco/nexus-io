@@ -1,14 +1,66 @@
 use anyhow::{anyhow, Result};
-use wasmtime::{Config, Engine, Instance, Module, Store};
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use wasmtime::{Config, Engine, Instance, Linker, Module, Store};
+use wasmtime_wasi::p1::{self, WasiP1Ctx};
+use wasmtime_wasi::p2::pipe::{MemoryInputPipe, MemoryOutputPipe};
+use wasmtime_wasi::{FsPerms, WasiCtxBuilder};
 
 fn wt_err(e: wasmtime::Error) -> anyhow::Error {
     anyhow!("{}", e)
 }
 
-/// Wasmtime Crystal Cell Engine:
+/// Capability-scoped configuration for executing any WASI polyglot module
+/// (PHP/WordPress `php-cgi.wasm`, CPython `python.wasm`, Go `wasip1`, Rust, C/C++, Ruby).
+///
+/// Zero ambient host authority: env vars, argv, stdin, and preopened directories must be
+/// explicitly granted per invocation.
+#[derive(Debug, Clone)]
+pub struct WasiRunConfig {
+    pub args: Vec<String>,
+    pub env: Vec<(String, String)>,
+    pub stdin: Vec<u8>,
+    /// `(host_path, guest_mount_path, writable)`
+    pub preopen_dirs: Vec<(PathBuf, String, bool)>,
+    pub fuel_limit: u64,
+}
+
+impl Default for WasiRunConfig {
+    fn default() -> Self {
+        Self {
+            args: vec!["cell.wasm".to_string()],
+            env: Vec::new(),
+            stdin: Vec::new(),
+            preopen_dirs: Vec::new(),
+            fuel_limit: 50_000_000,
+        }
+    }
+}
+
+/// Captured output & resource accounting from a WASI Crystal cell invocation.
+#[derive(Debug, Clone)]
+pub struct WasiRunOutput {
+    pub exit_code: i32,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    pub fuel_consumed: u64,
+}
+
+/// Parsed HTTP/CGI response returned by `CrystalEngine::invoke_wasi_cgi` (e.g. PHP/WordPress cells).
+#[derive(Debug, Clone)]
+pub struct WasiCgiResponse {
+    pub status: u16,
+    pub headers: BTreeMap<String, String>,
+    pub body: Vec<u8>,
+    pub stderr: String,
+    pub fuel_consumed: u64,
+}
+
+/// Wasmtime Crystal Cell & WASI Polyglot Primitive Engine:
 /// - **Non-iOS (`#[cfg(not(target_os = "ios"))]`):** Supports Cranelift JIT and AOT pre-compilation (`.cwasm`).
 /// - **iOS (`#[cfg(target_os = "ios")]`):** Strictly AOT-only (`runtime` feature, zero JIT — 100% Apple `W^X` compliant).
-/// - **Fuel Metering:** Every Crystal cell runs with a strict fuel budget so runaway compute cannot starve the shared-memory host.
+/// - **WASI Sandbox:** Runs PHP/WordPress, Python, Go, Rust, Ruby, and Wasm OCI components with
+///   zero ambient OS access, scoped virtual filesystem mounts, and deterministic fuel metering.
 pub struct CrystalEngine {
     engine: Engine,
 }
@@ -60,6 +112,133 @@ impl CrystalEngine {
         self.exec_module_i64(&module, fn_name, a, b, fuel_limit)
     }
 
+    /// Execute a WASI Preview 1 polyglot module (`.wasm` or `.wat`) with capability-scoped
+    /// stdio pipes, argv, env vars, preopened directories, and deterministic fuel metering.
+    #[cfg(not(target_os = "ios"))]
+    pub fn run_wasi_p1(&self, wasm_or_wat: &[u8], cfg: WasiRunConfig) -> Result<WasiRunOutput> {
+        let module = Module::new(&self.engine, wasm_or_wat).map_err(wt_err)?;
+        self.exec_wasi_p1_module(&module, cfg)
+    }
+
+    /// Execute a pre-compiled AOT `.cwasm` WASI Preview 1 module (works on all 5 platforms including iOS).
+    pub fn run_wasi_p1_aot(&self, aot_bytes: &[u8], cfg: WasiRunConfig) -> Result<WasiRunOutput> {
+        let module = unsafe { Module::deserialize(&self.engine, aot_bytes).map_err(wt_err)? };
+        self.exec_wasi_p1_module(&module, cfg)
+    }
+
+    /// Execute a WASI HTTP/CGI polyglot handler (e.g. `php-cgi.wasm` for WordPress/Laravel,
+    /// `python.wasm`, or Go/Rust WASI binaries) and parse its HTTP status, headers, and body.
+    #[cfg(not(target_os = "ios"))]
+    pub fn invoke_wasi_cgi(
+        &self,
+        wasm_or_wat: &[u8],
+        method: &str,
+        path: &str,
+        query_string: &str,
+        body: &[u8],
+        doc_root: Option<&Path>,
+        fuel_limit: u64,
+    ) -> Result<WasiCgiResponse> {
+        let mut env = vec![
+            ("REQUEST_METHOD".to_string(), method.to_ascii_uppercase()),
+            ("PATH_INFO".to_string(), path.to_string()),
+            ("REQUEST_URI".to_string(), if query_string.is_empty() { path.to_string() } else { format!("{}?{}", path, query_string) }),
+            ("QUERY_STRING".to_string(), query_string.to_string()),
+            ("CONTENT_LENGTH".to_string(), body.len().to_string()),
+            ("SERVER_PROTOCOL".to_string(), "HTTP/1.1".to_string()),
+            ("GATEWAY_INTERFACE".to_string(), "CGI/1.1".to_string()),
+            ("REDIRECT_STATUS".to_string(), "200".to_string()),
+        ];
+        let mut preopen_dirs = Vec::new();
+        if let Some(root) = doc_root {
+            env.push(("DOCUMENT_ROOT".to_string(), "/var/www".to_string()));
+            env.push(("SCRIPT_FILENAME".to_string(), format!("/var/www/{}", path.trim_start_matches('/'))));
+            preopen_dirs.push((root.to_path_buf(), "/var/www".to_string(), true));
+        }
+
+        let out = self.run_wasi_p1(
+            wasm_or_wat,
+            WasiRunConfig {
+                args: vec!["wasi-cgi".to_string()],
+                env,
+                stdin: body.to_vec(),
+                preopen_dirs,
+                fuel_limit,
+            },
+        )?;
+
+        let (status, headers, resp_body) = parse_cgi_response(&out.stdout);
+        Ok(WasiCgiResponse {
+            status,
+            headers,
+            body: resp_body,
+            stderr: String::from_utf8_lossy(&out.stderr).to_string(),
+            fuel_consumed: out.fuel_consumed,
+        })
+    }
+
+    fn exec_wasi_p1_module(&self, module: &Module, cfg: WasiRunConfig) -> Result<WasiRunOutput> {
+        let stdout_pipe = MemoryOutputPipe::new(4 * 1024 * 1024);
+        let stderr_pipe = MemoryOutputPipe::new(1024 * 1024);
+        let stdin_pipe = MemoryInputPipe::new(cfg.stdin);
+
+        let mut builder = WasiCtxBuilder::new();
+        builder
+            .stdin(stdin_pipe)
+            .stdout(stdout_pipe.clone())
+            .stderr(stderr_pipe.clone());
+
+        if !cfg.args.is_empty() {
+            builder.args(&cfg.args);
+        }
+        for (k, v) in &cfg.env {
+            builder.env(k, v);
+        }
+        for (host_path, guest_path, writable) in &cfg.preopen_dirs {
+            let perms = if *writable {
+                FsPerms::ReadWrite
+            } else {
+                FsPerms::ReadOnly
+            };
+            builder
+                .preopened_dir(host_path, guest_path, perms)
+                .map_err(wt_err)?;
+        }
+
+        let wasi_ctx: WasiP1Ctx = builder.build_p1();
+        let mut store = Store::new(&self.engine, wasi_ctx);
+        store.set_fuel(cfg.fuel_limit).map_err(wt_err)?;
+
+        let mut linker: Linker<WasiP1Ctx> = Linker::new(&self.engine);
+        p1::add_to_linker_sync(&mut linker, |s| s).map_err(wt_err)?;
+
+        let instance = linker.instantiate(&mut store, module).map_err(wt_err)?;
+        let start = instance
+            .get_typed_func::<(), ()>(&mut store, "_start")
+            .map_err(|e| anyhow!("WASI module missing '_start' entrypoint: {}", e))?;
+
+        let exit_code = match start.call(&mut store, ()) {
+            Ok(()) => 0,
+            Err(err) => {
+                if let Some(exit) = err.downcast_ref::<wasmtime_wasi::I32Exit>() {
+                    exit.0
+                } else {
+                    return Err(wt_err(err));
+                }
+            }
+        };
+
+        let remaining = store.get_fuel().unwrap_or(0);
+        let fuel_consumed = cfg.fuel_limit.saturating_sub(remaining);
+
+        Ok(WasiRunOutput {
+            exit_code,
+            stdout: stdout_pipe.contents().to_vec(),
+            stderr: stderr_pipe.contents().to_vec(),
+            fuel_consumed,
+        })
+    }
+
     fn exec_module_i64(
         &self,
         module: &Module,
@@ -79,6 +258,35 @@ impl CrystalEngine {
     }
 }
 
+fn parse_cgi_response(raw: &[u8]) -> (u16, BTreeMap<String, String>, Vec<u8>) {
+    let mut status = 200u16;
+    let mut headers = BTreeMap::new();
+    let split = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|i| (i, 4))
+        .or_else(|| raw.windows(2).position(|w| w == b"\n\n").map(|i| (i, 2)));
+
+    let Some((idx, sep_len)) = split else {
+        return (status, headers, raw.to_vec());
+    };
+    let head_str = String::from_utf8_lossy(&raw[..idx]);
+    for line in head_str.lines() {
+        if let Some((k, v)) = line.split_once(':') {
+            let key = k.trim().to_string();
+            let val = v.trim().to_string();
+            if key.eq_ignore_ascii_case("Status") {
+                if let Some(code) = val.split_whitespace().next().and_then(|s| s.parse::<u16>().ok()) {
+                    status = code;
+                }
+            } else {
+                headers.insert(key, val);
+            }
+        }
+    }
+    (status, headers, raw[idx + sep_len..].to_vec())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -96,13 +304,11 @@ mod tests {
             )
         "#;
 
-        // 1. Pre-compile to native AOT bytes and execute (iOS-compatible path)
         let aot = crystal.compile_aot(add_wat).unwrap();
         assert!(!aot.is_empty());
         let sum = crystal.run_aot_i64(&aot, "add", 19, 23, 10_000).unwrap();
         assert_eq!(sum, 42);
 
-        // 2. Verify fuel metering traps runaway loops
         let spin_wat = br#"
             (module
                 (func (export "spin") (param i64 i64) (result i64)
@@ -113,5 +319,33 @@ mod tests {
         "#;
         let trapped = crystal.run_wasm_i64(spin_wat, "spin", 0, 0, 1_000);
         assert!(trapped.is_err());
+    }
+
+    #[test]
+    fn runs_wasi_p1_polyglot_module_and_cgi_http_response() {
+        let crystal = CrystalEngine::new().unwrap();
+        // Minimal WASI Preview 1 module writing a CGI HTTP response via `fd_write(1, ...)`
+        let wasi_cgi_wat = br#"
+            (module
+                (import "wasi_snapshot_preview1" "fd_write"
+                    (func $fd_write (param i32 i32 i32 i32) (result i32)))
+                (memory (export "memory") 1)
+                (data (i32.const 16) "Status: 201 Created\r\nContent-Type: text/plain\r\n\r\nhello from wasi crystal")
+                (func (export "_start")
+                    ;; iovec at offset 0: { ptr: 16, len: 72 }
+                    (i32.store (i32.const 0) (i32.const 16))
+                    (i32.store (i32.const 4) (i32.const 72))
+                    (drop (call $fd_write (i32.const 1) (i32.const 0) (i32.const 1) (i32.const 8)))
+                )
+            )
+        "#;
+
+        let cgi = crystal
+            .invoke_wasi_cgi(wasi_cgi_wat, "GET", "/index.php", "p=1", b"", None, 1_000_000)
+            .unwrap();
+        assert_eq!(cgi.status, 201);
+        assert_eq!(cgi.headers.get("Content-Type").map(String::as_str), Some("text/plain"));
+        assert_eq!(String::from_utf8_lossy(&cgi.body), "hello from wasi crystal");
+        assert!(cgi.fuel_consumed > 0);
     }
 }

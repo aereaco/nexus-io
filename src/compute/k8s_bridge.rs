@@ -112,7 +112,9 @@ fn is_wasm_artifact(s: &str) -> bool {
         || lower.ends_with(".cwasm")
         || lower.starts_with("s3://")
         || lower.starts_with("iroh://")
+        || lower.starts_with("oci://")
         || lower.contains("wasm")
+        || lower.contains("wasi")
 }
 
 fn policy_label(policy: &CellPolicy) -> &'static str {
