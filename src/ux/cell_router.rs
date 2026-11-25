@@ -157,6 +157,47 @@ impl Handler for CellGatewayHandler {
             return;
         }
 
+        // GET /cells/_runtimes -> list registered WASI guest runtimes (quickjs, php-cgi, sqlite, pglite, ...)
+        #[cfg(feature = "wasm-runtime")]
+        if req.method() == &Method::GET && req.uri().path().trim_end_matches('/') == "/cells/_runtimes" {
+            let runtimes = self.cells.runtimes().list_runtimes().await;
+            res.status_code(StatusCode::OK);
+            res.render(Json(serde_json::json!({ "runtimes": runtimes })));
+            return;
+        }
+
+        // PUT /cells/_runtimes/<name> -> register & AOT-precompile a WASI guest runtime into BlobBridge
+        #[cfg(feature = "wasm-runtime")]
+        if req.method() == &Method::PUT {
+            let runtime_name = req
+                .uri()
+                .path()
+                .strip_prefix("/cells/_runtimes/")
+                .map(|s| s.trim_matches('/').to_string())
+                .filter(|s| !s.is_empty());
+            if let Some(name) = runtime_name {
+                let bytes = match req.payload().await {
+                    Ok(b) => b.to_vec(),
+                    Err(e) => {
+                        res.status_code(StatusCode::BAD_REQUEST);
+                        res.render(Text::Plain(format!("Failed to read runtime bytes: {}", e)));
+                        return;
+                    }
+                };
+                match self.cells.runtimes().register_runtime(&name, &bytes).await {
+                    Ok(rec) => {
+                        res.status_code(StatusCode::OK);
+                        res.render(Json(rec));
+                    }
+                    Err(e) => {
+                        res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+                        res.render(Text::Plain(format!("Runtime registration error: {}", e)));
+                    }
+                }
+                return;
+            }
+        }
+
         let Some((app, cell_id)) = parse_cell_path(req.uri().path()) else {
             res.status_code(StatusCode::BAD_REQUEST);
             res.render(Text::Plain("Invalid cell path. Use: /cells/<app>/<cell_id>"));
@@ -198,7 +239,26 @@ impl Handler for CellGatewayHandler {
         }
 
         match req.method() {
-            // PUT /cells/<app>/<cell_id> -> wake/deploy WASI, WASI-CGI, or TS/JS cell workload
+            // PUT /cells/<app>/<cell_id>/db-config -> declaratively configure per-cell CellDbConfig
+            &Method::PUT if req.uri().path().trim_end_matches('/').ends_with("/db-config") => {
+                match req.parse_json::<crate::js::cell::CellDbConfig>().await {
+                    Ok(cfg) => {
+                        self.cells.set_db_config(&app, &cell_id, cfg.clone()).await;
+                        res.status_code(StatusCode::OK);
+                        res.render(Json(serde_json::json!({
+                            "app": app,
+                            "cell_id": cell_id,
+                            "db_config": cfg
+                        })));
+                    }
+                    Err(e) => {
+                        res.status_code(StatusCode::BAD_REQUEST);
+                        res.render(Text::Plain(format!("Invalid CellDbConfig JSON: {}", e)));
+                    }
+                }
+            }
+
+            // PUT /cells/<app>/<cell_id> -> wake/deploy WASI, WASI-CGI, JS-on-Wasm (quickjs.wasm), or TS/JS cell
             &Method::PUT => {
                 let policy = policy_from_headers(req);
                 let runtime_hdr = req
@@ -220,6 +280,25 @@ impl Handler for CellGatewayHandler {
                         return;
                     }
                 };
+                #[cfg(feature = "wasm-runtime")]
+                if runtime_hdr.as_deref() == Some("js-wasm") || runtime_hdr.as_deref() == Some("quickjs") {
+                    let script = String::from_utf8_lossy(&raw_bytes).to_string();
+                    match self
+                        .cells
+                        .wake_js_wasm(&app, &cell_id, policy, script, "quickjs", 50_000_000)
+                        .await
+                    {
+                        Ok(()) => {
+                            res.status_code(StatusCode::OK);
+                            res.render(Text::Plain(format!("Cell {}/{} awake (js-wasm)", app, cell_id)));
+                        }
+                        Err(e) => {
+                            res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+                            res.render(Text::Plain(format!("Cell js-wasm wake error: {}", e)));
+                        }
+                    }
+                    return;
+                }
                 let workload = match runtime_hdr.as_deref() {
                     Some("wasi-cgi") | Some("cgi") | Some("php") => CellWorkload::WasiCgi {
                         module_bytes: raw_bytes,

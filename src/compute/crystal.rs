@@ -685,7 +685,6 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn wasi_guest_calls_nexus_host_db_query_and_enforces_cell_db_config() {
-        let crystal = CrystalEngine::new().unwrap();
         let db = Arc::new(crate::db::Database::open_mem());
         let blobs = Arc::new(BlobBridge::new(db.clone()).await.unwrap());
 

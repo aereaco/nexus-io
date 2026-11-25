@@ -10,6 +10,10 @@ pub mod k8s_bridge;
 pub mod analytics;
 #[cfg(feature = "wasm-runtime")]
 pub mod crystal;
+#[cfg(feature = "wasm-runtime")]
+pub mod wasm_registry;
+#[cfg(feature = "wasm-runtime")]
+pub mod wasm_db;
 
 pub use telemetry::NodeResources;
 pub use router::{InferenceRouter, ComputeRequirements};

@@ -535,15 +535,32 @@ impl Handler for UnifiedQueryHandler {
             .map(|arr| arr.iter().map(DbValue::from_json).collect())
             .unwrap_or_default();
 
-        match crate::db::sql_compiler::execute_unified_query(
-            &self.db.inner,
-            &ns,
-            &database,
-            flavor,
-            query,
-            params,
-            auth,
-        ) {
+        let query_result = match (req.param::<String>("app"), req.param::<String>("cell_id")) {
+            (Some(app), Some(cell_id)) => {
+                self.cells
+                    .query_cell(
+                        &app,
+                        &cell_id,
+                        crate::js::cell::CellDbTransport::HttpRest,
+                        flavor,
+                        query,
+                        params,
+                        auth,
+                    )
+                    .await
+            }
+            _ => crate::db::sql_compiler::execute_unified_query(
+                &self.db.inner,
+                &ns,
+                &database,
+                flavor,
+                query,
+                params,
+                auth,
+            ),
+        };
+
+        match query_result {
             Ok(result) => {
                 if flavor.eq_ignore_ascii_case("graphql") {
                     res.render(Json(result));

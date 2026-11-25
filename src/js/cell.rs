@@ -228,6 +228,7 @@ pub enum CellWorkload {
     JsOnWasm {
         script: String,
         engine_wasm: Vec<u8>,
+        is_aot: bool,
         fuel_limit: u64,
     },
     WasiModule {
@@ -277,18 +278,29 @@ thread_local! {
 pub struct CellManager {
     engine: Arc<dyn StateEngine>,
     blobs: Arc<BlobBridge>,
+    #[cfg(feature = "wasm-runtime")]
+    runtimes: crate::compute::wasm_registry::WasmRuntimeRegistry,
     active: Arc<RwLock<HashMap<CellKey, ActiveCell>>>,
     db_configs: Arc<RwLock<HashMap<CellKey, CellDbConfig>>>,
 }
 
 impl CellManager {
     pub fn new(engine: Arc<dyn StateEngine>, blobs: Arc<BlobBridge>) -> Self {
+        #[cfg(feature = "wasm-runtime")]
+        let runtimes = crate::compute::wasm_registry::WasmRuntimeRegistry::new(blobs.clone());
         Self {
             engine,
             blobs,
+            #[cfg(feature = "wasm-runtime")]
+            runtimes,
             active: Arc::new(RwLock::new(HashMap::new())),
             db_configs: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    #[cfg(feature = "wasm-runtime")]
+    pub fn runtimes(&self) -> &crate::compute::wasm_registry::WasmRuntimeRegistry {
+        &self.runtimes
     }
 
     /// Declare the modular `CellDbConfig` (mode, exposed flavors, and allowed connection transports)
@@ -459,6 +471,105 @@ impl CellManager {
         Ok(())
     }
 
+    /// Wake a JS/TS cell backed by a registered WASI JavaScript engine (`quickjs.wasm` / Javy)
+    /// resolved from `WasmRuntimeRegistry` (preferring pre-compiled AOT `.cwasm`).
+    #[cfg(feature = "wasm-runtime")]
+    pub async fn wake_js_wasm(
+        &self,
+        app: &str,
+        cell_id: &str,
+        policy: CellPolicy,
+        script: String,
+        runtime_name: &str,
+        fuel_limit: u64,
+    ) -> Result<()> {
+        let resolved = self.runtimes.resolve_runtime(runtime_name).await?;
+        let (engine_wasm, is_aot) = match resolved {
+            crate::compute::wasm_registry::ResolvedRuntime::Aot(b) => (b, true),
+            crate::compute::wasm_registry::ResolvedRuntime::Wasm(b) => (b, false),
+        };
+        self.wake_workload(
+            app,
+            cell_id,
+            policy,
+            CellWorkload::JsOnWasm {
+                script,
+                engine_wasm,
+                is_aot,
+                fuel_limit,
+            },
+        )
+        .await
+    }
+
+    /// Universal cell database query executor supporting BOTH kernel-native `nexus-db`
+    /// (`Dedicated`, `Reference`, `Mesh`) AND Wasmtime-hosted DB engines (`CellDbMode::WasmEngine`,
+    /// e.g. `sqlite.wasm`, `pglite.wasm`, `duckdb.wasm`, `nexus-db.wasm`).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn query_cell(
+        &self,
+        app: &str,
+        cell_id: &str,
+        transport: CellDbTransport,
+        flavor: &str,
+        query: &str,
+        params: Vec<DbValue>,
+        auth: Option<nexus_db::auth::AuthContext>,
+    ) -> Result<serde_json::Value> {
+        let cfg = self.get_db_config(app, cell_id).await;
+        let binding = Self::check_db_config(&cfg, app, cell_id, transport, flavor)?;
+
+        #[cfg(feature = "wasm-runtime")]
+        if let CellDbMode::WasmEngine {
+            engine,
+            module_cid,
+            mount_path,
+        } = &cfg.mode
+        {
+            return crate::compute::wasm_db::WasmDbMount::execute_query(
+                &self.blobs,
+                &self.runtimes,
+                app,
+                cell_id,
+                engine,
+                module_cid,
+                mount_path,
+                flavor,
+                query,
+                50_000_000,
+            )
+            .await;
+        }
+
+        let nexus = self
+            .engine
+            .as_nexus_db()
+            .ok_or_else(|| anyhow::anyhow!("Kernel StateEngine is not backed by NexusDb"))?;
+        let effective_auth = if binding.read_only {
+            Some(nexus_db::auth::AuthContext {
+                level: nexus_db::auth::AuthLevel::Database(
+                    binding.target_ns.clone(),
+                    binding.target_db.clone(),
+                ),
+                roles: vec![nexus_db::auth::Role::Viewer],
+                actor: auth.and_then(|a| a.actor),
+                access_name: None,
+                token_claims: None,
+            })
+        } else {
+            auth
+        };
+        execute_unified_query(
+            nexus,
+            &binding.target_ns,
+            &binding.target_db,
+            flavor,
+            query,
+            params,
+            effective_auth,
+        )
+    }
+
     /// Returns `true` if `(app, cell_id)` is currently awake with a Wasmtime workload (`WasiModule`, `WasiCgi`, or `JsOnWasm`).
     pub async fn is_wasm_workload(&self, app: &str, cell_id: &str) -> bool {
         let key = CellKey {
@@ -570,6 +681,7 @@ impl CellManager {
             CellWorkload::JsOnWasm {
                 script,
                 engine_wasm,
+                is_aot,
                 fuel_limit,
             } => {
                 let js_script = if super::transformer::is_likely_ts(&script) {
@@ -580,7 +692,18 @@ impl CellManager {
                 };
                 let body_vec = body.to_vec();
                 let out = tokio::task::spawn_blocking(move || {
-                    crystal.invoke_js_wasm(&engine_wasm, &js_script, &body_vec, Some(host), fuel_limit)
+                    if is_aot {
+                        let cfg = crate::compute::crystal::WasiRunConfig {
+                            args: vec!["quickjs.wasm".to_string()],
+                            env: vec![("NEXUS_JS_SOURCE".to_string(), js_script)],
+                            stdin: body_vec,
+                            preopen_dirs: Vec::new(),
+                            fuel_limit,
+                        };
+                        crystal.run_wasi_aot_with_host(&engine_wasm, cfg, host)
+                    } else {
+                        crystal.invoke_js_wasm(&engine_wasm, &js_script, &body_vec, Some(host), fuel_limit)
+                    }
                 })
                 .await??;
                 Ok(CellHttpResponse {
@@ -1154,5 +1277,105 @@ mod tests {
         .unwrap();
         assert_eq!(m_bound.mesh_cluster.as_deref(), Some("us-east"));
         assert!(m_bound.read_only);
+    }
+
+    #[cfg(all(feature = "wasm-runtime", not(target_os = "ios")))]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn end_to_end_quickjs_wasm_cell_and_wasm_db_engine_via_cell_manager() {
+        let db = Arc::new(Database::open_mem());
+        let blobs = Arc::new(BlobBridge::new(db.clone()).await.unwrap());
+        let manager = CellManager::new(db, blobs);
+
+        // 1. Register an AOT-precompiled WASI JS guest runtime (`quickjs`) that invokes `nexus_host::nexus_db_query`
+        let quickjs_stub_wat = br#"
+            (module
+                (import "wasi_snapshot_preview1" "fd_write"
+                    (func $fd_write (param i32 i32 i32 i32) (result i32)))
+                (import "nexus_host" "nexus_db_query"
+                    (func $db_query (param i32 i32 i32 i32 i32 i32) (result i32)))
+                (memory (export "memory") 1)
+                (data (i32.const 32) "surql")
+                (data (i32.const 64) "RETURN 'hello-quickjs-wasm'")
+                (func (export "_start")
+                    (local $n i32)
+                    (local.set $n
+                        (call $db_query
+                            (i32.const 32) (i32.const 5)
+                            (i32.const 64) (i32.const 27)
+                            (i32.const 256) (i32.const 256)))
+                    (i32.store (i32.const 0) (i32.const 256))
+                    (i32.store (i32.const 4) (local.get $n))
+                    (drop (call $fd_write (i32.const 1) (i32.const 0) (i32.const 1) (i32.const 8)))
+                )
+            )
+        "#;
+        let qjs_rec = manager
+            .runtimes()
+            .register_runtime("quickjs", quickjs_stub_wat)
+            .await
+            .unwrap();
+        assert!(qjs_rec.aot_cached);
+
+        manager
+            .wake_js_wasm(
+                "web",
+                "api_1",
+                CellPolicy::Pinned,
+                "export default () => 'ts-source'".to_string(),
+                "quickjs",
+                1_000_000,
+            )
+            .await
+            .unwrap();
+        assert!(manager.is_wasm_workload("web", "api_1").await);
+
+        let http_resp = manager
+            .invoke_http("web", "api_1", "GET", "/cells/web/api_1", "", b"")
+            .await
+            .unwrap();
+        assert_eq!(http_resp.status, 200);
+        assert!(String::from_utf8_lossy(&http_resp.body).contains("hello-quickjs-wasm"));
+
+        // 2. Register a Wasm-hosted DB engine (`sqlite`) and query it through CellManager::query_cell
+        let sqlite_wasm_wat = br#"
+            (module
+                (import "wasi_snapshot_preview1" "fd_write"
+                    (func $fd_write (param i32 i32 i32 i32) (result i32)))
+                (memory (export "memory") 1)
+                (data (i32.const 16) "[{\"db\":\"sqlite-wasm\",\"rows\":3}]")
+                (func (export "_start")
+                    (i32.store (i32.const 0) (i32.const 16))
+                    (i32.store (i32.const 4) (i32.const 31))
+                    (drop (call $fd_write (i32.const 1) (i32.const 0) (i32.const 1) (i32.const 8)))
+                )
+            )
+        "#;
+        let sql_rec = manager
+            .runtimes()
+            .register_runtime("sqlite", sqlite_wasm_wat)
+            .await
+            .unwrap();
+        manager
+            .set_db_config(
+                "shop",
+                "cart_1",
+                CellDbConfig::wasm_engine("sqlite", &sql_rec.cid, "sqlite"),
+            )
+            .await;
+
+        let rows = manager
+            .query_cell(
+                "shop",
+                "cart_1",
+                CellDbTransport::HttpRest,
+                "sqlite",
+                "SELECT count(*) FROM items",
+                Vec::new(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows[0]["db"], "sqlite-wasm");
+        assert_eq!(rows[0]["rows"], 3);
     }
 }
