@@ -679,3 +679,158 @@ async fn end_to_end_guest_and_concurrent_20_cell_workload_benchmark() {
         all_lat[(all_lat.len() * 95) / 100]
     );
 }
+
+/// Declarative Control-Plane API & Fenced Stateful Migration Integration Test:
+/// 1. `POST /_nexus/deploy` fails closed (`503`) before boot recovery.
+/// 2. `VIEWER` cannot deploy (`403 Forbidden`), while `OWNER` deploys TOML `AppManifest` (`202 Accepted`),
+///    and `GET /_nexus/deploy/{op_id}` + `GET /_nexus/apps/{app_id}` return durable CAS records.
+/// 3. Stateful cell `fenced_checkpoint` migration from Node A -> Node B advances monotonic
+///    `fencing_token` and rejects stale Node A commits.
+#[tokio::test(flavor = "multi_thread")]
+async fn declarative_manifest_control_plane_and_fenced_stateful_migration() {
+    use nexus_io::storage::cas_store::CasStore;
+    use nexus_io::ux::{GatewayConfig, UxGateway};
+    use salvo::test::{ResponseExt, TestClient};
+    use salvo::Service;
+
+    let db = Arc::new(Database::open_mem());
+    let blobs = Arc::new(BlobBridge::new(db.clone()).await.unwrap());
+    let gw = UxGateway::new(db.clone(), blobs.clone(), GatewayConfig::default());
+    let service = Service::new(gw.router());
+
+    let cid = format!("blake3:{}", "b".repeat(64));
+    let manifest_toml = format!(
+        r#"
+api_version = "nexus.io/v1"
+kind = "Application"
+
+[metadata]
+name = "billing"
+version = "1.0.0"
+
+[topology]
+mode = "modular"
+
+[cells.ledger]
+artifact = "{cid}"
+replicas = 1
+migration = "fenced_checkpoint"
+
+[cells.ledger.database]
+mode = "dedicated"
+flavors = ["surql"]
+transports = ["internal"]
+
+[cells.ledger.capabilities]
+allow = ["db.read", "db.write"]
+"#
+    );
+
+    // 1. Pre-recovery: /_nexus/deploy MUST return 503 Service Unavailable
+    let pre = TestClient::post("http://127.0.0.1/_nexus/deploy")
+        .text(manifest_toml.clone())
+        .send(&service)
+        .await;
+    assert_eq!(pre.status_code, Some(salvo::http::StatusCode::SERVICE_UNAVAILABLE));
+
+    gw.reconcile_storage_on_boot().await.unwrap();
+
+    // Provision VIEWER and OWNER tokens via real Nexus-DB IAM + HTTP `/signin`
+    db.inner
+        .query_scoped(
+            "nexus",
+            "system",
+            "DEFINE USER viewer_u ON ROOT PASSWORD 'secret' ROLES VIEWER; DEFINE USER owner_u ON ROOT PASSWORD 'secret' ROLES OWNER;",
+            vec![],
+        )
+        .unwrap();
+    let mut sv = TestClient::post("http://127.0.0.1/signin")
+        .json(&serde_json::json!({ "user": "viewer_u", "pass": "secret" }))
+        .send(&service)
+        .await;
+    let viewer_tok = sv.take_json::<serde_json::Value>().await.unwrap()["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let mut so = TestClient::post("http://127.0.0.1/signin")
+        .json(&serde_json::json!({ "user": "owner_u", "pass": "secret" }))
+        .send(&service)
+        .await;
+    let owner_tok = so.take_json::<serde_json::Value>().await.unwrap()["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // 2. VIEWER is denied (403 Forbidden - lacks `cell.spawn`)
+    let r_viewer = TestClient::post("http://127.0.0.1/_nexus/deploy")
+        .add_header("Authorization", format!("Bearer {}", viewer_tok), true)
+        .text(manifest_toml.clone())
+        .send(&service)
+        .await;
+    assert_eq!(r_viewer.status_code, Some(salvo::http::StatusCode::FORBIDDEN));
+
+    // 3. OWNER deploys cleanly -> 202 Accepted + durable operation & app records
+    let mut r_owner = TestClient::post("http://127.0.0.1/_nexus/deploy")
+        .add_header("Authorization", format!("Bearer {}", owner_tok), true)
+        .text(manifest_toml)
+        .send(&service)
+        .await;
+    assert_eq!(r_owner.status_code, Some(salvo::http::StatusCode::ACCEPTED));
+    let op_json: serde_json::Value = r_owner.take_json().await.unwrap();
+    let op_id = op_json["operation_id"].as_str().unwrap();
+    assert_eq!(op_json["status"], "succeeded");
+
+    let mut r_op = TestClient::get(format!("http://127.0.0.1/_nexus/deploy/{}", op_id))
+        .add_header("Authorization", format!("Bearer {}", owner_tok), true)
+        .send(&service)
+        .await;
+    assert_eq!(r_op.status_code, Some(salvo::http::StatusCode::OK));
+    let op_fetched: serde_json::Value = r_op.take_json().await.unwrap();
+    assert_eq!(op_fetched["app_name"], "billing");
+
+    let mut r_app = TestClient::get("http://127.0.0.1/_nexus/apps/billing")
+        .add_header("Authorization", format!("Bearer {}", owner_tok), true)
+        .send(&service)
+        .await;
+    assert_eq!(r_app.status_code, Some(salvo::http::StatusCode::OK));
+    let app_rec: serde_json::Value = r_app.take_json().await.unwrap();
+    assert_eq!(app_rec["cells"]["ledger"]["migration_policy"], "fenced_checkpoint");
+
+    // 4. Stateful `fenced_checkpoint` migration handoff (Node A -> Node B):
+    //    Node A acquires token 1, checkpoints state & releases lease;
+    //    Node B acquires monotonic token 2; Node A's stale token 1 renewal MUST be fenced out!
+    let cas_a = CasStore::new(blobs.clone());
+    let cas_b = CasStore::new(blobs.clone());
+    let lease_a = cas_a
+        .acquire_execution_lease("nexus-deployments", "leases/billing/ledger.json", "node-a", 30_000)
+        .await
+        .unwrap();
+    assert_eq!(lease_a.fencing_token, 1);
+    // Node A checkpoints and cleanly releases lease for migration
+    assert!(cas_a
+        .release_execution_lease(
+            "nexus-deployments",
+            "leases/billing/ledger.json",
+            "node-a",
+            lease_a.fencing_token
+        )
+        .await
+        .unwrap());
+    // Node B takes ownership with monotonic fencing_token = 2
+    let lease_b = cas_b
+        .acquire_execution_lease("nexus-deployments", "leases/billing/ledger.json", "node-b", 30_000)
+        .await
+        .unwrap();
+    assert_eq!(lease_b.fencing_token, 2);
+    // Stale Node A renewal MUST be rejected by fencing!
+    assert!(cas_a
+        .renew_execution_lease(
+            "nexus-deployments",
+            "leases/billing/ledger.json",
+            "node-a",
+            lease_a.fencing_token,
+            30_000
+        )
+        .await
+        .is_err());
+}

@@ -56,7 +56,19 @@ All persistent cell DB files and guest Wasm binaries share one content-addressed
 - **Integrity Guarantees:** Deleting or corrupting any derived AOT cache entry transparently evicts and rebuilds from `cid/<cid>`. Corrupting the authoritative `cid/<cid>` source fails explicitly with a BLAKE3 integrity error (never falls through).
 - **Hardened OCI Pulls (`runtime-oci`):** HTTPS enforced by default, Bearer credentials stripped on cross-origin redirects, SHA-256 verification of manifest & layers, strict Wasm media-type allowlist, streaming size caps, and `RuntimeTrustPolicy` (`TrustMode::AllowlistOnly` by default).
 
-## 6. Semantic Deployment Profiles (`Cargo.toml`)
+## 6. Declarative Application Manifest (`AppManifest`), Typed `Chart`s & Control Plane (`src/compute/manifest.rs`)
+Application architecture and deployment topology are independent — the same application can start as a single-node **monolith**, evolve into **modular** local cells, and later target **mesh** placement without rewriting application code:
+
+- **Wasmtime is implicit:** `api_version = "nexus.io/v1"` manifests never declare a host runtime. Every cell declares an immutable `blake3:<64-hex>` or digest-pinned `oci://...@sha256:<64-hex>` artifact, `CellDbConfig`, `CellResourceLimits`, default-deny `capabilities.allow`, and evolvable `topology` / `placement` / `lifecycle` / `migration` policies.
+- **Authorization separated from declaration:** Manifests may only *request* capabilities. Effective capabilities are strictly `requested ∩ operator_policy ∩ deployer_iam ∩ cell_db_caps`.
+- **Stateful safety:** Stateful cells reject `replicas > 1` and unimplemented `MigrationPolicy::Replicated` at `validate()`.
+- **Deterministic typed `Chart`s:** `ChartPackage::resolve(&overrides)` applies typed `ChartValues` overrides with explicit precedence and produces a validated, reproducible `AppManifest` + canonical BLAKE3 digest (no string templating).
+- **Desired-state reconciliation & Control Plane API:**
+  - `POST /_nexus/deploy` (accepts TOML or JSON `AppManifest`, enforces `BootRecoveryGateMiddleware` + `IamMiddleware` + `Capability::CellSpawn`, persists `DeploymentOperation` in `CasStore` before mutating cells, returns `202 Accepted` + `operation_id`).
+  - `GET /_nexus/deploy/{operation_id}` (inspect reconciliation status and plan).
+  - `GET /_nexus/apps/{app_id}` (inspect reconciled `DeploymentRecord` and cell states).
+
+## 7. Semantic Deployment Profiles (`Cargo.toml`)
 - **`core`** *(default, 422 unique crates, 15.87 MB stripped)*: `runtime-wasm`, `db-auth`, `db-cbor` + `BlobBridge`/`CasStore` + `UxGateway` + `IAM` + `NexusMetrics`.
 - **`full`** *(1,161 unique crates)*: `core` + `runtime-all`, `db-all`, `net-all`, `storage-all`, `serve-all`, `ops-all`.
 - **Composable GUI:** `--features gui-all` (`gui-webview`) adds OS-autodetected native WebView (WebView2 / WKWebView / WebKitGTK / Android / iOS) to any profile.

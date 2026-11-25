@@ -701,6 +701,34 @@ impl UxGateway {
                 .delete(crate::ux::reverse_proxy::ReverseProxyHandler::from_env()),
         );
 
+        #[cfg(feature = "runtime-wasm")]
+        let router = router
+            .push(
+                Router::with_path("/_nexus/deploy")
+                    .hoop(gate.clone())
+                    .hoop(crate::ux::iam::IamMiddleware::authenticated(self.db.clone()))
+                    .post(DeploySubmitHandler {
+                        cells: self.cells.clone(),
+                        garage: self.garage.clone(),
+                    }),
+            )
+            .push(
+                Router::with_path("/_nexus/deploy/{operation_id}")
+                    .hoop(gate.clone())
+                    .hoop(crate::ux::iam::IamMiddleware::authenticated(self.db.clone()))
+                    .get(DeployOperationHandler {
+                        garage: self.garage.clone(),
+                    }),
+            )
+            .push(
+                Router::with_path("/_nexus/apps/{app_id}")
+                    .hoop(gate.clone())
+                    .hoop(crate::ux::iam::IamMiddleware::authenticated(self.db.clone()))
+                    .get(DeployedAppHandler {
+                        garage: self.garage.clone(),
+                    }),
+            );
+
         router
             
             // S3 Proxy (browser-friendly)
@@ -747,6 +775,161 @@ impl UxGateway {
     /// `self.reconcile_storage_on_boot().await?`.
     pub fn router(&self) -> Router {
         self.build_main_router()
+    }
+}
+
+#[cfg(feature = "runtime-wasm")]
+#[derive(Clone)]
+struct DeploySubmitHandler {
+    cells: Arc<CellManager>,
+    garage: Arc<BlobBridge>,
+}
+
+#[cfg(feature = "runtime-wasm")]
+#[async_trait]
+impl Handler for DeploySubmitHandler {
+    async fn handle(
+        &self,
+        req: &mut Request,
+        depot: &mut Depot,
+        res: &mut Response,
+        _ctrl: &mut FlowCtrl,
+    ) {
+        use crate::compute::manifest::{AppManifest, ManifestReconciler};
+        use crate::iam::capabilities::{Capability, CapabilitySet};
+
+        let auth = crate::ux::iam::depot_auth_context(depot);
+        let caller_caps = CapabilitySet::from_auth_context(auth.as_ref());
+        if !caller_caps.has(Capability::CellSpawn) {
+            crate::observability::global_metrics().inc_iam_auth_denial();
+            res.status_code(StatusCode::FORBIDDEN);
+            res.render(Json(serde_json::json!({
+                "error": "Missing required capability `cell.spawn` for /_nexus/deploy"
+            })));
+            return;
+        }
+
+        let Ok(raw_body) = req.payload_with_max_size(1024 * 1024).await else {
+            res.status_code(StatusCode::BAD_REQUEST);
+            res.render(Json(serde_json::json!({ "error": "Failed to read manifest body" })));
+            return;
+        };
+        let Ok(body_str) = std::str::from_utf8(raw_body) else {
+            res.status_code(StatusCode::BAD_REQUEST);
+            res.render(Json(serde_json::json!({ "error": "Manifest body must be valid UTF-8" })));
+            return;
+        };
+
+        let trimmed = body_str.trim();
+        let parsed = if trimmed.starts_with('{') {
+            AppManifest::from_json(trimmed)
+        } else {
+            AppManifest::from_toml(trimmed)
+        };
+        let manifest = match parsed {
+            Ok(m) => m,
+            Err(e) => {
+                res.status_code(StatusCode::BAD_REQUEST);
+                res.render(Json(serde_json::json!({ "error": e.to_string() })));
+                return;
+            }
+        };
+        let validated = match manifest.validate() {
+            Ok(v) => v,
+            Err(e) => {
+                res.status_code(StatusCode::UNPROCESSABLE_ENTITY);
+                res.render(Json(serde_json::json!({ "error": e.to_string() })));
+                return;
+            }
+        };
+
+        match ManifestReconciler::apply(
+            &self.cells,
+            &self.garage,
+            &validated,
+            &CapabilitySet::admin_all(),
+            auth.as_ref(),
+        )
+        .await
+        {
+            Ok(op) => {
+                res.status_code(StatusCode::ACCEPTED);
+                res.render(Json(op));
+            }
+            Err(e) => {
+                res.status_code(StatusCode::BAD_REQUEST);
+                res.render(Json(serde_json::json!({ "error": e.to_string() })));
+            }
+        }
+    }
+}
+
+#[cfg(feature = "runtime-wasm")]
+#[derive(Clone)]
+struct DeployOperationHandler {
+    garage: Arc<BlobBridge>,
+}
+
+#[cfg(feature = "runtime-wasm")]
+#[async_trait]
+impl Handler for DeployOperationHandler {
+    async fn handle(
+        &self,
+        req: &mut Request,
+        _depot: &mut Depot,
+        res: &mut Response,
+        _ctrl: &mut FlowCtrl,
+    ) {
+        let op_id = req.param::<String>("operation_id").unwrap_or_default();
+        match crate::compute::manifest::ManifestReconciler::get_operation(&self.garage, &op_id).await
+        {
+            Ok(Some(op)) => {
+                res.status_code(StatusCode::OK);
+                res.render(Json(op));
+            }
+            Ok(None) => {
+                res.status_code(StatusCode::NOT_FOUND);
+                res.render(Json(serde_json::json!({ "error": "Deployment operation not found" })));
+            }
+            Err(e) => {
+                res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+                res.render(Json(serde_json::json!({ "error": e.to_string() })));
+            }
+        }
+    }
+}
+
+#[cfg(feature = "runtime-wasm")]
+#[derive(Clone)]
+struct DeployedAppHandler {
+    garage: Arc<BlobBridge>,
+}
+
+#[cfg(feature = "runtime-wasm")]
+#[async_trait]
+impl Handler for DeployedAppHandler {
+    async fn handle(
+        &self,
+        req: &mut Request,
+        _depot: &mut Depot,
+        res: &mut Response,
+        _ctrl: &mut FlowCtrl,
+    ) {
+        let app_id = req.param::<String>("app_id").unwrap_or_default();
+        match crate::compute::manifest::ManifestReconciler::get_app(&self.garage, &app_id).await {
+            Ok(Some(rec)) => {
+                res.status_code(StatusCode::OK);
+                res.render(Json(rec));
+            }
+            Ok(None) => {
+                res.status_code(StatusCode::NOT_FOUND);
+                res.render(Json(serde_json::json!({ "error": "Application deployment not found" })));
+            }
+            Err(e) => {
+                res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+                res.render(Json(serde_json::json!({ "error": e.to_string() })));
+            }
+        }
     }
 }
 

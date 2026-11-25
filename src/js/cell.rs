@@ -63,7 +63,7 @@ pub enum CellDbMode {
 
 /// Unified per-cell declarative database configuration governing topology (`mode`),
 /// exposed query `flavors`, and allowed connection methods (`transports`).
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CellDbConfig {
     pub mode: CellDbMode,
     pub flavors: Vec<String>,

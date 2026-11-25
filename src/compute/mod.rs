@@ -18,6 +18,8 @@ pub mod crystal;
 pub mod wasm_registry;
 #[cfg(feature = "runtime-wasm")]
 pub mod wasm_db;
+#[cfg(feature = "runtime-wasm")]
+pub mod manifest;
 
 pub use telemetry::NodeResources;
 pub use router::{InferenceRouter, ComputeRequirements};
