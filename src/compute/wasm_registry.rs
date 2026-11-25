@@ -290,18 +290,53 @@ impl WasmRuntimeRegistry {
         Ok(())
     }
 
-    /// Explicitly uninstall a registered runtime from the durable catalog and remove its name aliases.
+    /// Crash-safe runtime uninstall:
+    /// 1. Atomically commits the updated catalog index FIRST via CAS (restoring in-memory state if CAS fails).
+    /// 2. Only AFTER the durable catalog transition succeeds, deletes alias keys and any unreferenced
+    ///    content-addressed CID blobs (preserving blobs still referenced by another runtime alias).
     pub async fn uninstall_runtime(&self, name: &str) -> Result<bool> {
         self.ensure_hydrated().await?;
         let norm = validate_runtime_name(name)?;
-        let removed = self.index.write().await.remove(&norm).is_some();
-        if removed {
-            let compat = current_aot_compat_key();
-            let _ = self.blobs.delete_object(RUNTIMES_BUCKET, &format!("raw/{}.wasm", norm)).await;
-            let _ = self.blobs.delete_object(RUNTIMES_BUCKET, &format!("aot/{}/{}.cwasm", compat, norm)).await;
-            self.persist_index().await?;
+        let removed_rec = self.index.write().await.remove(&norm);
+        let Some(rec) = removed_rec else {
+            return Ok(false);
+        };
+
+        // Step 1: Persist durable catalog transition FIRST
+        if let Err(e) = self.persist_index().await {
+            // Roll back in-memory removal on CAS/storage failure
+            self.index.write().await.insert(norm, rec);
+            return Err(e);
         }
-        Ok(removed)
+
+        // Step 2: Reclaim name aliases and unreferenced CID blobs ONLY after durable commit succeeded
+        let compat = current_aot_compat_key();
+        let _ = self
+            .blobs
+            .delete_object(RUNTIMES_BUCKET, &format!("raw/{}.wasm", norm))
+            .await;
+        let _ = self
+            .blobs
+            .delete_object(RUNTIMES_BUCKET, &format!("aot/{}/{}.cwasm", compat, norm))
+            .await;
+
+        let cid_still_referenced = self
+            .index
+            .read()
+            .await
+            .values()
+            .any(|other| other.cid == rec.cid);
+        if !cid_still_referenced {
+            let _ = self
+                .blobs
+                .delete_object(RUNTIMES_BUCKET, &format!("cid/{}", rec.cid))
+                .await;
+            let _ = self
+                .blobs
+                .delete_object(RUNTIMES_BUCKET, &format!("aot-cid/{}/{}.cwasm", compat, rec.cid))
+                .await;
+        }
+        Ok(true)
     }
 
     /// Register a `.wasm` or `.wat` guest runtime under `name` (e.g. `"quickjs"`, `"php-cgi"`, `"sqlite"`),

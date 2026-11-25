@@ -238,7 +238,8 @@ async fn cell_lifecycle_lease_conflict_and_runtime_trust_policy() {
     // 3. Persistent CellDbConfig survives full CellManager restart
     manager
         .set_db_config("billing", "ledger", CellDbConfig::stateless())
-        .await;
+        .await
+        .unwrap();
     let fresh_db = Arc::new(Database::open_mem());
     let fresh_mgr = CellManager::new(fresh_db, blobs);
     let restored_cfg = fresh_mgr.get_db_config("billing", "ledger").await;

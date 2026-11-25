@@ -375,24 +375,24 @@ impl CellManager {
         &self.runtimes
     }
 
-    /// Declare the modular `CellDbConfig` (mode, exposed flavors, and allowed connection transports)
-    /// for `(app, cell_id)` and persist it durably in `BlobBridge` so it survives process restarts.
-    pub async fn set_db_config(&self, app: &str, cell_id: &str, config: CellDbConfig) {
+    /// Transactionally declare and persist `CellDbConfig` for `(app, cell_id)`:
+    /// writes durably to `BlobBridge` FIRST and only updates in-memory state after persistence succeeds.
+    pub async fn set_db_config(&self, app: &str, cell_id: &str, config: CellDbConfig) -> Result<()> {
+        let _ = self.blobs.create_bucket("nexus-cells").await;
+        let json = serde_json::to_vec(&config)?;
+        let key = format!("meta/{}/{}.dbconfig.json", app, cell_id);
+        self.blobs
+            .put_object("nexus-cells", &key, bytes::Bytes::from(json))
+            .await?;
+
         self.db_configs.write().await.insert(
             CellKey {
                 app: app.to_string(),
                 cell_id: cell_id.to_string(),
             },
-            config.clone(),
+            config,
         );
-        let _ = self.blobs.create_bucket("nexus-cells").await;
-        if let Ok(json) = serde_json::to_vec(&config) {
-            let key = format!("meta/{}/{}.dbconfig.json", app, cell_id);
-            let _ = self
-                .blobs
-                .put_object("nexus-cells", &key, bytes::Bytes::from(json))
-                .await;
-        }
+        Ok(())
     }
 
     pub async fn get_db_config(&self, app: &str, cell_id: &str) -> CellDbConfig {
@@ -1548,7 +1548,8 @@ mod tests {
                 "cart_1",
                 CellDbConfig::wasm_engine("sqlite", &sql_rec.cid, "sqlite"),
             )
-            .await;
+            .await
+            .unwrap();
 
         let rows = manager
             .query_cell(

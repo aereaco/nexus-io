@@ -239,22 +239,26 @@ impl WasmDbMount {
                 )
             })?;
 
-            // Deterministic Rust-inspired ownership transfer: acquire new CIDs and immediately
-            // drop superseded blobs with zero remaining owners (no GC sweeps needed).
+            // Single-CAS atomic ownership transfer: propagate errors (never ignore bookkeeping failures)
             let owner_id = format!("wasmdb:{}/{}", app, cell_id);
             let prev_cids: std::collections::HashSet<String> =
                 prev_manifest.files.values().cloned().collect();
             let next_cids: std::collections::HashSet<String> =
                 next_manifest.files.values().cloned().collect();
-            let _ = cas
-                .transfer_manifest_ownership(
-                    WASM_DB_BUCKET,
-                    "blobs/",
-                    &owner_id,
-                    &prev_cids,
-                    &next_cids,
+            cas.transfer_manifest_ownership(
+                WASM_DB_BUCKET,
+                "blobs/",
+                &owner_id,
+                &prev_cids,
+                &next_cids,
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "Atomic ownership transfer failed for WasmDbFsManifest v{} ({}/{})",
+                    next_manifest.version, app, cell_id
                 )
-                .await;
+            })?;
             Ok(())
         }
         .await;

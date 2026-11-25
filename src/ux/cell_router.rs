@@ -354,7 +354,11 @@ impl Handler for CellGatewayHandler {
                 }
                 match req.parse_json::<crate::js::cell::CellDbConfig>().await {
                     Ok(cfg) => {
-                        self.cells.set_db_config(&app, &cell_id, cfg.clone()).await;
+                        if let Err(e) = self.cells.set_db_config(&app, &cell_id, cfg.clone()).await {
+                            res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+                            res.render(Text::Plain(format!("Failed to persist CellDbConfig: {}", e)));
+                            return;
+                        }
                         res.status_code(StatusCode::OK);
                         res.render(Json(serde_json::json!({
                             "app": app,
