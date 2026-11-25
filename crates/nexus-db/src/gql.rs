@@ -7,6 +7,28 @@ use crate::NexusDb;
 /// Translates ISO GQL `MATCH (a:table1)-[:edge]->(b:table2) [WHERE a.field = 'val'] RETURN b.field`
 /// directly onto `NexusDb`'s indexed graph traversal engine.
 pub fn execute_gql(db: &NexusDb, ns: &str, database: &str, query: &str) -> Result<Vec<Value>> {
+    execute_gql_inner(db, ns, database, query, None)
+}
+
+#[cfg(feature = "auth")]
+pub fn execute_gql_with_auth(
+    db: &NexusDb,
+    ns: &str,
+    database: &str,
+    query: &str,
+    auth: crate::auth::AuthContext,
+) -> Result<Vec<Value>> {
+    execute_gql_inner(db, ns, database, query, Some(auth))
+}
+
+fn execute_gql_inner(
+    db: &NexusDb,
+    ns: &str,
+    database: &str,
+    query: &str,
+    #[cfg(feature = "auth")] auth: Option<crate::auth::AuthContext>,
+    #[cfg(not(feature = "auth"))] _auth: Option<()>,
+) -> Result<Vec<Value>> {
     let q = query.trim().trim_end_matches(';').trim();
     let rest = q
         .strip_prefix("MATCH")
@@ -64,7 +86,18 @@ pub fn execute_gql(db: &NexusDb, ns: &str, database: &str, query: &str) -> Resul
         "SELECT VALUE ->{}->{}{} FROM {}{};",
         edge, dst_table, tail_field, src_table, where_sql
     );
-    let rows = db.query_scoped(ns, database, &surql, vec![])?;
+    let rows = {
+        #[cfg(feature = "auth")]
+        if let Some(ctx) = auth {
+            db.query_scoped_with_auth(ns, database, &surql, vec![], ctx)?
+        } else {
+            db.query_scoped(ns, database, &surql, vec![])?
+        }
+        #[cfg(not(feature = "auth"))]
+        {
+            db.query_scoped(ns, database, &surql, vec![])?
+        }
+    };
 
     // Flatten array of arrays returned by per-node traversal
     let mut flat = Vec::new();

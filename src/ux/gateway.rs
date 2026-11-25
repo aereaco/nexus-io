@@ -80,7 +80,8 @@ impl UxGateway {
             }));
         }
 
-        // Port 5432: PostgreSQL v3 Wire Protocol (`PgWireSession`)
+        // Port 5432: PostgreSQL v3 Wire Protocol (`PgWireSession`) — disabled by default
+        #[cfg(feature = "pgwire")]
         if self.config.enable_pgwire {
             let gateway = self.clone();
             handles.push(tokio::spawn(async move {
@@ -138,18 +139,37 @@ impl UxGateway {
         Ok(())
     }
 
-    /// Port 443: Primary HTTPS gateway
+    /// Primary gateway listener:
+    /// - Uses real Rustls HTTPS/TLS ONLY when `NEXUS_TLS_CERT` + `NEXUS_TLS_KEY` PEM files are configured.
+    /// - Otherwise runs an explicitly labeled plaintext dev HTTP listener on `127.0.0.1:8443` (or `NEXUS_HTTP_BIND`).
     async fn serve_https(&self) -> Result<(), Box<dyn std::error::Error>> {
         let router = self.build_main_router();
 
-        // TODO: Implement ACME once we have a domain
-        // For now, use self-signed cert or require manual cert
-        
-        println!("✅ HTTPS Gateway listening on 0.0.0.0:443");
-        println!("   Note: ACME/TLS not yet configured - manual cert required");
-        
-        // For development: just use HTTP on 8443
-        let acceptor = TcpListener::new("0.0.0.0:8443").bind().await;
+        if let (Ok(cert_path), Ok(key_path)) = (
+            std::env::var("NEXUS_TLS_CERT"),
+            std::env::var("NEXUS_TLS_KEY"),
+        ) {
+            let bind_addr =
+                std::env::var("NEXUS_HTTPS_BIND").unwrap_or_else(|_| "0.0.0.0:443".to_string());
+            let cert = std::fs::read(&cert_path)?;
+            let key = std::fs::read(&key_path)?;
+            let config = salvo::conn::rustls::RustlsConfig::new(
+                salvo::conn::rustls::Keycert::new().cert(cert).key(key),
+            );
+            let acceptor = TcpListener::new(bind_addr.clone()).rustls(config).bind().await;
+            println!("🔒 HTTPS/TLS Gateway listening on https://{}", bind_addr);
+            Server::new(acceptor).serve(router).await;
+            return Ok(());
+        }
+
+        let dev_bind =
+            std::env::var("NEXUS_HTTP_BIND").unwrap_or_else(|_| "127.0.0.1:8443".to_string());
+        println!(
+            "⚠️  Dev HTTP Gateway (TLS DISABLED — plaintext) listening on http://{}",
+            dev_bind
+        );
+        println!("   Set NEXUS_TLS_CERT and NEXUS_TLS_KEY to enable real HTTPS/TLS.");
+        let acceptor = TcpListener::new(dev_bind).bind().await;
         Server::new(acceptor).serve(router).await;
 
         Ok(())
@@ -170,42 +190,93 @@ impl UxGateway {
     }
 
     /// Port 5432 (configurable): PostgreSQL v3 Wire Protocol TCP listener (`psql`, `pg`, Prisma, Drizzle).
+    /// Binds loopback (`127.0.0.1`) by default, handles `SSLRequest`, enforces `AuthenticationCleartextPassword`
+    /// backed by `nexus-db` RBAC, and uses streaming length-prefixed TCP framing.
+    #[cfg(feature = "pgwire")]
     async fn serve_pgwire(&self) -> Result<(), Box<dyn std::error::Error>> {
+        use nexus_db::pgwire::{PgWireSession, StartupPacket};
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let addr = format!("0.0.0.0:{}", self.config.pgwire_port);
+
+        let bind_host =
+            std::env::var("NEXUS_PGWIRE_BIND").unwrap_or_else(|_| "127.0.0.1".to_string());
+        let addr = format!("{}:{}", bind_host, self.config.pgwire_port);
+        let trust_local = std::env::var("NEXUS_PGWIRE_TRUST_LOCAL").as_deref() == Ok("1");
         let listener = tokio::net::TcpListener::bind(&addr).await?;
-        println!("🐘 PostgreSQL v3 Wire Protocol (PgWire) listening on {}", addr);
+        println!(
+            "🐘 PostgreSQL v3 Wire Protocol (PgWire) listening on {} (auth: {})",
+            addr,
+            if trust_local { "trust-local" } else { "password-required" }
+        );
 
         loop {
             let (mut socket, _) = listener.accept().await?;
             let db = self.db.clone();
             tokio::spawn(async move {
-                let mut buf = vec![0u8; 65_536];
-                // Read startup packet
-                let Ok(n) = socket.read(&mut buf).await else { return; };
-                if n == 0 {
-                    return;
-                }
-                let mut pg = db.inner.pgwire_session("nexus", "system");
+                let mut stream_buf: Vec<u8> = Vec::with_capacity(8192);
+                let mut chunk = [0u8; 4096];
+
+                // 1. Read & parse PG v3 startup packet (handling optional SSLRequest first)
+                let (ns, database, user) = loop {
+                    match PgWireSession::parse_startup_packet(&stream_buf) {
+                        Ok(Some((consumed, StartupPacket::SslRequest))) => {
+                            stream_buf.drain(..consumed);
+                            if socket.write_all(b"N").await.is_err() {
+                                return;
+                            }
+                        }
+                        Ok(Some((consumed, StartupPacket::Startup { user, database, ns, .. }))) => {
+                            stream_buf.drain(..consumed);
+                            break (ns, database, user);
+                        }
+                        Ok(None) => {
+                            let Ok(n) = socket.read(&mut chunk).await else { return; };
+                            if n == 0 {
+                                return;
+                            }
+                            stream_buf.extend_from_slice(&chunk[..n]);
+                        }
+                        Err(_) => return,
+                    }
+                };
+
+                let mut pg = if trust_local {
+                    PgWireSession::new(db.inner.clone(), ns, database)
+                } else {
+                    PgWireSession::new_authenticated(db.inner.clone(), ns, database, user)
+                };
+
                 if socket.write_all(&pg.startup_response()).await.is_err() {
                     return;
                 }
+
+                // 2. Streaming length-prefixed PG v3 message loop (handles fragmented & coalesced TCP reads)
                 loop {
-                    let Ok(read_n) = socket.read(&mut buf).await else { break; };
-                    if read_n == 0 {
-                        break;
-                    }
-                    match pg.handle_frame(&buf[..read_n]) {
-                        Ok(reply) => {
-                            if !reply.is_empty() && socket.write_all(&reply).await.is_err() {
-                                break;
+                    loop {
+                        match PgWireSession::extract_next_frame(&mut stream_buf) {
+                            Ok(Some(frame)) => {
+                                let is_terminate = frame.first() == Some(&b'X');
+                                match pg.handle_frame(&frame) {
+                                    Ok(reply) => {
+                                        if !reply.is_empty() && socket.write_all(&reply).await.is_err() {
+                                            return;
+                                        }
+                                        if is_terminate {
+                                            return;
+                                        }
+                                    }
+                                    Err(_) => return,
+                                }
                             }
-                            if buf[0] == b'X' {
-                                break;
-                            }
+                            Ok(None) => break,
+                            Err(_) => return,
                         }
-                        Err(_) => break,
                     }
+
+                    let Ok(n) = socket.read(&mut chunk).await else { return; };
+                    if n == 0 {
+                        return;
+                    }
+                    stream_buf.extend_from_slice(&chunk[..n]);
                 }
             });
         }
@@ -256,7 +327,7 @@ impl UxGateway {
 
     /// Build the main application router
     fn build_main_router(&self) -> Router {
-        Router::new()
+        let router = Router::new()
             // Static PWA files
             .push(Router::with_path("/").get(serve_static))
             
@@ -296,16 +367,11 @@ impl UxGateway {
             .push(Router::with_path("/status").get(crate::ux::surreal_http::surreal_status))
             .push(Router::with_path("/ready").get(crate::ux::surreal_http::surreal_ready))
             .push(Router::with_path("/version").get(crate::ux::surreal_http::surreal_version))
-            // Unified External Multi-Flavor Query API (`POST /query`, `POST /graphql`, `POST /cells/:app/:cell_id/query`)
+            // Unified External Multi-Flavor Query API (`POST /query`, `POST /cells/:app/:cell_id/query`)
             .push(Router::with_path("/query").post(crate::ux::surreal_http::UnifiedQueryHandler {
                 db: self.db.clone(),
                 cells: self.cells.clone(),
                 default_flavor: "surql",
-            }))
-            .push(Router::with_path("/graphql").post(crate::ux::surreal_http::UnifiedQueryHandler {
-                db: self.db.clone(),
-                cells: self.cells.clone(),
-                default_flavor: "graphql",
             }))
             .push(Router::with_path("/cells/<app:str>/<cell_id:str>/query").post(
                 crate::ux::surreal_http::UnifiedQueryHandler {
@@ -314,10 +380,26 @@ impl UxGateway {
                     default_flavor: "surql",
                 },
             ))
-            // LibSQL / Turso Hrana SQLite HTTP pipeline & multi-node WAL replication transport
-            .push(Router::with_path("/v2/pipeline").post(crate::ux::surreal_http::SqliteHranaHandler { db: self.db.clone() }))
+            // Multi-node WAL replication transport
             .push(Router::with_path("/_nexus/wal/entries").get(crate::ux::surreal_http::WalReplicationHandler { db: self.db.clone(), is_apply: false }))
-            .push(Router::with_path("/_nexus/wal/apply").post(crate::ux::surreal_http::WalReplicationHandler { db: self.db.clone(), is_apply: true }))
+            .push(Router::with_path("/_nexus/wal/apply").post(crate::ux::surreal_http::WalReplicationHandler { db: self.db.clone(), is_apply: true }));
+
+        #[cfg(feature = "graphql")]
+        let router = router.push(Router::with_path("/graphql").post(
+            crate::ux::surreal_http::UnifiedQueryHandler {
+                db: self.db.clone(),
+                cells: self.cells.clone(),
+                default_flavor: "graphql",
+            },
+        ));
+
+        #[cfg(feature = "sqlite-hrana")]
+        let router = router.push(
+            Router::with_path("/v2/pipeline")
+                .post(crate::ux::surreal_http::SqliteHranaHandler { db: self.db.clone() }),
+        );
+
+        router
             
             // S3 Proxy (browser-friendly)
             .push({

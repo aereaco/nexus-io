@@ -7,6 +7,28 @@ use crate::NexusDb;
 /// translating GraphQL queries directly into `NexusDb` SurrealQL queries.
 /// Supports: `{ table { field1 field2 } }` and `query { table(limit: 5) { id name } }`.
 pub fn execute_graphql(db: &NexusDb, ns: &str, database: &str, query: &str) -> Result<JsonValue> {
+    execute_graphql_inner(db, ns, database, query, None)
+}
+
+#[cfg(feature = "auth")]
+pub fn execute_graphql_with_auth(
+    db: &NexusDb,
+    ns: &str,
+    database: &str,
+    query: &str,
+    auth: crate::auth::AuthContext,
+) -> Result<JsonValue> {
+    execute_graphql_inner(db, ns, database, query, Some(auth))
+}
+
+fn execute_graphql_inner(
+    db: &NexusDb,
+    ns: &str,
+    database: &str,
+    query: &str,
+    #[cfg(feature = "auth")] auth: Option<crate::auth::AuthContext>,
+    #[cfg(not(feature = "auth"))] _auth: Option<()>,
+) -> Result<JsonValue> {
     let trimmed = query.trim();
     let body = trimmed
         .strip_prefix("query")
@@ -53,7 +75,18 @@ pub fn execute_graphql(db: &NexusDb, ns: &str, database: &str, query: &str) -> R
     };
 
     let surql = format!("SELECT {} FROM {}{};", proj, table, limit_clause);
-    let rows = db.query_scoped(ns, database, &surql, vec![])?;
+    let rows = {
+        #[cfg(feature = "auth")]
+        if let Some(ctx) = auth {
+            db.query_scoped_with_auth(ns, database, &surql, vec![], ctx)?
+        } else {
+            db.query_scoped(ns, database, &surql, vec![])?
+        }
+        #[cfg(not(feature = "auth"))]
+        {
+            db.query_scoped(ns, database, &surql, vec![])?
+        }
+    };
     let json_rows: Vec<JsonValue> = rows.iter().map(|r| r.to_json()).collect();
 
     Ok(json!({

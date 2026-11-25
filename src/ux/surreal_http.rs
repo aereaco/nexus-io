@@ -59,9 +59,32 @@ fn extract_ns_db(req: &Request) -> (String, String) {
     (ns, db)
 }
 
-fn resolve_http_auth(req: &Request, db: &Database, ns: &str, database: &str) -> Result<Option<AuthContext>, String> {
+fn is_loopback_addr(req: &Request) -> bool {
+    let addr = req.remote_addr().to_string();
+    addr.contains("127.0.0.1") || addr.contains("::1") || addr.contains("localhost")
+}
+
+/// Resolve and enforce HTTP authentication for all data/query endpoints.
+///
+/// Explicit security boundary:
+/// - `Authorization: Bearer <jwt|bearer>` or `Basic <base64>` is ALWAYS verified via `nexus-db`.
+/// - Missing `Authorization` is REJECTED (`401 Unauthorized`) by default.
+/// - Unauthenticated local dev access is ONLY permitted when BOTH `NEXUS_ALLOW_UNAUTH_LOCAL=1`
+///   AND the request originates from loopback (`127.0.0.1` / `::1`).
+fn resolve_http_auth(
+    req: &Request,
+    db: &Database,
+    ns: &str,
+    database: &str,
+) -> Result<Option<AuthContext>, String> {
     let Some(header) = req.headers().get("authorization").and_then(|v| v.to_str().ok()) else {
-        return Ok(None); // Local trusted embedded mode when no auth header is sent
+        if std::env::var("NEXUS_ALLOW_UNAUTH_LOCAL").as_deref() == Ok("1") && is_loopback_addr(req) {
+            return Ok(None);
+        }
+        return Err(
+            "Authentication required (provide Authorization: Bearer <token> or Basic <creds>; for local dev set NEXUS_ALLOW_UNAUTH_LOCAL=1)"
+                .to_string(),
+        );
     };
     if let Some(bearer) = header.strip_prefix("Bearer ").or_else(|| header.strip_prefix("bearer ")) {
         return db
@@ -259,6 +282,19 @@ pub struct SurrealExportImportHandler {
 impl Handler for SurrealExportImportHandler {
     async fn handle(&self, req: &mut Request, _depot: &mut Depot, res: &mut Response, _ctrl: &mut FlowCtrl) {
         let (ns, database) = extract_ns_db(req);
+        match resolve_http_auth(req, &self.db, &ns, &database) {
+            Ok(Some(ctx)) if !ctx.can_admin_iam(&ns, &database) => {
+                res.status_code(StatusCode::FORBIDDEN);
+                res.render(Json(json!({ "code": 403, "details": "OWNER role required for export/import" })));
+                return;
+            }
+            Ok(_) => {}
+            Err(msg) => {
+                res.status_code(StatusCode::UNAUTHORIZED);
+                res.render(Json(json!({ "code": 401, "details": msg })));
+                return;
+            }
+        }
         if self.is_import {
             let dump = match req.payload().await {
                 Ok(b) => String::from_utf8_lossy(b).to_string(),
@@ -500,15 +536,22 @@ impl Handler for UnifiedQueryHandler {
 }
 
 /// `POST /v2/pipeline` — LibSQL / Turso Hrana HTTP SQLite pipeline endpoint backed by `nexus-db`.
+#[cfg(feature = "sqlite-hrana")]
 #[derive(Clone)]
 pub struct SqliteHranaHandler {
     pub db: Arc<Database>,
 }
 
+#[cfg(feature = "sqlite-hrana")]
 #[async_trait]
 impl Handler for SqliteHranaHandler {
     async fn handle(&self, req: &mut Request, _depot: &mut Depot, res: &mut Response, _ctrl: &mut FlowCtrl) {
         let (ns, database) = extract_ns_db(req);
+        if let Err(msg) = resolve_http_auth(req, &self.db, &ns, &database) {
+            res.status_code(StatusCode::UNAUTHORIZED);
+            res.render(Json(json!({ "code": 401, "details": msg })));
+            return;
+        }
         let body: JsonValue = match req.parse_json().await {
             Ok(v) => v,
             Err(e) => {
@@ -535,6 +578,20 @@ pub struct WalReplicationHandler {
 #[async_trait]
 impl Handler for WalReplicationHandler {
     async fn handle(&self, req: &mut Request, _depot: &mut Depot, res: &mut Response, _ctrl: &mut FlowCtrl) {
+        let (ns, database) = extract_ns_db(req);
+        match resolve_http_auth(req, &self.db, &ns, &database) {
+            Ok(Some(ctx)) if !ctx.can_admin_iam(&ns, &database) => {
+                res.status_code(StatusCode::FORBIDDEN);
+                res.render(Json(json!({ "code": 403, "details": "OWNER role required for WAL replication" })));
+                return;
+            }
+            Ok(_) => {}
+            Err(msg) => {
+                res.status_code(StatusCode::UNAUTHORIZED);
+                res.render(Json(json!({ "code": 401, "details": msg })));
+                return;
+            }
+        }
         if self.is_apply {
             let entries: Vec<nexus_db::replication::WalEntry> = match req.parse_json().await {
                 Ok(v) => v,

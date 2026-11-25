@@ -29,6 +29,13 @@ profile-app = [
     "profile-core",
     "p2p-storage",
     "s3-gateway",
+    "sqlite-hrana",
+    "graphql",
+    "gql",
+    "pgwire",
+    "salvo/acme",
+    "salvo/quinn",
+    "salvo/oapi",
     "nexus-db/fts",
     "nexus-db/vector",
     "nexus-db/files",
@@ -92,6 +99,10 @@ gateway = []
 js-runtime = []
 cells = []
 iam = []
+sqlite-hrana = ["nexus-db/sqlite"]
+graphql = ["nexus-db/graphql"]
+gql = ["nexus-db/gql"]
+pgwire = ["nexus-db/pgwire"]
 p2p-storage = ["dep:iroh", "dep:iroh-blobs"]
 s3-gateway = ["dep:s3s"]
 shell = ["dep:nu-cli", "dep:rustyline"]
@@ -104,10 +115,10 @@ surrealdb-ref = ["dep:surrealdb"]
 
 [dependencies]
 # 1. The Mind (State — MIT-licensed nexus-db by default; optional surrealdb-ref for differential tests)
-nexus-db = { path = "crates/nexus-db", default-features = false, features = ["auth", "cbor", "sqlite", "graphql", "gql", "pgwire"] }
+nexus-db = { path = "crates/nexus-db", default-features = false, features = ["auth", "cbor"] }
 surrealdb = { version = "4.0.1", optional = true, default-features = false, features = ["kv-mem"] }
 sqlparser = "0.64.0"
-tokio = { version = "1.0", features = ["full"] }
+tokio = { version = "1.0", features = ["rt-multi-thread", "net", "io-util", "sync", "time", "fs", "macros", "signal"] }
 
 # 2. The Nerves (Logic/Shell)
 nu-engine = "0.117.0"
@@ -137,8 +148,8 @@ iroh-blobs = { version = "0.104.1", optional = true }
 # WireGuard - Zero-Trust VPN Mesh (optional behind `vpn`)
 boringtun = { version = "0.7.1", optional = true }
 
-# Networking & UX Gateway (Salvo)
-salvo = { version = "1.1.1", features = ["acme", "quinn", "rustls", "websocket", "oapi"] }
+# Networking & UX Gateway (Salvo — lean Core default; QUIC/ACME/OpenAPI enabled in profile-app+)
+salvo = { version = "1.1.1", features = ["rustls", "websocket"] }
 
 # Networking & Async Utils
 tokio-util = { version = "0.7", features = ["codec"] }

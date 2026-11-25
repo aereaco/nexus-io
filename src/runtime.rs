@@ -54,8 +54,10 @@ impl CapabilityRegistry {
         };
 
         reg("database", true);
-        reg("pgwire", true);
-        reg("sqlite-hrana", true);
+        reg("pgwire", cfg!(feature = "pgwire"));
+        reg("sqlite-hrana", cfg!(feature = "sqlite-hrana"));
+        reg("graphql", cfg!(feature = "graphql"));
+        reg("gql", cfg!(feature = "gql"));
         reg("unified-multi-flavor-query", true);
         reg("gateway", true);
         reg("js-runtime", true);

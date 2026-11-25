@@ -386,9 +386,17 @@ pub fn execute_unified_query(
                 rows.iter().map(DbValue::to_json).collect(),
             ))
         }
-        "graphql" => db.graphql(ns, db_name, query),
+        #[cfg(feature = "graphql")]
+        "graphql" => match auth {
+            Some(ctx) => db.graphql_with_auth(ns, db_name, query, ctx),
+            None => db.graphql(ns, db_name, query),
+        },
+        #[cfg(feature = "gql")]
         "gql" => {
-            let rows = db.gql(ns, db_name, query)?;
+            let rows = match auth {
+                Some(ctx) => db.gql_with_auth(ns, db_name, query, ctx)?,
+                None => db.gql(ns, db_name, query)?,
+            };
             Ok(serde_json::Value::Array(
                 rows.iter().map(DbValue::to_json).collect(),
             ))
@@ -457,7 +465,7 @@ mod tests {
         .unwrap();
         assert_eq!(my_rows[0]["name"], "Alice");
 
-        // 4. SurrealQL RELATE + GraphQL + ISO GQL on the exact same cell DB
+        // 4. SurrealQL RELATE (+ GraphQL & ISO GQL when compiled in profile-app / profile-full)
         execute_unified_query(
             &db,
             "app1",
@@ -468,29 +476,35 @@ mod tests {
             None,
         )
         .unwrap();
-        let gql = execute_unified_query(
-            &db,
-            "app1",
-            "cell1",
-            "gql",
-            "MATCH (x:person)-[:mentors]->(y:person) WHERE x.name = 'Ada' RETURN y.name",
-            vec![],
-            None,
-        )
-        .unwrap();
-        assert_eq!(gql[0], "Grace");
+        #[cfg(feature = "gql")]
+        {
+            let gql = execute_unified_query(
+                &db,
+                "app1",
+                "cell1",
+                "gql",
+                "MATCH (x:person)-[:mentors]->(y:person) WHERE x.name = 'Ada' RETURN y.name",
+                vec![],
+                None,
+            )
+            .unwrap();
+            assert_eq!(gql[0], "Grace");
+        }
 
-        let graphql = execute_unified_query(
-            &db,
-            "app1",
-            "cell1",
-            "graphql",
-            "{ person { name } }",
-            vec![],
-            None,
-        )
-        .unwrap();
-        assert!(graphql["data"]["person"].is_array());
+        #[cfg(feature = "graphql")]
+        {
+            let graphql = execute_unified_query(
+                &db,
+                "app1",
+                "cell1",
+                "graphql",
+                "{ person { name } }",
+                vec![],
+                None,
+            )
+            .unwrap();
+            assert!(graphql["data"]["person"].is_array());
+        }
     }
 
     #[test]

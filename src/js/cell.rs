@@ -131,8 +131,9 @@ impl CellManager {
         Ok(())
     }
 
-    /// Ensure a cell is awake (hydrating any hibernated snapshot from blob storage if needed)
-    /// before executing an external multi-flavor query against `(app, cell_id)`.
+    /// Ensure a cell is awake (acquiring its CAS lease, hydrating any hibernated snapshot from
+    /// the default `nexus-cells` bucket, and registering it in `self.active`) before executing
+    /// an external multi-flavor query against `(app, cell_id)`.
     pub async fn ensure_awake(&self, app: &str, cell_id: &str) -> Result<()> {
         let key = CellKey {
             app: app.to_string(),
@@ -142,12 +143,8 @@ impl CellManager {
             existing.last_active = Instant::now();
             return Ok(());
         }
-        // Best-effort hydration from default `cells` snapshot bucket if previously hibernated
-        let snap_key = format!("snapshots/{}/{}.json", app, cell_id);
-        if let Ok(Some(snap)) = self.blobs.get_object("cells", &snap_key).await {
-            let _ = self.engine.import_snapshot(app, cell_id, snap).await;
-        }
-        Ok(())
+        self.wake(app, cell_id, CellPolicy::elastic_default(), String::new())
+            .await
     }
 
     /// Execute a request/expression inside the scoped cell with `ctx.storage.sql`, `ctx.storage` KV,
@@ -204,28 +201,40 @@ impl CellManager {
         })
     }
 
-    /// Hibernate an `Elastic` cell: flush snapshot to `BlobBridge`, release CAS lease, and evict from RAM.
+    /// Transactionally hibernate an `Elastic` cell:
+    /// 1. Keep the cell registered in `self.active` until snapshot export & durable blob write succeed.
+    /// 2. Only after durable persistence succeeds, verify lease ownership, release the lease, and evict from RAM.
     pub async fn hibernate(&self, app: &str, cell_id: &str) -> Result<()> {
         let key = CellKey {
             app: app.to_string(),
             cell_id: cell_id.to_string(),
         };
 
-        let removed = self.active.write().await.remove(&key);
-        let Some(cell) = removed else {
-            return Ok(());
+        let (policy, lease_etag) = {
+            let map = self.active.read().await;
+            let Some(cell) = map.get(&key) else {
+                return Ok(());
+            };
+            (cell.policy.clone(), cell.lease_etag.clone())
         };
 
-        if let CellPolicy::Elastic { lease_bucket, .. } = &cell.policy {
+        if let CellPolicy::Elastic { lease_bucket, .. } = &policy {
             let snapshot = self.engine.export_snapshot(app, cell_id).await?;
             let snap_key = format!("snapshots/{}/{}.json", app, cell_id);
             self.blobs.put_object(lease_bucket, &snap_key, snapshot).await?;
 
-            if cell.lease_etag.is_some() {
+            // Release lease only after verifying we still own the matching ETag
+            if let Some(expected_etag) = lease_etag {
                 let lease_key = format!("leases/{}/{}.lease", app, cell_id);
-                let _ = self.blobs.delete_object(lease_bucket, &lease_key).await;
+                if let Ok(Some(meta)) = self.blobs.head_object(lease_bucket, &lease_key).await {
+                    if meta.etag == expected_etag {
+                        let _ = self.blobs.delete_object(lease_bucket, &lease_key).await;
+                    }
+                }
             }
         }
+
+        self.active.write().await.remove(&key);
         Ok(())
     }
 

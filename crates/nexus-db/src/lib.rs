@@ -138,6 +138,18 @@ impl NexusDb {
         crate::gql::execute_gql(self, ns, db, query)
     }
 
+    /// Execute an ISO GQL query with explicit RBAC enforcement (`feature = "gql"` + `"auth"`).
+    #[cfg(all(feature = "gql", feature = "auth"))]
+    pub fn gql_with_auth(
+        &self,
+        ns: &str,
+        db: &str,
+        query: &str,
+        auth: crate::auth::AuthContext,
+    ) -> Result<Vec<Value>> {
+        crate::gql::execute_gql_with_auth(self, ns, db, query, auth)
+    }
+
     /// Create a PostgreSQL v3 Wire Protocol session (`feature = "pgwire"`).
     #[cfg(feature = "pgwire")]
     pub fn pgwire_session(&self, ns: &str, db: &str) -> crate::pgwire::PgWireSession {
@@ -154,6 +166,18 @@ impl NexusDb {
     #[cfg(feature = "graphql")]
     pub fn graphql(&self, ns: &str, db: &str, query: &str) -> Result<serde_json::Value> {
         crate::graphql::execute_graphql(self, ns, db, query)
+    }
+
+    /// Execute a GraphQL query with explicit RBAC enforcement (`feature = "graphql"` + `"auth"`).
+    #[cfg(all(feature = "graphql", feature = "auth"))]
+    pub fn graphql_with_auth(
+        &self,
+        ns: &str,
+        db: &str,
+        query: &str,
+        auth: crate::auth::AuthContext,
+    ) -> Result<serde_json::Value> {
+        crate::graphql::execute_graphql_with_auth(self, ns, db, query, auth)
     }
 
     /// Register a SurrealML-compatible linear model (`feature = "ml"`).
@@ -1643,6 +1667,78 @@ mod tests {
         assert_eq!(
             pipe["results"][2]["response"]["result"]["rows"][0][0]["value"],
             "hello-hrana"
+        );
+    }
+
+    #[cfg(all(feature = "pgwire", feature = "graphql", feature = "gql", feature = "auth"))]
+    #[test]
+    fn pgwire_password_auth_tcp_framing_and_graphql_gql_rbac() {
+        let db = NexusDb::open_mem();
+        db.query_scoped(
+            "pgsec",
+            "app",
+            "DEFINE USER viewer_u ON DATABASE PASSWORD 'vpass' ROLES VIEWER;
+             CREATE item:1 SET name = 'secret';
+             CREATE p:1 SET name = 'Ada'; CREATE p:2 SET name = 'Grace';
+             RELATE p:1->knows->p:2;",
+            vec![],
+        )
+        .unwrap();
+
+        // 1. PgWire authenticated session requires PasswordMessage ('p') before 'Q'
+        let mut pg = crate::pgwire::PgWireSession::new_authenticated(
+            db.clone(),
+            "pgsec",
+            "app",
+            "viewer_u",
+        );
+        let hs = pg.startup_response();
+        assert_eq!(hs[0], b'R');
+        assert_eq!(i32::from_be_bytes([hs[5], hs[6], hs[7], hs[8]]), 3); // AuthenticationCleartextPassword
+
+        // Unauthenticated query rejected
+        let q_unauth = crate::pgwire::PgWireSession::encode_query_frame("SELECT * FROM item;");
+        let r_unauth = pg.handle_frame(&q_unauth).unwrap();
+        assert_eq!(r_unauth[0], b'E');
+
+        // Wrong password rejected
+        let p_bad = crate::pgwire::PgWireSession::encode_password_frame("wrong");
+        let r_bad = pg.handle_frame(&p_bad).unwrap();
+        assert_eq!(r_bad[0], b'E');
+        assert!(!pg.authenticated);
+
+        // Correct password succeeds + streaming TCP framing extracts coalesced frames
+        let p_ok = crate::pgwire::PgWireSession::encode_password_frame("vpass");
+        let q_read = crate::pgwire::PgWireSession::encode_query_frame("SELECT name FROM item:1;");
+        let q_write = crate::pgwire::PgWireSession::encode_query_frame("CREATE item:2 SET name = 'blocked';");
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&p_ok);
+        stream.extend_from_slice(&q_read);
+        stream.extend_from_slice(&q_write);
+
+        let f1 = crate::pgwire::PgWireSession::extract_next_frame(&mut stream).unwrap().unwrap();
+        let r1 = pg.handle_frame(&f1).unwrap();
+        assert_eq!(r1[0], b'R');
+        assert!(pg.authenticated);
+
+        let f2 = crate::pgwire::PgWireSession::extract_next_frame(&mut stream).unwrap().unwrap();
+        let r2 = pg.handle_frame(&f2).unwrap();
+        assert_eq!(r2[0], b'T'); // VIEWER read succeeds
+
+        let f3 = crate::pgwire::PgWireSession::extract_next_frame(&mut stream).unwrap().unwrap();
+        let r3 = pg.handle_frame(&f3).unwrap();
+        assert_eq!(r3[0], b'E'); // VIEWER write rejected by RBAC!
+
+        // 2. GraphQL & ISO GQL enforce RBAC via graphql_with_auth / gql_with_auth
+        let anon = crate::auth::AuthContext::anonymous();
+        assert!(db.graphql_with_auth("pgsec", "app", "{ item { name } }", anon.clone()).is_err());
+        assert!(db.gql_with_auth("pgsec", "app", "MATCH (a:p)-[:knows]->(b:p) RETURN b.name", anon).is_err());
+
+        let (_, viewer_ctx) = db.signin_user("pgsec", "app", "viewer_u", "vpass").unwrap();
+        assert!(db.graphql_with_auth("pgsec", "app", "{ item { name } }", viewer_ctx.clone()).is_ok());
+        assert_eq!(
+            db.gql_with_auth("pgsec", "app", "MATCH (a:p)-[:knows]->(b:p) RETURN b.name", viewer_ctx).unwrap(),
+            vec![Value::String("Grace".into())]
         );
     }
 }
