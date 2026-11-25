@@ -1,3 +1,56 @@
+pub mod cell;
+#[cfg(feature = "shell")]
+pub mod command;
+pub mod transformer;
+pub mod wintercg;
+
+/// Direct `nexus_db::Value` -> `quickrs_core::value::Value` conversion (no `serde_json` hop).
+#[cfg(feature = "js-native")]
+pub(crate) fn surreal_to_js(
+    ctx: &mut quickrs_core::context::Context,
+    val: nexus_db::Value,
+) -> quickrs_core::value::Value {
+    use quickrs_core::object::{PropFlags, Property};
+    use quickrs_core::value::{PropKey, Value as JsValue};
+
+    match val {
+        nexus_db::Value::None | nexus_db::Value::Null => JsValue::Null,
+        nexus_db::Value::Bool(b) => JsValue::Bool(b),
+        nexus_db::Value::Int(i) => {
+            if let Ok(i32_val) = i32::try_from(i) {
+                JsValue::Int(i32_val)
+            } else {
+                JsValue::Float(i as f64)
+            }
+        }
+        nexus_db::Value::Float(f) => JsValue::Float(f),
+        nexus_db::Value::String(s)
+        | nexus_db::Value::DateTime(s)
+        | nexus_db::Value::Decimal(s) => JsValue::Str(ctx.intern(&s)),
+        nexus_db::Value::Duration(secs) => JsValue::Str(ctx.intern(&format!("{}s", secs))),
+        nexus_db::Value::RecordId { tb, id } => {
+            JsValue::Str(ctx.intern(&format!("{}:{}", tb, id)))
+        }
+        nexus_db::Value::Array(arr) => {
+            let items: Vec<JsValue> = arr.into_iter().map(|v| surreal_to_js(ctx, v)).collect();
+            JsValue::Object(ctx.new_array_from(items))
+        }
+        nexus_db::Value::Object(map) => {
+            let obj = ctx.new_object();
+            for (k, v) in map {
+                let key = PropKey::from_string(&ctx.intern(&k));
+                let js_v = surreal_to_js(ctx, v);
+                ctx.define_own(&obj, key, Property::data(js_v, PropFlags::C_W_E));
+            }
+            JsValue::Object(obj)
+        }
+        other => JsValue::Str(ctx.intern(&format!("{:?}", other))),
+    }
+}
+
+#[cfg(feature = "shell")]
+mod client {
+use super::{surreal_to_js, transformer};
 use quickrs_core::ast::SourceType as JsSourceType;
 use quickrs_core::context::Context;
 use quickrs_core::object::{ClassId, ObjectData, PropFlags, PropValue, Property};
@@ -10,11 +63,6 @@ use std::sync::{
 use std::thread;
 
 use crate::db::Database;
-
-pub mod cell;
-pub mod command;
-pub mod transformer;
-pub mod wintercg;
 
 #[derive(Clone)]
 pub struct JsClient {
@@ -122,7 +170,7 @@ impl JsClient {
 
 fn eval_code(context: &mut Context, mut code: String, span: Span) -> Result<NuValue, ShellError> {
     if transformer::is_likely_ts(&code) {
-        if let Ok(transpiled) = transformer::transform_ts_to_js(&code, span) {
+        if let Ok(transpiled) = transformer::transform_ts_to_js(&code) {
             code = transpiled;
         }
     }
@@ -232,43 +280,6 @@ fn nexus_sql_callback(
     }
 }
 
-/// Direct `nexus_db::Value` -> `quickrs_core::value::Value` conversion (no `serde_json` hop).
-fn surreal_to_js(ctx: &mut Context, val: nexus_db::Value) -> JsValue {
-    match val {
-        nexus_db::Value::None | nexus_db::Value::Null => JsValue::Null,
-        nexus_db::Value::Bool(b) => JsValue::Bool(b),
-        nexus_db::Value::Int(i) => {
-            if let Ok(i32_val) = i32::try_from(i) {
-                JsValue::Int(i32_val)
-            } else {
-                JsValue::Float(i as f64)
-            }
-        }
-        nexus_db::Value::Float(f) => JsValue::Float(f),
-        nexus_db::Value::String(s)
-        | nexus_db::Value::DateTime(s)
-        | nexus_db::Value::Decimal(s) => JsValue::Str(ctx.intern(&s)),
-        nexus_db::Value::Duration(secs) => JsValue::Str(ctx.intern(&format!("{}s", secs))),
-        nexus_db::Value::RecordId { tb, id } => {
-            JsValue::Str(ctx.intern(&format!("{}:{}", tb, id)))
-        }
-        nexus_db::Value::Array(arr) => {
-            let items: Vec<JsValue> = arr.into_iter().map(|v| surreal_to_js(ctx, v)).collect();
-            JsValue::Object(ctx.new_array_from(items))
-        }
-        nexus_db::Value::Object(map) => {
-            let obj = ctx.new_object();
-            for (k, v) in map {
-                let key = PropKey::from_string(&ctx.intern(&k));
-                let js_v = surreal_to_js(ctx, v);
-                ctx.define_own(&obj, key, Property::data(js_v, PropFlags::C_W_E));
-            }
-            JsValue::Object(obj)
-        }
-        other => JsValue::Str(ctx.intern(&format!("{:?}", other))),
-    }
-}
-
 fn value_to_display(_ctx: &Context, val: &JsValue) -> String {
     match val {
         JsValue::Undefined | JsValue::Uninitialized => "undefined".to_string(),
@@ -371,3 +382,7 @@ mod tests {
         assert_eq!(out.as_int().unwrap(), 42);
     }
 }
+}
+
+#[cfg(feature = "shell")]
+pub use client::JsClient;

@@ -1,12 +1,74 @@
+#[cfg(not(feature = "shell"))]
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    use nexus_io::{db, storage, ux};
+    use std::sync::Arc;
+
+    let args: Vec<String> = std::env::args().collect();
+    let launch_gui = args.contains(&"--gui".to_string())
+        || std::env::var("NEXUS_GUI").as_deref() == Ok("1");
+
+    if launch_gui {
+        let mut cfg = ux::native_gui::NativeWindowConfig::default();
+        if let Ok(url) = std::env::var("NEXUS_GUI_URL") {
+            cfg.url = url;
+        }
+        std::thread::spawn(|| {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("tokio runtime for GUI gateway");
+            rt.block_on(async {
+                let db = Arc::new(db::Database::init().await);
+                let bridge = Arc::new(
+                    storage::BlobBridge::new(db.clone())
+                        .await
+                        .expect("Failed to init storage bridge"),
+                );
+                let gw = ux::UxGateway::new(db, bridge, ux::GatewayConfig::default());
+                let _ = gw.start().await;
+            });
+        });
+        ux::native_gui::launch_native_window(cfg)?;
+        return Ok(());
+    }
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    rt.block_on(async {
+        let db = Arc::new(db::Database::init().await);
+        let bridge = Arc::new(
+            storage::BlobBridge::new(db.clone())
+                .await
+                .expect("Failed to init storage bridge"),
+        );
+        let gw = ux::UxGateway::new(db, bridge, ux::GatewayConfig::default());
+        println!(
+            "🚀 Nexus-IO Sovereign Microkernel ({}) starting on http://127.0.0.1:8080",
+            nexus_io::runtime::CapabilityRegistry::active_profile()
+        );
+        gw.start().await
+    })?;
+    Ok(())
+}
+
+#[cfg(feature = "shell")]
 use nexus_io::{compute, db, economy, iam, js, shell, storage, ux};
 
+#[cfg(feature = "shell")]
 use std::sync::Arc;
+#[cfg(feature = "shell")]
 use std::time::Instant;
+#[cfg(feature = "shell")]
 use nu_protocol::engine::{StateWorkingSet, Stack};
+#[cfg(feature = "shell")]
 use nu_cmd_lang::create_default_context;
+#[cfg(feature = "shell")]
 use nu_command::add_shell_command_context;
+#[cfg(feature = "shell")]
 use nu_protocol::{Value, Span};
 
+#[cfg(feature = "shell")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
     let is_test = args.contains(&"--test".to_string());
@@ -117,6 +179,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     rt.block_on(async_main(args, is_test))
 }
 
+#[cfg(feature = "shell")]
 async fn async_main(args: Vec<String>, is_test: bool) -> Result<(), Box<dyn std::error::Error>> {
     let _start_time = Instant::now();
     // 2. Parallel Genesis (Full Planes for Complex Tasks)

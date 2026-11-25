@@ -1,8 +1,12 @@
 pub mod telemetry;
 pub mod router;
+#[cfg(feature = "shell")]
 pub mod command;
+#[cfg(feature = "shell")]
 pub mod route_command;
+#[cfg(feature = "shell")]
 pub mod grid_command;
+#[cfg(feature = "shell")]
 pub mod run_command;
 pub mod md_runtime;
 #[cfg(feature = "k8s-bridge")]

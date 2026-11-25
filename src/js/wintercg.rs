@@ -402,7 +402,7 @@ mod tests {
                     let manager = CellManager::new(db, blobs);
 
                     let script = r#"
-                        function testWinterCG(): string {
+                        function testWinterCG() {
                             const url = new URL("https://nexus.io:8443/cells/app/1?mode=fast&tag=wcg");
                             const h = new Headers({ "X-Custom": "hello" });
                             const enc = new TextEncoder().encode("hi");

@@ -28,6 +28,7 @@ profile-core = [
 
 profile-app = [
     "profile-core",
+    "ts-compiler",
     "p2p-storage",
     "s3-gateway",
     "sqlite-hrana",
@@ -109,7 +110,24 @@ pgwire = ["nexus-db/pgwire"]
 mysqlwire = ["nexus-db/mysqlwire"]
 p2p-storage = ["dep:iroh", "dep:iroh-blobs"]
 s3-gateway = ["dep:s3s"]
-shell = ["dep:nu-cli", "dep:rustyline"]
+shell = [
+    "dep:nu-engine",
+    "dep:nu-protocol",
+    "dep:nu-command",
+    "dep:nu-parser",
+    "dep:nu-cmd-lang",
+    "dep:nu-cli",
+    "dep:rustyline",
+]
+ts-compiler = [
+    "dep:oxc_allocator",
+    "dep:oxc_parser",
+    "dep:oxc_semantic",
+    "dep:oxc_transformer",
+    "dep:oxc_codegen",
+    "dep:oxc_span",
+    "dep:oxc_ast",
+]
 wasm-runtime = ["dep:wasmtime", "dep:wasmtime-wasi"]
 k8s-bridge = ["dep:serde_norway"]
 vpn = ["dep:boringtun", "dep:wintun-bindings"]
@@ -124,26 +142,26 @@ surrealdb = { version = "4.0.1", optional = true, default-features = false, feat
 sqlparser = "0.64.0"
 tokio = { version = "1.0", features = ["rt-multi-thread", "net", "io-util", "sync", "time", "fs", "macros", "signal"] }
 
-# 2. The Nerves (Logic/Shell)
-nu-engine = "0.117.0"
-nu-protocol = "0.117.0"
-nu-command = { version = "0.117.0", features = ["os", "network", "rand", "sqlite"] }
-nu-parser = "0.117.0"
-nu-cmd-lang = "0.117.0"
+# 2. The Nerves (Optional Interactive Nushell — gated behind `shell`)
+nu-engine = { version = "0.117.0", optional = true }
+nu-protocol = { version = "0.117.0", optional = true }
+nu-command = { version = "0.117.0", optional = true, features = ["os", "network", "rand", "sqlite"] }
+nu-parser = { version = "0.117.0", optional = true }
+nu-cmd-lang = { version = "0.117.0", optional = true }
 
-# 3. The Trampoline (Unified Wasmtime/WASI Core + Native TS via OXC + transitional optional quickrs-core)
+# 3. The Trampoline (Unified Wasmtime/WASI Core + optional TS compiler + transitional optional quickrs-core)
 quickrs-core = { version = "0.16.2", optional = true }
 wasmtime = { version = "51.0.0", optional = true, default-features = false, features = ["runtime"] }
 wasmtime-wasi = { version = "51.0.0", optional = true }
 
-# Tier S: Native TypeScript (OXC)
-oxc_allocator = { version = "0.144.0", features = ["serialize"] }
-oxc_parser = "0.144.0"
-oxc_semantic = "0.144.0"
-oxc_transformer = "0.144.0"
-oxc_codegen = "0.144.0"
-oxc_span = { version = "0.144.0", features = ["serialize"] }
-oxc_ast = { version = "0.144.0", features = ["serialize"] }
+# Tier S: Optional Native TypeScript Compiler (OXC — gated behind `ts-compiler`)
+oxc_allocator = { version = "0.144.0", optional = true, features = ["serialize"] }
+oxc_parser = { version = "0.144.0", optional = true }
+oxc_semantic = { version = "0.144.0", optional = true }
+oxc_transformer = { version = "0.144.0", optional = true }
+oxc_codegen = { version = "0.144.0", optional = true }
+oxc_span = { version = "0.144.0", optional = true, features = ["serialize"] }
+oxc_ast = { version = "0.144.0", optional = true, features = ["serialize"] }
 
 # 4. The Cloud (Cross-Platform Distributed Storage & Networking — optional behind `p2p-storage` / `s3-gateway`)
 s3s = { version = "0.17.0", optional = true }

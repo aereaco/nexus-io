@@ -73,7 +73,7 @@ impl Command for JsCommand {
                             // Transform TS if needed
                             let mut exec_code = line.to_string();
                             if transformer::is_likely_ts(&exec_code) {
-                                if let Ok(js) = transformer::transform_ts_to_js(&exec_code, call.head) {
+                                if let Ok(js) = transformer::transform_ts_to_js(&exec_code) {
                                     exec_code = js;
                                 }
                             }
@@ -124,7 +124,9 @@ impl Command for JsCommand {
         };
 
         if transformer::is_likely_ts(&code) {
-            code = transformer::transform_ts_to_js(&code, call.head)?;
+            code = transformer::transform_ts_to_js(&code).map_err(|e| {
+                crate::shell_err("TypeScript Transform Error", e.to_string(), Some(call.head), None)
+            })?;
         }
 
         // Auto-AOT Heuristic: If code is complex (contains functions), force harden

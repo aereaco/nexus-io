@@ -4,6 +4,7 @@ pub mod wireguard;
 pub mod mesh;
 pub mod storage_config;
 pub mod blob_bridge;
+#[cfg(feature = "shell")]
 pub mod command;
 
 pub use blob_bridge::BlobBridge;
@@ -11,6 +12,7 @@ pub use wireguard::WireGuardManager;
 #[cfg(feature = "vpn")]
 pub use mesh::MeshReactor;
 
+#[cfg(feature = "shell")]
 pub use command::{
     StorageInitCommand, StorageStatusCommand,
     StorageBucketCreateCommand, StorageBucketListCommand,

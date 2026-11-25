@@ -1,15 +1,22 @@
 use anyhow::Result;
+#[cfg(feature = "shell")]
 use nu_engine::CallExt;
+#[cfg(feature = "shell")]
 use nu_protocol::engine::{Call, Command, EngineState, Stack};
+#[cfg(feature = "shell")]
 use nu_protocol::{Category, PipelineData, ShellError, Signature, SyntaxShape, Value};
 use std::collections::HashMap;
+#[cfg(feature = "shell")]
 use std::sync::Arc;
 
 #[cfg(feature = "wasm-runtime")]
 use crate::compute::crystal::CrystalEngine;
 use crate::db::sql_compiler::compile_sqlite_to_surql;
-use crate::db::{Database, StateEngine};
+#[cfg(feature = "shell")]
+use crate::db::Database;
+use crate::db::StateEngine;
 use crate::js::cell::{CellManager, CellPolicy};
+#[cfg(feature = "shell")]
 use crate::storage::BlobBridge;
 
 /// Declarative backend `SystemNode` parsed from a Markdown (`.md`) service file.
@@ -256,12 +263,14 @@ pub fn execute_node_crystal_i64(
 
 /// Nushell/CLI command: `cell deploy <path.md>` — deploys a declarative Markdown service file
 /// onto `CellManager` and `StateEngine`.
+#[cfg(feature = "shell")]
 #[derive(Clone)]
 pub struct CellDeployCommand {
     pub db: Arc<Database>,
     pub bridge: Arc<BlobBridge>,
 }
 
+#[cfg(feature = "shell")]
 impl Command for CellDeployCommand {
     fn name(&self) -> &str {
         "cell deploy"
@@ -350,9 +359,8 @@ policy: elastic
 CREATE TABLE IF NOT EXISTS metrics (label TEXT, val INT)
 ```
 
-```ts
-interface Metric { label: string; val: number; }
-function record(m: Metric): number {
+```js
+function record(m) {
     ctx.storage.sql.exec("INSERT INTO metrics (label, val) VALUES (?, ?)", m.label, m.val);
     return ctx.storage.sql.exec("SELECT val FROM metrics").toArray().length;
 }

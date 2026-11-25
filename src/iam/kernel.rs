@@ -1,6 +1,8 @@
 use nexus_db::auth::{AuthContext, AuthLevel, Role};
+#[cfg(feature = "shell")]
 use nexus_db::parser::{parse_surql, Statement};
 use nexus_db::Value as DbValue;
+#[cfg(feature = "shell")]
 use nu_protocol::{ShellError, Span};
 use std::sync::Arc;
 
@@ -54,6 +56,7 @@ impl SecurityKernel {
     }
 
     /// AST-based policy check for CLI/gateway command invocations.
+    #[cfg(feature = "shell")]
     pub async fn check_policy(
         &self,
         username: String,

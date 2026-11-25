@@ -685,8 +685,7 @@ impl CellManager {
                 fuel_limit,
             } => {
                 let js_script = if super::transformer::is_likely_ts(&script) {
-                    super::transformer::transform_ts_to_js(&script, nu_protocol::Span::unknown())
-                        .unwrap_or(script)
+                    super::transformer::transform_ts_to_js(&script).unwrap_or(script)
                 } else {
                     script
                 };
@@ -786,8 +785,7 @@ impl CellManager {
 
             // Transpile TypeScript cell script if needed
             let js_script = if super::transformer::is_likely_ts(&script) {
-                super::transformer::transform_ts_to_js(&script, nu_protocol::Span::unknown())
-                    .unwrap_or(script)
+                super::transformer::transform_ts_to_js(&script).unwrap_or(script)
             } else {
                 script
             };
@@ -1158,10 +1156,9 @@ mod tests {
                     let blobs = Arc::new(BlobBridge::new(db.clone()).await.unwrap());
                     let manager = CellManager::new(db.clone(), blobs);
 
-                    let ts_cell = r#"
-                        interface Todo { title: string; done: number; }
+                    let js_cell = r#"
                         ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS todos (title TEXT, done INT)");
-                        function addTodo(t: Todo): number {
+                        function addTodo(t) {
                             ctx.storage.sql.exec("INSERT INTO todos (title, done) VALUES (?, ?)", t.title, t.done);
                             ctx.storage.put("last_title", t.title);
                             return ctx.storage.sql.exec("SELECT title FROM todos WHERE done = ?", 0).toArray().length;
@@ -1170,7 +1167,7 @@ mod tests {
 
                     // 1. Wake elastic cell (acquires CAS lease)
                     manager
-                        .wake("demo_app", "room_1", CellPolicy::elastic_default(), ts_cell.to_string())
+                        .wake("demo_app", "room_1", CellPolicy::elastic_default(), js_cell.to_string())
                         .await
                         .unwrap();
 
@@ -1196,7 +1193,7 @@ mod tests {
 
                     // 4. Re-wake cell and verify KV state survived hibernation
                     manager
-                        .wake("demo_app", "room_1", CellPolicy::elastic_default(), ts_cell.to_string())
+                        .wake("demo_app", "room_1", CellPolicy::elastic_default(), js_cell.to_string())
                         .await
                         .unwrap();
                     let restored = manager

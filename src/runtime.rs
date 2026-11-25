@@ -64,6 +64,7 @@ impl CapabilityRegistry {
         reg("wasm-runtime", cfg!(feature = "wasm-runtime"));
         reg("js-wasm", cfg!(feature = "wasm-runtime"));
         reg("js-native", cfg!(feature = "js-native"));
+        reg("ts-compiler", cfg!(feature = "ts-compiler"));
         reg("cells", true);
         reg("iam", true);
         reg("object-storage", true);

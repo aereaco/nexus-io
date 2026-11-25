@@ -1,25 +1,24 @@
-use oxc_allocator::Allocator;
-use oxc_codegen::Codegen;
-use oxc_parser::Parser;
-use oxc_semantic::SemanticBuilder;
-use oxc_span::SourceType;
-use oxc_transformer::{TransformOptions, Transformer};
-use nu_protocol::{ShellError, Span};
-use std::path::Path;
+use anyhow::Result;
+#[cfg(feature = "ts-compiler")]
+use anyhow::anyhow;
 
-/// Transpiles TypeScript to JavaScript using the pure-Rust OXC 0.144 engine.
-/// Runs natively across Windows, Linux, macOS, Android, and iOS with zero Node.js dependency.
-pub fn transform_ts_to_js(source: &str, span: Span) -> Result<String, ShellError> {
+/// Transpiles TypeScript to JavaScript using the optional pure-Rust OXC engine (`ts-compiler` feature).
+/// When `ts-compiler` is disabled (lean microkernel `profile-core`), returns source unmodified
+/// (TypeScript can be pre-transpiled or stripped by a Wasm transpiler guest).
+#[cfg(feature = "ts-compiler")]
+pub fn transform_ts_to_js(source: &str) -> Result<String> {
+    use oxc_allocator::Allocator;
+    use oxc_codegen::Codegen;
+    use oxc_parser::Parser;
+    use oxc_semantic::SemanticBuilder;
+    use oxc_span::SourceType;
+    use oxc_transformer::{TransformOptions, Transformer};
+    use std::path::Path;
+
     let allocator = Allocator::default();
     let path = Path::new("input.ts");
-    let source_type = SourceType::from_path(path).map_err(|_| {
-        crate::shell_err(
-            "Transformer Error",
-            "Failed to determine source type",
-            Some(span),
-            None,
-        )
-    })?;
+    let source_type = SourceType::from_path(path)
+        .map_err(|_| anyhow!("Transformer Error: failed to determine source type"))?;
 
     let parser_return = Parser::new(&allocator, source, source_type).parse();
 
@@ -30,13 +29,7 @@ pub fn transform_ts_to_js(source: &str, span: Span) -> Result<String, ShellError
             .map(|e| e.to_string())
             .collect::<Vec<_>>()
             .join("\n");
-
-        return Err(crate::shell_err(
-            "TypeScript Syntax Error",
-            err_msg,
-            Some(span),
-            Some("Ensure your TypeScript code is valid.".into()),
-        ));
+        return Err(anyhow!("TypeScript Syntax Error:\n{}", err_msg));
     }
 
     let mut program = parser_return.program;
@@ -51,16 +44,16 @@ pub fn transform_ts_to_js(source: &str, span: Span) -> Result<String, ShellError
             .map(|e| e.to_string())
             .collect::<Vec<_>>()
             .join("\n");
-        return Err(crate::shell_err(
-            "TypeScript Transform Error",
-            err_msg,
-            Some(span),
-            None,
-        ));
+        return Err(anyhow!("TypeScript Transform Error:\n{}", err_msg));
     }
 
     let result = Codegen::new().build(&program).code;
     Ok(result)
+}
+
+#[cfg(not(feature = "ts-compiler"))]
+pub fn transform_ts_to_js(source: &str) -> Result<String> {
+    Ok(source.to_string())
 }
 
 /// A heuristic to check if code might be TypeScript.
@@ -72,7 +65,7 @@ pub fn is_likely_ts(code: &str) -> bool {
         || code.contains("enum ")
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "ts-compiler"))]
 mod tests {
     use super::*;
 
@@ -83,7 +76,7 @@ mod tests {
             const greet = (u: User): string => `${u.name}:${u.age}`;
             greet({ name: "nexus", age: 1 });
         "#;
-        let js = transform_ts_to_js(ts, Span::unknown()).unwrap();
+        let js = transform_ts_to_js(ts).unwrap();
         assert!(!js.contains("interface User"));
         assert!(js.contains("greet"));
     }
