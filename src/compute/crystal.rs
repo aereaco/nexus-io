@@ -28,6 +28,7 @@ pub struct NexusHostContext {
     pub cell_id: String,
     pub db_config: CellDbConfig,
     pub capabilities: CapabilitySet,
+    pub request_id: Option<String>,
     pub engine: Arc<dyn StateEngine>,
     pub blobs: Arc<BlobBridge>,
     pub logs: Arc<Mutex<Vec<String>>>,
@@ -52,6 +53,7 @@ impl NexusHostContext {
             cell_id: cell_id.into(),
             db_config,
             capabilities,
+            request_id: None,
             engine,
             blobs,
             logs: Arc::new(Mutex::new(Vec::new())),
@@ -60,6 +62,11 @@ impl NexusHostContext {
 
     pub fn with_capabilities(mut self, caps: CapabilitySet) -> Self {
         self.capabilities = caps;
+        self
+    }
+
+    pub fn with_request_id(mut self, request_id: Option<String>) -> Self {
+        self.request_id = request_id;
         self
     }
 }
@@ -487,8 +494,12 @@ fn register_nexus_host_abi(linker: &mut Linker<CrystalWasiState>) -> Result<()> 
                 if let Some(bytes) = read_guest_bytes(&mut caller, ptr, len) {
                     let msg = String::from_utf8_lossy(&bytes).to_string();
                     if let Some(host) = &caller.data().host {
+                        let entry = match &host.request_id {
+                            Some(rid) => format!("[req:{}] {}", rid, msg),
+                            None => msg,
+                        };
                         if let Ok(mut logs) = host.logs.lock() {
-                            logs.push(msg);
+                            logs.push(entry);
                         }
                     }
                 }

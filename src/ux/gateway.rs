@@ -217,17 +217,26 @@ impl UxGateway {
 
         let bind_host =
             std::env::var("NEXUS_PGWIRE_BIND").unwrap_or_else(|_| "127.0.0.1".to_string());
+        let is_loopback_bind = matches!(bind_host.as_str(), "127.0.0.1" | "localhost" | "::1");
+        if !is_loopback_bind {
+            return Err(format!(
+                "Refusing plaintext PgWire bind on non-loopback host '{}': remote wire-protocol access requires TLS",
+                bind_host
+            )
+            .into());
+        }
         let addr = format!("{}:{}", bind_host, self.config.pgwire_port);
-        let trust_local = std::env::var("NEXUS_PGWIRE_TRUST_LOCAL").as_deref() == Ok("1");
+        let trust_local_env = std::env::var("NEXUS_PGWIRE_TRUST_LOCAL").as_deref() == Ok("1");
         let listener = tokio::net::TcpListener::bind(&addr).await?;
         println!(
             "🐘 PostgreSQL v3 Wire Protocol (PgWire) listening on {} (auth: {})",
             addr,
-            if trust_local { "trust-local" } else { "password-required" }
+            if trust_local_env { "trust-loopback-only" } else { "password-required" }
         );
 
         loop {
-            let (mut socket, _) = listener.accept().await?;
+            let (mut socket, peer_addr) = listener.accept().await?;
+            let trust_local = trust_local_env && peer_addr.ip().is_loopback();
             let db = self.db.clone();
             tokio::spawn(async move {
                 let mut stream_buf: Vec<u8> = Vec::with_capacity(8192);
@@ -312,17 +321,26 @@ impl UxGateway {
         static CONN_ID: AtomicU32 = AtomicU32::new(1);
         let bind_host =
             std::env::var("NEXUS_MYSQLWIRE_BIND").unwrap_or_else(|_| "127.0.0.1".to_string());
+        let is_loopback_bind = matches!(bind_host.as_str(), "127.0.0.1" | "localhost" | "::1");
+        if !is_loopback_bind {
+            return Err(format!(
+                "Refusing plaintext MySqlWire bind on non-loopback host '{}': remote wire-protocol access requires TLS",
+                bind_host
+            )
+            .into());
+        }
         let addr = format!("{}:{}", bind_host, self.config.mysqlwire_port);
-        let trust_local = std::env::var("NEXUS_MYSQLWIRE_TRUST_LOCAL").as_deref() == Ok("1");
+        let trust_local_env = std::env::var("NEXUS_MYSQLWIRE_TRUST_LOCAL").as_deref() == Ok("1");
         let listener = tokio::net::TcpListener::bind(&addr).await?;
         println!(
             "🐬 MySQL v10 Wire Protocol (MySqlWire) listening on {} (auth: {})",
             addr,
-            if trust_local { "trust-local" } else { "password-required" }
+            if trust_local_env { "trust-loopback-only" } else { "password-required" }
         );
 
         loop {
-            let (mut socket, _) = listener.accept().await?;
+            let (mut socket, peer_addr) = listener.accept().await?;
+            let trust_local = trust_local_env && peer_addr.ip().is_loopback();
             let db = self.db.clone();
             let cid = CONN_ID.fetch_add(1, Ordering::Relaxed);
             tokio::spawn(async move {
@@ -476,11 +494,14 @@ impl UxGateway {
                     .patch(crate::ux::surreal_http::SurrealKeyHandler { db: self.db.clone() })
                     .delete(crate::ux::surreal_http::SurrealKeyHandler { db: self.db.clone() }),
             )
-            .push(Router::with_path("/api/<ns:str>/<db:str>/<**path>")
-                .get(crate::ux::surreal_http::SurrealCustomApiHandler { db: self.db.clone() })
-                .post(crate::ux::surreal_http::SurrealCustomApiHandler { db: self.db.clone() })
-                .put(crate::ux::surreal_http::SurrealCustomApiHandler { db: self.db.clone() })
-                .delete(crate::ux::surreal_http::SurrealCustomApiHandler { db: self.db.clone() }))
+            .push(
+                Router::with_path("/api/<ns:str>/<db:str>/<**path>")
+                    .hoop(crate::ux::iam::IamMiddleware::authenticated(self.db.clone()))
+                    .get(crate::ux::surreal_http::SurrealCustomApiHandler { db: self.db.clone() })
+                    .post(crate::ux::surreal_http::SurrealCustomApiHandler { db: self.db.clone() })
+                    .put(crate::ux::surreal_http::SurrealCustomApiHandler { db: self.db.clone() })
+                    .delete(crate::ux::surreal_http::SurrealCustomApiHandler { db: self.db.clone() }),
+            )
             // Public health/readiness/version + Observability metrics
             .push(Router::with_path("/status").get(crate::ux::surreal_http::surreal_status))
             .push(Router::with_path("/ready").get(crate::ux::surreal_http::surreal_ready))

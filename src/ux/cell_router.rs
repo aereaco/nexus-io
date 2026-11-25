@@ -8,7 +8,26 @@ use std::sync::Arc;
 use crate::compute::k8s_bridge::{export_k8s_yaml, import_k8s_yaml, ExportOptions};
 use crate::compute::md_runtime::deploy_markdown;
 use crate::db::Database;
+use crate::iam::capabilities::{Capability, CapabilitySet};
 use crate::js::cell::{CellManager, CellPolicy, CellWorkload};
+use crate::observability::global_metrics;
+use crate::ux::iam::{depot_auth_context, depot_request_id};
+
+/// Enforce a specific fine-grained `Capability` derived from the canonical `AuthContext` in `Depot`.
+fn require_capability(depot: &Depot, res: &mut Response, cap: Capability) -> bool {
+    let auth = depot_auth_context(depot);
+    let caps = CapabilitySet::from_auth_context(auth.as_ref());
+    if caps.has(cap) {
+        return true;
+    }
+    global_metrics().inc_iam_auth_denial();
+    res.status_code(StatusCode::FORBIDDEN);
+    res.render(Json(serde_json::json!({
+        "code": 403,
+        "details": format!("Missing required capability {:?}", cap)
+    })));
+    false
+}
 
 /// HTTP & WebSocket ingress handler for `/cells/<**path>` (`/cells/<app>/<cell_id>` and `POST /cells/deploy-md`).
 /// Supports deploying/waking `pinned` or `elastic` (`celld`) cells, evaluating requests,
@@ -50,12 +69,15 @@ impl Handler for CellGatewayHandler {
     async fn handle(
         &self,
         req: &mut Request,
-        _depot: &mut Depot,
+        depot: &mut Depot,
         res: &mut Response,
         _ctrl: &mut FlowCtrl,
     ) {
-        // POST /cells/deploy-md -> deploy declarative Markdown (.md) service nodes directly
+        // POST /cells/deploy-md -> deploy declarative Markdown (.md) service nodes (requires CellSpawn)
         if req.method() == &Method::POST && req.uri().path().trim_end_matches('/') == "/cells/deploy-md" {
+            if !require_capability(depot, res, Capability::CellSpawn) {
+                return;
+            }
             let md = match req.payload().await {
                 Ok(bytes) => String::from_utf8_lossy(bytes).to_string(),
                 Err(e) => {
@@ -81,9 +103,12 @@ impl Handler for CellGatewayHandler {
             return;
         }
 
-        // POST /cells/import-k8s -> import Kubernetes YAML into Nexus .md (and optionally deploy with ?deploy=true)
+        // POST /cells/import-k8s -> import Kubernetes YAML into Nexus .md (requires CellSpawn)
         #[cfg(feature = "k8s-bridge")]
         if req.method() == &Method::POST && req.uri().path().trim_end_matches('/') == "/cells/import-k8s" {
+            if !require_capability(depot, res, Capability::CellSpawn) {
+                return;
+            }
             let yaml = match req.payload().await {
                 Ok(bytes) => String::from_utf8_lossy(bytes).to_string(),
                 Err(e) => {
@@ -157,10 +182,12 @@ impl Handler for CellGatewayHandler {
             return;
         }
 
-        // POST /cells/_runtimes/pull -> pull Wasm runtime + optional Nexus policy from any OCI v2 registry
-        // Body: { "reference": "@aerea/quickjs:1.0", "name": "quickjs" (optional) }
+        // POST /cells/_runtimes/pull -> pull Wasm runtime from OCI v2 registry (requires RuntimeInstall)
         #[cfg(all(feature = "wasm-runtime", feature = "oci-registry"))]
         if req.method() == &Method::POST && req.uri().path().trim_end_matches('/') == "/cells/_runtimes/pull" {
+            if !require_capability(depot, res, Capability::RuntimeInstall) {
+                return;
+            }
             let body: serde_json::Value = match req.parse_json().await {
                 Ok(v) => v,
                 Err(e) => {
@@ -197,7 +224,7 @@ impl Handler for CellGatewayHandler {
             return;
         }
 
-        // PUT /cells/_runtimes/<name> -> register & AOT-precompile a WASI guest runtime into BlobBridge
+        // PUT /cells/_runtimes/<name> -> register & AOT-precompile a WASI guest runtime (requires RuntimeInstall)
         #[cfg(feature = "wasm-runtime")]
         if req.method() == &Method::PUT {
             let runtime_name = req
@@ -207,6 +234,9 @@ impl Handler for CellGatewayHandler {
                 .map(|s| s.trim_matches('/').to_string())
                 .filter(|s| !s.is_empty());
             if let Some(name) = runtime_name {
+                if !require_capability(depot, res, Capability::RuntimeInstall) {
+                    return;
+                }
                 let bytes = match req.payload().await {
                     Ok(b) => b.to_vec(),
                     Err(e) => {
@@ -229,6 +259,36 @@ impl Handler for CellGatewayHandler {
             }
         }
 
+        // DELETE /cells/_runtimes/<name> -> uninstall a WASI guest runtime (requires RuntimeInstall)
+        #[cfg(feature = "wasm-runtime")]
+        if req.method() == &Method::DELETE {
+            let runtime_name = req
+                .uri()
+                .path()
+                .strip_prefix("/cells/_runtimes/")
+                .map(|s| s.trim_matches('/').to_string())
+                .filter(|s| !s.is_empty());
+            if let Some(name) = runtime_name {
+                if !require_capability(depot, res, Capability::RuntimeInstall) {
+                    return;
+                }
+                match self.cells.runtimes().uninstall_runtime(&name).await {
+                    Ok(true) => {
+                        res.status_code(StatusCode::NO_CONTENT);
+                    }
+                    Ok(false) => {
+                        res.status_code(StatusCode::NOT_FOUND);
+                        res.render(Text::Plain(format!("Runtime '{}' not found", name)));
+                    }
+                    Err(e) => {
+                        res.status_code(StatusCode::BAD_REQUEST);
+                        res.render(Text::Plain(format!("Runtime uninstall error: {}", e)));
+                    }
+                }
+                return;
+            }
+        }
+
         let Some((app, cell_id)) = parse_cell_path(req.uri().path()) else {
             res.status_code(StatusCode::BAD_REQUEST);
             res.render(Text::Plain("Invalid cell path. Use: /cells/<app>/<cell_id>"));
@@ -245,12 +305,27 @@ impl Handler for CellGatewayHandler {
 
         if is_ws && req.method() == &Method::GET {
             let cells = self.cells.clone();
+            let db_ws = self.db.clone();
             let app_ws = app.clone();
             let id_ws = cell_id.clone();
+            let initial_auth = depot_auth_context(depot);
             let upgrade_res = WebSocketUpgrade::new()
                 .upgrade(req, res, move |mut ws| async move {
+                    let kernel = crate::iam::kernel::SecurityKernel::new(db_ws);
                     while let Some(Ok(msg)) = ws.next().await {
                         if let Ok(text) = msg.as_str() {
+                            // Re-verify live authorization on EVERY frame (not just at upgrade time)
+                            if let Some(ref auth) = initial_auth {
+                                if let Some(ref actor) = auth.actor {
+                                    let live = kernel.resolve_auth_context(actor, &app_ws, &id_ws).await;
+                                    let caps = CapabilitySet::from_auth_context(Some(&live));
+                                    if !caps.has(Capability::DbRead) {
+                                        global_metrics().inc_iam_auth_denial();
+                                        let _ = ws.send(Message::text("ERROR: 403 Forbidden (revoked)")).await;
+                                        break;
+                                    }
+                                }
+                            }
                             let reply = match cells.eval_in_cell(&app_ws, &id_ws, text).await {
                                 Ok(out) => out,
                                 Err(e) => format!("ERROR: {}", e),
@@ -269,9 +344,14 @@ impl Handler for CellGatewayHandler {
             return;
         }
 
+        let req_id = depot_request_id(depot);
+
         match req.method() {
-            // PUT /cells/<app>/<cell_id>/db-config -> declaratively configure per-cell CellDbConfig
+            // PUT /cells/<app>/<cell_id>/db-config -> declaratively configure per-cell CellDbConfig (requires CellManage)
             &Method::PUT if req.uri().path().trim_end_matches('/').ends_with("/db-config") => {
+                if !require_capability(depot, res, Capability::CellManage) {
+                    return;
+                }
                 match req.parse_json::<crate::js::cell::CellDbConfig>().await {
                     Ok(cfg) => {
                         self.cells.set_db_config(&app, &cell_id, cfg.clone()).await;
@@ -289,8 +369,11 @@ impl Handler for CellGatewayHandler {
                 }
             }
 
-            // PUT /cells/<app>/<cell_id> -> wake/deploy WASI, WASI-CGI, JS-on-Wasm (quickjs.wasm), or TS/JS cell
+            // PUT /cells/<app>/<cell_id> -> wake/deploy WASI, WASI-CGI, JS-on-Wasm, or TS/JS cell (requires CellSpawn)
             &Method::PUT => {
+                if !require_capability(depot, res, Capability::CellSpawn) {
+                    return;
+                }
                 let policy = policy_from_headers(req);
                 let runtime_hdr = req
                     .headers()
@@ -385,7 +468,15 @@ impl Handler for CellGatewayHandler {
                     let query = req.uri().query().unwrap_or("");
                     match self
                         .cells
-                        .invoke_http(&app, &cell_id, "POST", req.uri().path(), query, &raw_bytes)
+                        .invoke_http_with_request_id(
+                            &app,
+                            &cell_id,
+                            "POST",
+                            req.uri().path(),
+                            query,
+                            &raw_bytes,
+                            req_id,
+                        )
                         .await
                     {
                         Ok(resp) => {
@@ -422,16 +513,21 @@ impl Handler for CellGatewayHandler {
                 }
             }
 
-            // DELETE /cells/<app>/<cell_id> -> hibernate cell & release CAS lease
-            &Method::DELETE => match self.cells.hibernate(&app, &cell_id).await {
-                Ok(()) => {
-                    res.status_code(StatusCode::NO_CONTENT);
+            // DELETE /cells/<app>/<cell_id> -> hibernate cell & release CAS lease (requires CellManage)
+            &Method::DELETE => {
+                if !require_capability(depot, res, Capability::CellManage) {
+                    return;
                 }
-                Err(e) => {
-                    res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
-                    res.render(Text::Plain(format!("Cell hibernate error: {}", e)));
+                match self.cells.hibernate(&app, &cell_id).await {
+                    Ok(()) => {
+                        res.status_code(StatusCode::NO_CONTENT);
+                    }
+                    Err(e) => {
+                        res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+                        res.render(Text::Plain(format!("Cell hibernate error: {}", e)));
+                    }
                 }
-            },
+            }
 
             // GET /cells/<app>/<cell_id> -> invoke WASI/CGI handler or WinterCG fetch(request)
             &Method::GET => {
@@ -440,7 +536,15 @@ impl Handler for CellGatewayHandler {
                     let query = req.uri().query().unwrap_or("");
                     match self
                         .cells
-                        .invoke_http(&app, &cell_id, "GET", req.uri().path(), query, b"")
+                        .invoke_http_with_request_id(
+                            &app,
+                            &cell_id,
+                            "GET",
+                            req.uri().path(),
+                            query,
+                            b"",
+                            req_id,
+                        )
                         .await
                     {
                         Ok(resp) => {

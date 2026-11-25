@@ -376,27 +376,42 @@ impl CellManager {
     }
 
     /// Declare the modular `CellDbConfig` (mode, exposed flavors, and allowed connection transports)
-    /// for `(app, cell_id)`.
+    /// for `(app, cell_id)` and persist it durably in `BlobBridge` so it survives process restarts.
     pub async fn set_db_config(&self, app: &str, cell_id: &str, config: CellDbConfig) {
         self.db_configs.write().await.insert(
             CellKey {
                 app: app.to_string(),
                 cell_id: cell_id.to_string(),
             },
-            config,
+            config.clone(),
         );
+        let _ = self.blobs.create_bucket("nexus-cells").await;
+        if let Ok(json) = serde_json::to_vec(&config) {
+            let key = format!("meta/{}/{}.dbconfig.json", app, cell_id);
+            let _ = self
+                .blobs
+                .put_object("nexus-cells", &key, bytes::Bytes::from(json))
+                .await;
+        }
     }
 
     pub async fn get_db_config(&self, app: &str, cell_id: &str) -> CellDbConfig {
-        self.db_configs
-            .read()
-            .await
-            .get(&CellKey {
-                app: app.to_string(),
-                cell_id: cell_id.to_string(),
-            })
-            .cloned()
-            .unwrap_or_default()
+        let key = CellKey {
+            app: app.to_string(),
+            cell_id: cell_id.to_string(),
+        };
+        if let Some(cfg) = self.db_configs.read().await.get(&key).cloned() {
+            return cfg;
+        }
+        // Hydrate persisted CellDbConfig from BlobBridge after restart
+        let blob_key = format!("meta/{}/{}.dbconfig.json", app, cell_id);
+        if let Ok(Some(bytes)) = self.blobs.get_object("nexus-cells", &blob_key).await {
+            if let Ok(cfg) = serde_json::from_slice::<CellDbConfig>(&bytes) {
+                self.db_configs.write().await.insert(key, cfg.clone());
+                return cfg;
+            }
+        }
+        CellDbConfig::default()
     }
 
     /// Single unified authorization & topology resolver for BOTH internal cells and external transports.
@@ -700,6 +715,24 @@ impl CellManager {
         query_string: &str,
         body: &[u8],
     ) -> Result<CellHttpResponse> {
+        self.invoke_http_with_request_id(app, cell_id, method, path, query_string, body, None)
+            .await
+    }
+
+    /// Same as `invoke_http`, propagating an end-to-end correlation `request_id` (`X-Request-Id`)
+    /// into `NexusHostContext` for structured host logs & diagnostics.
+    #[cfg(all(feature = "wasm-runtime", not(target_os = "ios")))]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn invoke_http_with_request_id(
+        &self,
+        app: &str,
+        cell_id: &str,
+        method: &str,
+        path: &str,
+        query_string: &str,
+        body: &[u8],
+        request_id: Option<String>,
+    ) -> Result<CellHttpResponse> {
         let key = CellKey {
             app: app.to_string(),
             cell_id: cell_id.to_string(),
@@ -729,7 +762,8 @@ impl CellManager {
             db_config,
             self.engine.clone(),
             self.blobs.clone(),
-        );
+        )
+        .with_request_id(request_id);
         let crystal = self.crystal.clone();
 
         match workload {

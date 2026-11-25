@@ -2,11 +2,22 @@ use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
 
 use crate::observability::global_metrics;
 use crate::storage::BlobBridge;
+
+const OWNERSHIP_LEDGER_KEY: &str = "ownership.json";
+
+/// Durable Rust-inspired ownership ledger mapping each content-addressed blob CID
+/// to the set of live `OwnerId`s borrowing it (e.g. `wasmdb:shop/orders`, `runtime:quickjs`).
+/// When the last owner releases a CID (`owners.is_empty()`), the blob is deterministically
+/// dropped immediately — eliminating the need for mark-and-sweep garbage collection.
+#[derive(Debug, Clone, Default, Serialize, serde::Deserialize)]
+pub struct BlobOwnershipTable {
+    pub owners: BTreeMap<String, BTreeSet<String>>,
+}
 
 /// Shared atomic storage primitive built on `BlobBridge`:
 /// - **Versioned CAS Manifest Commits:** Reads `(manifest, etag)` and commits updates only if the
@@ -123,8 +134,8 @@ impl CasStore {
         Ok(data)
     }
 
-    /// Reference-tracked garbage collector: deletes any object under `prefix` in `bucket`
-    /// whose trailing CID is NOT in `referenced_cids`. Returns the number of reclaimed blobs.
+    /// Reference-tracked startup reconciliation for crash-leftover blobs (e.g. SIGKILL mid-upload).
+    /// Normal runtime reclamation uses deterministic ownership `Drop` (`transfer_manifest_ownership`).
     pub async fn gc_unreferenced_blobs(
         &self,
         bucket: &str,
@@ -143,6 +154,111 @@ impl CasStore {
             }
         }
         Ok(deleted)
+    }
+
+    /// Acquire a named owner borrow on `cid` in the durable ownership ledger.
+    pub async fn acquire_owner(&self, bucket: &str, cid: &str, owner_id: &str) -> Result<()> {
+        for _ in 0..5 {
+            let (mut table, etag) = match self
+                .read_manifest::<BlobOwnershipTable>(bucket, OWNERSHIP_LEDGER_KEY)
+                .await?
+            {
+                Some((t, e)) => (t, Some(e)),
+                None => (BlobOwnershipTable::default(), None),
+            };
+            table
+                .owners
+                .entry(cid.to_string())
+                .or_default()
+                .insert(owner_id.to_string());
+            match self
+                .commit_manifest_cas(bucket, OWNERSHIP_LEDGER_KEY, &table, etag.as_deref())
+                .await
+            {
+                Ok(_) => return Ok(()),
+                Err(e)
+                    if e.downcast_ref::<crate::storage::blob_bridge::CasConflictError>()
+                        .is_some() =>
+                {
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        anyhow::bail!("CAS contention acquiring ownership of '{}' for '{}'", cid, owner_id)
+    }
+
+    /// Release `owner_id`'s borrow on `cid`. Deterministically drops (deletes) `<prefix><cid>`
+    /// immediately if and only if zero owners remain — impossible to delete a borrowed blob.
+    /// Returns `true` if the blob was dropped.
+    pub async fn release_owner(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        cid: &str,
+        owner_id: &str,
+    ) -> Result<bool> {
+        let mut should_drop = false;
+        for _ in 0..5 {
+            let (mut table, etag) = match self
+                .read_manifest::<BlobOwnershipTable>(bucket, OWNERSHIP_LEDGER_KEY)
+                .await?
+            {
+                Some((t, e)) => (t, Some(e)),
+                None => return Ok(false),
+            };
+            should_drop = false;
+            if let Some(set) = table.owners.get_mut(cid) {
+                set.remove(owner_id);
+                if set.is_empty() {
+                    table.owners.remove(cid);
+                    should_drop = true;
+                }
+            }
+            match self
+                .commit_manifest_cas(bucket, OWNERSHIP_LEDGER_KEY, &table, etag.as_deref())
+                .await
+            {
+                Ok(_) => break,
+                Err(e)
+                    if e.downcast_ref::<crate::storage::blob_bridge::CasConflictError>()
+                        .is_some() =>
+                {
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        if should_drop {
+            let _ = self
+                .blobs
+                .delete_object(bucket, &format!("{}{}", prefix, cid))
+                .await;
+        }
+        Ok(should_drop)
+    }
+
+    /// Atomically transfer ownership for `owner_id` from `prev_cids` to `next_cids`:
+    /// acquires borrows on newly referenced CIDs first, then deterministically drops any
+    /// superseded CIDs whose owner count reaches zero. Returns count of dropped blobs.
+    pub async fn transfer_manifest_ownership(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        owner_id: &str,
+        prev_cids: &HashSet<String>,
+        next_cids: &HashSet<String>,
+    ) -> Result<usize> {
+        for cid in next_cids.difference(prev_cids) {
+            self.acquire_owner(bucket, cid, owner_id).await?;
+        }
+        let mut dropped = 0usize;
+        for cid in prev_cids.difference(next_cids) {
+            if self.release_owner(bucket, prefix, cid, owner_id).await? {
+                dropped += 1;
+            }
+        }
+        Ok(dropped)
     }
 }
 
@@ -217,5 +333,21 @@ mod tests {
         assert_eq!(reclaimed, 1);
         assert!(cas.get_verified_blob("cas-test", "blobs/", &live_cid).await.is_ok());
         assert!(cas.get_verified_blob("cas-test", "blobs/", &orphan_cid).await.is_err());
+
+        // 3. Deterministic Rust-style ownership/borrow Drop (zero-GC lifecycle)
+        let shared_cid = cas
+            .put_verified_blob("own-test", "blobs/", Bytes::from_static(b"shared-runtime-bytes"))
+            .await
+            .unwrap();
+        cas.acquire_owner("own-test", &shared_cid, "cell:a").await.unwrap();
+        cas.acquire_owner("own-test", &shared_cid, "cell:b").await.unwrap();
+
+        // Owner A drops -> Owner B still borrows it, so blob MUST survive
+        assert!(!cas.release_owner("own-test", "blobs/", &shared_cid, "cell:a").await.unwrap());
+        assert!(cas.get_verified_blob("own-test", "blobs/", &shared_cid).await.is_ok());
+
+        // Owner B drops -> zero owners left, blob is deterministically dropped immediately
+        assert!(cas.release_owner("own-test", "blobs/", &shared_cid, "cell:b").await.unwrap());
+        assert!(cas.get_verified_blob("own-test", "blobs/", &shared_cid).await.is_err());
     }
 }

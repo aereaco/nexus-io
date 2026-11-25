@@ -56,6 +56,11 @@ pub fn depot_auth_context(depot: &Depot) -> Option<AuthContext> {
         .flatten()
 }
 
+/// Retrieve the correlation `X-Request-Id` attached by `IamMiddleware`.
+pub fn depot_request_id(depot: &Depot) -> Option<String> {
+    depot.get::<String>(DEPOT_REQUEST_ID_KEY).ok().cloned()
+}
+
 #[async_trait]
 impl Handler for IamMiddleware {
     async fn handle(

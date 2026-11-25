@@ -23,15 +23,47 @@ pub fn current_aot_compat_key() -> String {
     )
 }
 
+/// Explicit trust mode distinguishing development vs. production registry policies.
+/// In `AllowlistOnly` mode, an empty `allowed_registries` list fails closed (never silently allows any host).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrustMode {
+    /// Production default: ONLY registries in `allowed_registries` (plus loopback in dev) are accepted.
+    AllowlistOnly,
+    /// Explicit development opt-in: allows pulling from any HTTPS registry.
+    AllowAnyDev,
+}
+
+impl Default for TrustMode {
+    fn default() -> Self {
+        if std::env::var("NEXUS_ENV").as_deref() == Ok("dev") {
+            Self::AllowAnyDev
+        } else {
+            Self::AllowlistOnly
+        }
+    }
+}
+
 /// Operator trust policy governing which OCI registries/publishers may be installed and
 /// whether installed runtime names are immutable (must be explicitly uninstalled before replacing).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeTrustPolicy {
-    /// If non-empty, OCI pulls are only permitted from these registry hostnames (e.g. `["ghcr.io"]`).
+    pub mode: TrustMode,
+    /// Allowed OCI registry hostnames (e.g. `["ghcr.io"]`). Empty + `AllowlistOnly` fails closed!
     pub allowed_registries: Vec<String>,
     /// When true, registering an already-installed runtime name with a different CID is rejected
     /// until `uninstall_runtime()` is explicitly called.
     pub immutable_versions: bool,
+}
+
+impl Default for RuntimeTrustPolicy {
+    fn default() -> Self {
+        Self {
+            mode: TrustMode::default(),
+            allowed_registries: vec!["ghcr.io".to_string()],
+            immutable_versions: false,
+        }
+    }
 }
 
 /// Strict validation of runtime names/aliases (prevents path traversal, control chars, or empty keys).
@@ -406,20 +438,22 @@ impl WasmRuntimeRegistry {
     ) -> Result<RuntimeRecord> {
         let oci = OciRef::parse(oci_ref_str)?;
 
-        // Enforce operator registry trust policy allowlist (if configured)
+        // Enforce operator registry trust policy (explicit dev vs. production fail-closed)
         {
             let policy = self.trust_policy.read().await;
-            if !policy.allowed_registries.is_empty()
-                && !policy
+            if policy.mode == TrustMode::AllowlistOnly && !oci.is_loopback() {
+                let allowed = policy
                     .allowed_registries
                     .iter()
-                    .any(|r| r.eq_ignore_ascii_case(&oci.registry))
-            {
-                global_metrics().inc_iam_auth_denial();
-                anyhow::bail!(
-                    "Registry '{}' is not in RuntimeTrustPolicy.allowed_registries",
-                    oci.registry
-                );
+                    .any(|r| r.eq_ignore_ascii_case(&oci.registry));
+                if !allowed {
+                    global_metrics().inc_iam_auth_denial();
+                    anyhow::bail!(
+                        "Registry '{}' denied by RuntimeTrustPolicy (mode=AllowlistOnly, allowed={:?})",
+                        oci.registry,
+                        policy.allowed_registries
+                    );
+                }
             }
         }
         global_metrics().inc_registry_pull();
@@ -998,11 +1032,19 @@ mod tests {
             let blobs = Arc::new(BlobBridge::new(db).await.unwrap());
             let registry = WasmRuntimeRegistry::new(blobs);
 
-            let err = registry
-                .pull_oci(None, "http://evil.example.com/org/pkg:1.0")
+            // 1. Untrusted registry rejected by default TrustMode::AllowlistOnly
+            let err_trust = registry
+                .pull_oci(None, "https://evil.example.com/org/pkg:1.0")
                 .await
                 .unwrap_err();
-            assert!(err.to_string().contains("Refusing insecure HTTP OCI pull"));
+            assert!(err_trust.to_string().contains("denied by RuntimeTrustPolicy"));
+
+            // 2. Allowlisted registry over insecure http:// still rejected by transport guard
+            let err_http = registry
+                .pull_oci(None, "http://ghcr.io/org/pkg:1.0")
+                .await
+                .unwrap_err();
+            assert!(err_http.to_string().contains("Refusing insecure HTTP OCI pull"));
         }
 
         #[tokio::test(flavor = "multi_thread")]

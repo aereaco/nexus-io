@@ -1,7 +1,8 @@
 use nexus_db::auth::{AuthContext, AuthLevel, Role};
 use nexus_io::compute::crystal::{CrystalEngine, NexusHostContext, WasiRunConfig};
 use nexus_io::compute::wasm_registry::{
-    current_aot_compat_key, validate_runtime_name, RuntimeTrustPolicy, WasmRuntimeRegistry,
+    current_aot_compat_key, validate_runtime_name, RuntimeTrustPolicy, TrustMode,
+    WasmRuntimeRegistry,
 };
 use nexus_io::db::sql_compiler::execute_unified_query;
 use nexus_io::db::Database;
@@ -213,8 +214,9 @@ async fn cell_lifecycle_lease_conflict_and_runtime_trust_policy() {
     assert!(validate_runtime_name("bad/name").is_err());
     assert!(validate_runtime_name("quickjs-1.0_beta").is_ok());
 
-    let reg = WasmRuntimeRegistry::new(blobs);
+    let reg = WasmRuntimeRegistry::new(blobs.clone());
     reg.set_trust_policy(RuntimeTrustPolicy {
+        mode: TrustMode::AllowlistOnly,
         allowed_registries: vec!["ghcr.io".to_string()],
         immutable_versions: true,
     })
@@ -232,4 +234,17 @@ async fn cell_lifecycle_lease_conflict_and_runtime_trust_policy() {
     assert!(reg.uninstall_runtime("quickjs-v1").await.unwrap());
     let r2 = reg.register_runtime("quickjs-v1", v2).await.unwrap();
     assert_ne!(r1.cid, r2.cid);
+
+    // 3. Persistent CellDbConfig survives full CellManager restart
+    manager
+        .set_db_config("billing", "ledger", CellDbConfig::stateless())
+        .await;
+    let fresh_db = Arc::new(Database::open_mem());
+    let fresh_mgr = CellManager::new(fresh_db, blobs);
+    let restored_cfg = fresh_mgr.get_db_config("billing", "ledger").await;
+    assert_eq!(
+        restored_cfg.mode,
+        nexus_io::js::cell::CellDbMode::None,
+        "CellDbConfig must persist across CellManager restarts"
+    );
 }
