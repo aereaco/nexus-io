@@ -1,22 +1,211 @@
 #[cfg(not(feature = "ops-shell"))]
+fn print_cli_help() {
+    println!("Nexus-IO Sovereign Microkernel ({})", nexus_io::runtime::CapabilityRegistry::active_profile());
+    println!();
+    println!("USAGE:");
+    println!("  nexus <COMMAND> [OPTIONS]");
+    println!();
+    println!("COMMANDS:");
+    println!("  start, serve   Start node strictly from a declared manifest (all services opt-in)");
+    println!("  check          Validate a manifest (schema, paths, compiled features) without starting");
+    println!("  init           Scaffold a declarative nexus.toml manifest (--preset erp|api|empty)");
+    println!("  help           Print this command reference");
+    println!();
+    println!("OPTIONS:");
+    println!("  -m, --manifest <PATH>   Path to AppManifest (.toml, .json, or .yaml)");
+    println!("  --gui                   Launch native desktop WebView alongside the declared gateway");
+    println!();
+    println!("COMPILED FEATURES:");
+    println!(
+        "  serve-web={}  serve-proxy={}  runtime-wasm={}  db-graphql={}  db-pgwire={}  db-mysqlwire={}",
+        cfg!(feature = "serve-web"),
+        cfg!(feature = "serve-proxy"),
+        cfg!(feature = "runtime-wasm"),
+        cfg!(feature = "db-graphql"),
+        cfg!(feature = "db-pgwire"),
+        cfg!(feature = "db-mysqlwire"),
+    );
+    println!();
+    println!("NOTE:");
+    println!("  Running `nexus` with no arguments never starts a web server or serves local folders.");
+    println!("  Declare enabled services explicitly in nexus.toml and run: nexus start -m nexus.toml");
+}
+
+#[cfg(not(feature = "ops-shell"))]
+fn parse_flag_value(args: &[String], short: &str, long: &str) -> Option<String> {
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == short || args[i] == long {
+            return args.get(i + 1).cloned();
+        }
+        if let Some(rest) = args[i].strip_prefix(&format!("{}=", long)) {
+            return Some(rest.to_string());
+        }
+        i += 1;
+    }
+    None
+}
+
+#[cfg(not(feature = "ops-shell"))]
+fn scaffold_manifest_toml(preset: &str) -> &'static str {
+    match preset {
+        "erp" | "web" => r#"api_version = "nexus.io/v1"
+kind = "Application"
+
+[metadata]
+name = "aerea-nexus"
+version = "0.1.0"
+
+[gateway]
+bind = "127.0.0.1:8443"
+
+[gateway.services]
+rpc = true
+cells = true
+s3 = true
+
+[gateway.web]
+enabled = true
+root = "./site"
+dist = "./dist"
+spa_fallback = true
+coop = "same-origin"
+coep = "credentialless"
+"#,
+        "api" => r#"api_version = "nexus.io/v1"
+kind = "Application"
+
+[metadata]
+name = "nexus-api"
+version = "0.1.0"
+
+[gateway]
+bind = "127.0.0.1:8443"
+
+[gateway.services]
+rpc = true
+cells = true
+s3 = true
+"#,
+        _ => r#"api_version = "nexus.io/v1"
+kind = "Application"
+
+[metadata]
+name = "nexus-node"
+version = "0.1.0"
+
+[gateway]
+bind = "127.0.0.1:8443"
+
+[gateway.services]
+rpc = false
+cells = false
+s3 = false
+"#,
+    }
+}
+
+#[cfg(not(feature = "ops-shell"))]
+fn load_gateway_from_manifest(
+    manifest_path: &std::path::Path,
+) -> Result<(nexus_io::compute::manifest::AppManifest, nexus_io::ux::GatewayConfig), Box<dyn std::error::Error>> {
+    let manifest = nexus_io::compute::manifest::AppManifest::from_file(manifest_path)?;
+    manifest.validate()?;
+    let manifest_dir = manifest_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let gw_cfg = manifest.compile_gateway_config(manifest_dir)?;
+    Ok((manifest, gw_cfg))
+}
+
+#[cfg(not(feature = "ops-shell"))]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     use nexus_io::{db, storage, ux};
+    use std::path::PathBuf;
     use std::sync::Arc;
 
     let args: Vec<String> = std::env::args().collect();
-    let launch_gui = args.contains(&"--gui".to_string())
-        || std::env::var("NEXUS_GUI").as_deref() == Ok("1");
+    if args.len() <= 1 || matches!(args[1].as_str(), "help" | "-h" | "--help") {
+        print_cli_help();
+        return Ok(());
+    }
 
-    if launch_gui {
-        let mut cfg = ux::native_gui::NativeWindowConfig::default();
-        if let Ok(url) = std::env::var("NEXUS_GUI_URL") {
-            cfg.url = url;
+    let subcmd = args[1].as_str();
+    match subcmd {
+        "init" => {
+            let preset = parse_flag_value(&args[2..], "-p", "--preset").unwrap_or_else(|| "api".to_string());
+            let target = args[2..]
+                .iter()
+                .find(|a| !a.starts_with('-') && *a != &preset)
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("nexus.toml"));
+            if target.exists() {
+                eprintln!("❌ Refusing to overwrite existing manifest '{}'", target.display());
+                std::process::exit(1);
+            }
+            std::fs::write(&target, scaffold_manifest_toml(&preset))?;
+            println!("✅ Created declarative manifest '{}' (preset: {})", target.display(), preset);
+            println!("   Run: nexus start -m {}", target.display());
+            return Ok(());
         }
-        std::thread::spawn(|| {
+        "check" => {
+            let Some(mpath) = parse_flag_value(&args[2..], "-m", "--manifest") else {
+                eprintln!("❌ Missing required --manifest <PATH> (e.g. nexus check -m nexus.toml)");
+                std::process::exit(2);
+            };
+            let (manifest, cfg) = load_gateway_from_manifest(std::path::Path::new(&mpath))?;
+            println!("✅ Manifest '{}' ({}) is valid", manifest.metadata.name, mpath);
+            println!(
+                "   Services: rpc={} cells={} s3={} web={} proxy={} metrics={}",
+                cfg.enable_rpc, cfg.enable_cells, cfg.enable_s3, cfg.enable_web, cfg.enable_proxy, cfg.enable_metrics
+            );
+            return Ok(());
+        }
+        "start" | "serve" | "--gui" => {
+            let launch_gui = args.contains(&"--gui".to_string())
+                || std::env::var("NEXUS_GUI").as_deref() == Ok("1");
+            let Some(mpath) = parse_flag_value(&args[1..], "-m", "--manifest") else {
+                eprintln!("❌ `nexus {}` requires an explicit manifest: nexus start -m nexus.toml", subcmd);
+                eprintln!("   (Run `nexus init --preset erp` to generate one.)");
+                std::process::exit(2);
+            };
+            let (manifest, gw_cfg) = load_gateway_from_manifest(std::path::Path::new(&mpath))?;
+            println!(
+                "🚀 Nexus-IO '{}' ({}) loading declared manifest '{}'",
+                manifest.metadata.name,
+                nexus_io::runtime::CapabilityRegistry::active_profile(),
+                mpath
+            );
+
+            if launch_gui {
+                let mut cfg = ux::native_gui::NativeWindowConfig::default();
+                if let Ok(url) = std::env::var("NEXUS_GUI_URL") {
+                    cfg.url = url;
+                }
+                std::thread::spawn(move || {
+                    let rt = tokio::runtime::Builder::new_multi_thread()
+                        .enable_all()
+                        .build()
+                        .expect("tokio runtime for GUI gateway");
+                    rt.block_on(async {
+                        let db = Arc::new(db::Database::init().await);
+                        let bridge = Arc::new(
+                            storage::BlobBridge::new(db.clone())
+                                .await
+                                .expect("Failed to init storage bridge"),
+                        );
+                        let gw = ux::UxGateway::new(db, bridge, gw_cfg);
+                        let _ = gw.start().await;
+                    });
+                });
+                ux::native_gui::launch_native_window(cfg)?;
+                return Ok(());
+            }
+
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
-                .build()
-                .expect("tokio runtime for GUI gateway");
+                .build()?;
             rt.block_on(async {
                 let db = Arc::new(db::Database::init().await);
                 let bridge = Arc::new(
@@ -24,32 +213,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .await
                         .expect("Failed to init storage bridge"),
                 );
-                let gw = ux::UxGateway::new(db, bridge, ux::GatewayConfig::default());
-                let _ = gw.start().await;
-            });
-        });
-        ux::native_gui::launch_native_window(cfg)?;
-        return Ok(());
+                let gw = ux::UxGateway::new(db, bridge, gw_cfg);
+                gw.start().await
+            })?;
+            return Ok(());
+        }
+        other => {
+            eprintln!("❌ Unknown command '{}'", other);
+            println!();
+            print_cli_help();
+            std::process::exit(2);
+        }
     }
-
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?;
-    rt.block_on(async {
-        let db = Arc::new(db::Database::init().await);
-        let bridge = Arc::new(
-            storage::BlobBridge::new(db.clone())
-                .await
-                .expect("Failed to init storage bridge"),
-        );
-        let gw = ux::UxGateway::new(db, bridge, ux::GatewayConfig::default());
-        println!(
-            "🚀 Nexus-IO Sovereign Microkernel ({}) starting on http://127.0.0.1:8080",
-            nexus_io::runtime::CapabilityRegistry::active_profile()
-        );
-        gw.start().await
-    })?;
-    Ok(())
 }
 
 #[cfg(feature = "ops-shell")]

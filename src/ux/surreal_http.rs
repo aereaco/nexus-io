@@ -64,11 +64,69 @@ fn is_loopback_addr(req: &Request) -> bool {
     addr.contains("127.0.0.1") || addr.contains("::1") || addr.contains("localhost")
 }
 
+pub const SESSION_COOKIE_NAME: &str = "nexus_session";
+
+fn is_secure_request(req: &Request) -> bool {
+    if req.uri().scheme_str() == Some("https") {
+        return true;
+    }
+    if req
+        .headers()
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.eq_ignore_ascii_case("https"))
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    std::env::var("NEXUS_TLS_CERT").is_ok() && std::env::var("NEXUS_TLS_KEY").is_ok()
+}
+
+pub(crate) fn extract_session_cookie(req: &Request) -> Option<String> {
+    for val in req.headers().get_all(salvo::http::header::COOKIE) {
+        if let Ok(raw) = val.to_str() {
+            for part in raw.split(';') {
+                let trimmed = part.trim();
+                if let Some(tok) = trimmed.strip_prefix(&format!("{}=", SESSION_COOKIE_NAME)) {
+                    let tok = tok.trim();
+                    if !tok.is_empty() {
+                        return Some(tok.to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn set_session_cookie(req: &Request, res: &mut Response, token: &str) {
+    let secure = if is_secure_request(req) { "; Secure" } else { "" };
+    let cookie = format!(
+        "{}={}; HttpOnly; SameSite=Lax; Path=/{}",
+        SESSION_COOKIE_NAME, token, secure
+    );
+    if let Ok(val) = salvo::http::header::HeaderValue::from_str(&cookie) {
+        res.headers_mut().append(salvo::http::header::SET_COOKIE, val);
+    }
+}
+
+fn clear_session_cookie(req: &Request, res: &mut Response) {
+    let secure = if is_secure_request(req) { "; Secure" } else { "" };
+    let cookie = format!(
+        "{}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0{}",
+        SESSION_COOKIE_NAME, secure
+    );
+    if let Ok(val) = salvo::http::header::HeaderValue::from_str(&cookie) {
+        res.headers_mut().append(salvo::http::header::SET_COOKIE, val);
+    }
+}
+
 /// Resolve and enforce HTTP authentication for all data/query endpoints.
 ///
 /// Explicit security boundary:
 /// - `Authorization: Bearer <jwt|bearer>` or `Basic <base64>` is ALWAYS verified via `nexus-db`.
-/// - Missing `Authorization` is REJECTED (`401 Unauthorized`) by default.
+/// - Browser `HttpOnly` session cookie (`nexus_session=<jwt>`) is verified identically via `nexus-db`.
+/// - Missing credentials are REJECTED (`401 Unauthorized`) by default.
 /// - Unauthenticated local dev access is ONLY permitted when BOTH `NEXUS_ALLOW_UNAUTH_LOCAL=1`
 ///   AND the request originates from loopback (`127.0.0.1` / `::1`).
 pub(crate) fn resolve_http_auth(
@@ -77,37 +135,46 @@ pub(crate) fn resolve_http_auth(
     ns: &str,
     database: &str,
 ) -> Result<Option<AuthContext>, String> {
-    let Some(header) = req.headers().get("authorization").and_then(|v| v.to_str().ok()) else {
-        if std::env::var("NEXUS_ALLOW_UNAUTH_LOCAL").as_deref() == Ok("1") && is_loopback_addr(req) {
-            return Ok(None);
+    if let Some(header) = req.headers().get("authorization").and_then(|v| v.to_str().ok()) {
+        if let Some(bearer) = header.strip_prefix("Bearer ").or_else(|| header.strip_prefix("bearer ")) {
+            return db
+                .inner
+                .authenticate_token(ns, database, bearer.trim())
+                .map(Some)
+                .map_err(|e| e.to_string());
         }
-        return Err(
-            "Authentication required (provide Authorization: Bearer <token> or Basic <creds>; for local dev set NEXUS_ALLOW_UNAUTH_LOCAL=1)"
-                .to_string(),
-        );
-    };
-    if let Some(bearer) = header.strip_prefix("Bearer ").or_else(|| header.strip_prefix("bearer ")) {
+        if let Some(b64) = header.strip_prefix("Basic ").or_else(|| header.strip_prefix("basic ")) {
+            let decoded = BASE64_STD
+                .decode(b64.trim())
+                .map_err(|_| "Invalid Basic auth base64".to_string())?;
+            let creds = String::from_utf8(decoded).map_err(|_| "Invalid Basic auth UTF-8".to_string())?;
+            let (user, pass) = creds
+                .split_once(':')
+                .ok_or_else(|| "Basic auth must be user:pass".to_string())?;
+            let (_, ctx) = db
+                .inner
+                .signin_user(ns, database, user, pass)
+                .map_err(|e| e.to_string())?;
+            return Ok(Some(ctx));
+        }
+        return Err("Unsupported Authorization scheme".to_string());
+    }
+
+    if let Some(cookie_token) = extract_session_cookie(req) {
         return db
             .inner
-            .authenticate_token(ns, database, bearer.trim())
+            .authenticate_token(ns, database, &cookie_token)
             .map(Some)
             .map_err(|e| e.to_string());
     }
-    if let Some(b64) = header.strip_prefix("Basic ").or_else(|| header.strip_prefix("basic ")) {
-        let decoded = BASE64_STD
-            .decode(b64.trim())
-            .map_err(|_| "Invalid Basic auth base64".to_string())?;
-        let creds = String::from_utf8(decoded).map_err(|_| "Invalid Basic auth UTF-8".to_string())?;
-        let (user, pass) = creds
-            .split_once(':')
-            .ok_or_else(|| "Basic auth must be user:pass".to_string())?;
-        let (_, ctx) = db
-            .inner
-            .signin_user(ns, database, user, pass)
-            .map_err(|e| e.to_string())?;
-        return Ok(Some(ctx));
+
+    if std::env::var("NEXUS_ALLOW_UNAUTH_LOCAL").as_deref() == Ok("1") && is_loopback_addr(req) {
+        return Ok(None);
     }
-    Err("Unsupported Authorization scheme".to_string())
+    Err(
+        "Authentication required (provide Authorization: Bearer <token>, Basic <creds>, or valid nexus_session cookie; for local dev set NEXUS_ALLOW_UNAUTH_LOCAL=1)"
+            .to_string(),
+    )
 }
 
 /// `POST /sql` — SurrealDB HTTP SQL endpoint.
@@ -262,12 +329,556 @@ impl Handler for SurrealAuthHandler {
             res.status_code(StatusCode::FORBIDDEN);
             res.render(Json(json!({ "code": 403, "details": err.message })));
         } else {
+            let token_val = resp.result.unwrap_or(JsonValue::Null);
+            if let Some(tok) = token_val.as_str().filter(|s| !s.is_empty()) {
+                set_session_cookie(req, res, tok);
+            }
+            res.headers_mut().insert(
+                salvo::http::header::CACHE_CONTROL,
+                salvo::http::header::HeaderValue::from_static("no-store"),
+            );
             res.render(Json(json!({
                 "code": 200,
                 "details": "Authentication succeeded",
-                "token": resp.result.unwrap_or(JsonValue::Null)
+                "token": token_val
             })));
         }
+    }
+}
+
+/// `POST /signout` — Clears the browser `HttpOnly` session cookie.
+#[derive(Clone)]
+pub struct SurrealSignoutHandler;
+
+#[async_trait]
+impl Handler for SurrealSignoutHandler {
+    async fn handle(&self, req: &mut Request, _depot: &mut Depot, res: &mut Response, _ctrl: &mut FlowCtrl) {
+        clear_session_cookie(req, res);
+        res.headers_mut().insert(
+            salvo::http::header::CACHE_CONTROL,
+            salvo::http::header::HeaderValue::from_static("no-store"),
+        );
+        res.render(Json(json!({
+            "code": 200,
+            "ok": true,
+            "details": "Signed out"
+        })));
+    }
+}
+
+/// `GET /_nexus/auth/me` — Returns the server-verified IAM identity, roles, and effective capabilities
+/// for the current caller (via `Authorization` header or `nexus_session` cookie).
+/// Never treats unauthenticated local-dev bypass as a signed-in user.
+#[derive(Clone)]
+pub struct AuthMeHandler {
+    pub db: Arc<Database>,
+}
+
+#[async_trait]
+impl Handler for AuthMeHandler {
+    async fn handle(&self, req: &mut Request, _depot: &mut Depot, res: &mut Response, _ctrl: &mut FlowCtrl) {
+        use crate::iam::capabilities::CapabilitySet;
+        use nexus_db::auth::AuthLevel;
+
+        res.headers_mut().insert(
+            salvo::http::header::CACHE_CONTROL,
+            salvo::http::header::HeaderValue::from_static("no-store"),
+        );
+
+        let (ns, database) = extract_ns_db(req);
+        let resolved: Option<AuthContext> = if let Some(header) = req.headers().get("authorization").and_then(|v| v.to_str().ok()) {
+            if let Some(bearer) = header.strip_prefix("Bearer ").or_else(|| header.strip_prefix("bearer ")) {
+                self.db.inner.authenticate_token(&ns, &database, bearer.trim()).ok()
+            } else {
+                None
+            }
+        } else if let Some(cookie_token) = extract_session_cookie(req) {
+            match self.db.inner.authenticate_token(&ns, &database, &cookie_token) {
+                Ok(ctx) => Some(ctx),
+                Err(_) => {
+                    clear_session_cookie(req, res);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let Some(ctx) = resolved else {
+            res.render(Json(json!({
+                "authenticated": false,
+                "actor": JsonValue::Null,
+                "level": "anonymous",
+                "ns": ns,
+                "db": database,
+                "roles": [],
+                "capabilities": []
+            })));
+            return;
+        };
+
+        let level = match &ctx.level {
+            AuthLevel::System => "system",
+            AuthLevel::Root => "root",
+            AuthLevel::Namespace(_) => "namespace",
+            AuthLevel::Database(_, _) => "database",
+            AuthLevel::Record { .. } => "record",
+            AuthLevel::Anonymous => "anonymous",
+        };
+        let caps = CapabilitySet::from_auth_context(Some(&ctx));
+        res.render(Json(json!({
+            "authenticated": true,
+            "actor": ctx.actor,
+            "level": level,
+            "ns": ns,
+            "db": database,
+            "roles": ctx.roles,
+            "capabilities": caps.caps
+        })));
+    }
+}
+
+/// `GET /_nexus/setup/status` — Public first-run check (`{ initialized: bool }`).
+/// Exposes zero user metadata; only indicates whether an initial IAM account exists.
+#[derive(Clone)]
+pub struct SetupStatusHandler {
+    pub db: Arc<Database>,
+}
+
+#[async_trait]
+impl Handler for SetupStatusHandler {
+    async fn handle(&self, req: &mut Request, _depot: &mut Depot, res: &mut Response, _ctrl: &mut FlowCtrl) {
+        res.headers_mut().insert(
+            salvo::http::header::CACHE_CONTROL,
+            salvo::http::header::HeaderValue::from_static("no-store"),
+        );
+        let (ns, database) = extract_ns_db(req);
+        let initialized = self.db.inner.has_any_user(&ns, &database).unwrap_or(true);
+        res.render(Json(json!({
+            "initialized": initialized,
+            "ns": ns,
+            "db": database
+        })));
+    }
+}
+
+/// `POST /_nexus/setup/bootstrap` — One-time initial `OWNER` admin creation on a fresh DB.
+/// **Strictly fail-closed (`403 Forbidden`)** as soon as ANY user exists.
+#[derive(Clone)]
+pub struct SetupBootstrapHandler {
+    pub db: Arc<Database>,
+}
+
+#[async_trait]
+impl Handler for SetupBootstrapHandler {
+    async fn handle(&self, req: &mut Request, _depot: &mut Depot, res: &mut Response, _ctrl: &mut FlowCtrl) {
+        res.headers_mut().insert(
+            salvo::http::header::CACHE_CONTROL,
+            salvo::http::header::HeaderValue::from_static("no-store"),
+        );
+        let (ns, database) = extract_ns_db(req);
+        if self.db.inner.has_any_user(&ns, &database).unwrap_or(true) {
+            res.status_code(StatusCode::FORBIDDEN);
+            res.render(Json(json!({
+                "code": 403,
+                "details": "Workspace is already initialized; bootstrap is disabled"
+            })));
+            return;
+        }
+        let body: JsonValue = match req.parse_json().await {
+            Ok(v) => v,
+            Err(e) => {
+                res.status_code(StatusCode::BAD_REQUEST);
+                res.render(Json(json!({ "code": 400, "details": e.to_string() })));
+                return;
+            }
+        };
+        let user = body.get("user").and_then(|v| v.as_str()).unwrap_or("").trim();
+        let pass = body.get("pass").and_then(|v| v.as_str()).unwrap_or("");
+        if user.is_empty() || !user.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-' || b == b'.') {
+            res.status_code(StatusCode::BAD_REQUEST);
+            res.render(Json(json!({ "code": 400, "details": "Username must be non-empty alphanumeric (-, _, .)" })));
+            return;
+        }
+        if pass.len() < 4 {
+            res.status_code(StatusCode::BAD_REQUEST);
+            res.render(Json(json!({ "code": 400, "details": "Password must be at least 4 characters" })));
+            return;
+        }
+        if let Err(e) = self.db.inner.create_user(&ns, &database, user, "DATABASE", pass, vec!["OWNER".to_string()]) {
+            res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+            res.render(Json(json!({ "code": 500, "details": e.to_string() })));
+            return;
+        }
+        match self.db.inner.signin_user(&ns, &database, user, pass) {
+            Ok((token, _)) => {
+                set_session_cookie(req, res, &token);
+                res.status_code(StatusCode::CREATED);
+                res.render(Json(json!({
+                    "ok": true,
+                    "actor": user,
+                    "roles": ["OWNER"],
+                    "token": token
+                })));
+            }
+            Err(e) => {
+                res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+                res.render(Json(json!({ "code": 500, "details": e.to_string() })));
+            }
+        }
+    }
+}
+
+/// `GET /_nexus/iam/users` & `POST /_nexus/iam/users` — Admin (`OWNER`) user management API.
+#[derive(Clone)]
+pub struct IamUsersHandler {
+    pub db: Arc<Database>,
+}
+
+#[async_trait]
+impl Handler for IamUsersHandler {
+    async fn handle(&self, req: &mut Request, _depot: &mut Depot, res: &mut Response, _ctrl: &mut FlowCtrl) {
+        res.headers_mut().insert(
+            salvo::http::header::CACHE_CONTROL,
+            salvo::http::header::HeaderValue::from_static("no-store"),
+        );
+        let (ns, database) = extract_ns_db(req);
+        if req.method() == &salvo::http::Method::GET {
+            match self.db.inner.list_users(&ns, &database) {
+                Ok(users) => res.render(Json(json!({ "users": users }))),
+                Err(e) => {
+                    res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+                    res.render(Json(json!({ "code": 500, "details": e.to_string() })));
+                }
+            }
+            return;
+        }
+        if req.method() == &salvo::http::Method::POST {
+            let body: JsonValue = match req.parse_json().await {
+                Ok(v) => v,
+                Err(e) => {
+                    res.status_code(StatusCode::BAD_REQUEST);
+                    res.render(Json(json!({ "code": 400, "details": e.to_string() })));
+                    return;
+                }
+            };
+            let user = body.get("user").and_then(|v| v.as_str()).unwrap_or("").trim();
+            let pass = body.get("pass").and_then(|v| v.as_str()).unwrap_or("");
+            let roles = parse_iam_roles(&body);
+            if user.is_empty() || pass.len() < 4 {
+                res.status_code(StatusCode::BAD_REQUEST);
+                res.render(Json(json!({ "code": 400, "details": "Valid username and password (min 4 chars) required" })));
+                return;
+            }
+            let Some(roles) = roles else {
+                res.status_code(StatusCode::BAD_REQUEST);
+                res.render(Json(json!({ "code": 400, "details": "Roles must be OWNER, EDITOR, or VIEWER" })));
+                return;
+            };
+            match self.db.inner.create_user(&ns, &database, user, "DATABASE", pass, roles.clone()) {
+                Ok(()) => {
+                    res.status_code(StatusCode::CREATED);
+                    res.render(Json(json!({
+                        "ok": true,
+                        "user": { "name": user, "level": "DATABASE", "roles": roles }
+                    })));
+                }
+                Err(e) => {
+                    res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+                    res.render(Json(json!({ "code": 500, "details": e.to_string() })));
+                }
+            }
+            return;
+        }
+        res.status_code(StatusCode::METHOD_NOT_ALLOWED);
+    }
+}
+
+fn parse_iam_roles(body: &JsonValue) -> Option<Vec<String>> {
+    let mut out = Vec::new();
+    if let Some(arr) = body.get("roles").and_then(|v| v.as_array()) {
+        for item in arr {
+            let r = item.as_str()?.trim().to_ascii_uppercase();
+            if !matches!(r.as_str(), "OWNER" | "EDITOR" | "VIEWER") {
+                return None;
+            }
+            if !out.contains(&r) {
+                out.push(r);
+            }
+        }
+    } else {
+        let r = body
+            .get("role")
+            .and_then(|v| v.as_str())
+            .unwrap_or("VIEWER")
+            .trim()
+            .to_ascii_uppercase();
+        if !matches!(r.as_str(), "OWNER" | "EDITOR" | "VIEWER") {
+            return None;
+        }
+        out.push(r);
+    }
+    if out.is_empty() {
+        return None;
+    }
+    Some(out)
+}
+
+/// `PUT/PATCH/DELETE /_nexus/iam/users/{name}` — Edit or delete an IAM user (`OWNER` only).
+#[derive(Clone)]
+pub struct IamUserItemHandler {
+    pub db: Arc<Database>,
+}
+
+#[async_trait]
+impl Handler for IamUserItemHandler {
+    async fn handle(&self, req: &mut Request, _depot: &mut Depot, res: &mut Response, _ctrl: &mut FlowCtrl) {
+        res.headers_mut().insert(
+            salvo::http::header::CACHE_CONTROL,
+            salvo::http::header::HeaderValue::from_static("no-store"),
+        );
+        let (ns, database) = extract_ns_db(req);
+        let name = req.param::<String>("name").unwrap_or_default();
+        if name.trim().is_empty() {
+            res.status_code(StatusCode::BAD_REQUEST);
+            res.render(Json(json!({ "code": 400, "details": "Missing user name" })));
+            return;
+        }
+
+        if req.method() == &salvo::http::Method::DELETE {
+            match self.db.inner.delete_user(&ns, &database, &name) {
+                Ok(true) => {
+                    res.render(Json(json!({ "ok": true, "deleted": name })));
+                }
+                Ok(false) => {
+                    res.status_code(StatusCode::NOT_FOUND);
+                    res.render(Json(json!({ "code": 404, "details": format!("User '{}' not found", name) })));
+                }
+                Err(e) => {
+                    res.status_code(StatusCode::BAD_REQUEST);
+                    res.render(Json(json!({ "code": 400, "details": e.to_string() })));
+                }
+            }
+            return;
+        }
+
+        if req.method() == &salvo::http::Method::PUT || req.method() == &salvo::http::Method::PATCH {
+            let body: JsonValue = match req.parse_json().await {
+                Ok(v) => v,
+                Err(e) => {
+                    res.status_code(StatusCode::BAD_REQUEST);
+                    res.render(Json(json!({ "code": 400, "details": e.to_string() })));
+                    return;
+                }
+            };
+            let Some(roles) = parse_iam_roles(&body) else {
+                res.status_code(StatusCode::BAD_REQUEST);
+                res.render(Json(json!({ "code": 400, "details": "Roles must be OWNER, EDITOR, or VIEWER" })));
+                return;
+            };
+            let new_pass = body
+                .get("pass")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty());
+            if let Some(p) = new_pass {
+                if p.len() < 4 {
+                    res.status_code(StatusCode::BAD_REQUEST);
+                    res.render(Json(json!({ "code": 400, "details": "New password must be at least 4 characters" })));
+                    return;
+                }
+            }
+            match self.db.inner.update_user(&ns, &database, &name, roles, new_pass) {
+                Ok(Some(user)) => {
+                    res.render(Json(json!({ "ok": true, "user": user })));
+                }
+                Ok(None) => {
+                    res.status_code(StatusCode::NOT_FOUND);
+                    res.render(Json(json!({ "code": 404, "details": format!("User '{}' not found", name) })));
+                }
+                Err(e) => {
+                    res.status_code(StatusCode::BAD_REQUEST);
+                    res.render(Json(json!({ "code": 400, "details": e.to_string() })));
+                }
+            }
+            return;
+        }
+
+        res.status_code(StatusCode::METHOD_NOT_ALLOWED);
+    }
+}
+
+fn valid_sql_ident(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 64
+        && s.bytes()
+            .next()
+            .map(|b| b.is_ascii_alphabetic() || b == b'_')
+            .unwrap_or(false)
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+/// `POST /_nexus/iam/policies/apply` — Applies a live Nexus-DB record-level (`DEFINE TABLE ... PERMISSIONS`)
+/// or field-level (`DEFINE FIELD ... PERMISSIONS`) policy (`OWNER` only).
+#[derive(Clone)]
+pub struct IamPolicyApplyHandler {
+    pub db: Arc<Database>,
+}
+
+#[async_trait]
+impl Handler for IamPolicyApplyHandler {
+    async fn handle(&self, req: &mut Request, _depot: &mut Depot, res: &mut Response, _ctrl: &mut FlowCtrl) {
+        let (ns, database) = extract_ns_db(req);
+        let body: JsonValue = match req.parse_json().await {
+            Ok(v) => v,
+            Err(e) => {
+                res.status_code(StatusCode::BAD_REQUEST);
+                res.render(Json(json!({ "code": 400, "details": e.to_string() })));
+                return;
+            }
+        };
+        let table = body.get("table").and_then(|v| v.as_str()).unwrap_or("").trim();
+        if !valid_sql_ident(table) {
+            res.status_code(StatusCode::BAD_REQUEST);
+            res.render(Json(json!({ "code": 400, "details": "Invalid table identifier" })));
+            return;
+        }
+        let scope = body.get("scope").and_then(|v| v.as_str()).unwrap_or("table").trim();
+        let mode = body.get("mode").and_then(|v| v.as_str()).unwrap_or("where").trim();
+
+        let surql = if scope == "field" {
+            let field = body.get("field").and_then(|v| v.as_str()).unwrap_or("").trim();
+            if !valid_sql_ident(field) {
+                res.status_code(StatusCode::BAD_REQUEST);
+                res.render(Json(json!({ "code": 400, "details": "Invalid field identifier" })));
+                return;
+            }
+            if mode == "full" || mode == "remove" {
+                format!("DEFINE FIELD {} ON TABLE {} PERMISSIONS FULL;", field, table)
+            } else if mode == "none" {
+                format!("DEFINE FIELD {} ON TABLE {} PERMISSIONS NONE;", field, table)
+            } else {
+                let expr = body.get("where_expr").and_then(|v| v.as_str()).unwrap_or("").trim();
+                if expr.is_empty() || expr.contains(';') {
+                    res.status_code(StatusCode::BAD_REQUEST);
+                    res.render(Json(json!({ "code": 400, "details": "Valid WHERE expression required (no semicolons)" })));
+                    return;
+                }
+                let ops = body.get("ops").and_then(|v| v.as_str()).unwrap_or("select, update").trim();
+                format!("DEFINE FIELD {} ON TABLE {} PERMISSIONS FOR {} WHERE {};", field, table, ops, expr)
+            }
+        } else if mode == "full" || mode == "remove" {
+            format!("DEFINE TABLE {} SCHEMALESS PERMISSIONS FULL;", table)
+        } else if mode == "none" {
+            format!("DEFINE TABLE {} SCHEMALESS PERMISSIONS NONE;", table)
+        } else {
+            let expr = body.get("where_expr").and_then(|v| v.as_str()).unwrap_or("").trim();
+            if expr.is_empty() || expr.contains(';') {
+                res.status_code(StatusCode::BAD_REQUEST);
+                res.render(Json(json!({ "code": 400, "details": "Valid WHERE expression required (no semicolons)" })));
+                return;
+            }
+            let ops = body
+                .get("ops")
+                .and_then(|v| v.as_str())
+                .unwrap_or("select, create, update, delete")
+                .trim();
+            format!("DEFINE TABLE {} SCHEMALESS PERMISSIONS FOR {} WHERE {};", table, ops, expr)
+        };
+
+        match self.db.inner.query_scoped_multi(&ns, &database, &surql, vec![]) {
+            Ok(_) => {
+                res.render(Json(json!({ "ok": true, "surql": surql })));
+            }
+            Err(e) => {
+                res.status_code(StatusCode::BAD_REQUEST);
+                res.render(Json(json!({ "code": 400, "details": e.to_string(), "surql": surql })));
+            }
+        }
+    }
+}
+
+/// `POST /_nexus/auth/password` — Allows any authenticated user to change their OWN password
+/// after verifying their current password (never allows role escalation).
+#[derive(Clone)]
+pub struct ChangeOwnPasswordHandler {
+    pub db: Arc<Database>,
+}
+
+#[async_trait]
+impl Handler for ChangeOwnPasswordHandler {
+    async fn handle(&self, req: &mut Request, depot: &mut Depot, res: &mut Response, _ctrl: &mut FlowCtrl) {
+        res.headers_mut().insert(
+            salvo::http::header::CACHE_CONTROL,
+            salvo::http::header::HeaderValue::from_static("no-store"),
+        );
+        let Some(auth) = crate::ux::iam::depot_auth_context(depot) else {
+            res.status_code(StatusCode::UNAUTHORIZED);
+            res.render(Json(json!({ "code": 401, "details": "Authentication required" })));
+            return;
+        };
+        let Some(actor) = auth.actor.clone() else {
+            res.status_code(StatusCode::UNAUTHORIZED);
+            res.render(Json(json!({ "code": 401, "details": "Authenticated actor identity missing" })));
+            return;
+        };
+        let (ns, database) = extract_ns_db(req);
+        let body: JsonValue = match req.parse_json().await {
+            Ok(v) => v,
+            Err(e) => {
+                res.status_code(StatusCode::BAD_REQUEST);
+                res.render(Json(json!({ "code": 400, "details": e.to_string() })));
+                return;
+            }
+        };
+        let current_pass = body.get("current_pass").and_then(|v| v.as_str()).unwrap_or("");
+        let new_pass = body.get("new_pass").and_then(|v| v.as_str()).unwrap_or("");
+        if new_pass.len() < 4 {
+            res.status_code(StatusCode::BAD_REQUEST);
+            res.render(Json(json!({ "code": 400, "details": "New password must be at least 4 characters" })));
+            return;
+        }
+        // Verify current password first
+        if self.db.inner.signin_user(&ns, &database, &actor, current_pass).is_err() {
+            res.status_code(StatusCode::FORBIDDEN);
+            res.render(Json(json!({ "code": 403, "details": "Current password is incorrect" })));
+            return;
+        }
+        let existing_roles: Vec<String> = self
+            .db
+            .inner
+            .list_users(&ns, &database)
+            .ok()
+            .and_then(|list| list.into_iter().find(|u| u.name == actor))
+            .map(|u| u.roles)
+            .unwrap_or_else(|| vec!["VIEWER".to_string()]);
+        match self.db.inner.update_user(&ns, &database, &actor, existing_roles, Some(new_pass)) {
+            Ok(Some(_)) => {
+                res.render(Json(json!({ "ok": true, "details": "Password updated" })));
+            }
+            Ok(None) => {
+                res.status_code(StatusCode::NOT_FOUND);
+                res.render(Json(json!({ "code": 404, "details": "User account not found" })));
+            }
+            Err(e) => {
+                res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+                res.render(Json(json!({ "code": 500, "details": e.to_string() })));
+            }
+        }
+    }
+}
+
+/// `GET /_nexus/cells` — Lists running/hibernated cells for UI & operations dashboards.
+#[derive(Clone)]
+pub struct CellsListHandler {
+    pub cells: Arc<crate::js::cell::CellManager>,
+}
+
+#[async_trait]
+impl Handler for CellsListHandler {
+    async fn handle(&self, _req: &mut Request, _depot: &mut Depot, res: &mut Response, _ctrl: &mut FlowCtrl) {
+        let cells = self.cells.list_cells().await;
+        res.render(Json(json!({ "cells": cells })));
     }
 }
 

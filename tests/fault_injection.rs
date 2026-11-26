@@ -301,7 +301,7 @@ async fn boot_recovery_gates_cell_work_and_replays_wal_on_startup() {
         .await
         .unwrap();
 
-    let gw = UxGateway::new(db.clone(), blobs.clone(), GatewayConfig::default());
+    let gw = UxGateway::new(db.clone(), blobs.clone(), GatewayConfig::all_core());
     assert!(!gw.is_storage_ready());
     let service = Service::new(gw.router());
 
@@ -695,7 +695,7 @@ async fn declarative_manifest_control_plane_and_fenced_stateful_migration() {
 
     let db = Arc::new(Database::open_mem());
     let blobs = Arc::new(BlobBridge::new(db.clone()).await.unwrap());
-    let gw = UxGateway::new(db.clone(), blobs.clone(), GatewayConfig::default());
+    let gw = UxGateway::new(db.clone(), blobs.clone(), GatewayConfig::all_core());
     let service = Service::new(gw.router());
 
     let cid = format!("blake3:{}", "b".repeat(64));
@@ -833,4 +833,115 @@ allow = ["db.read", "db.write"]
         )
         .await
         .is_err());
+
+    // 5. P2P Decentralized Mesh Fabric:
+    //    - Ingest WireGuard + 4D telemetry peer announcement via `POST /_nexus/mesh/gossip`
+    //    - Verify `GET /_nexus/mesh/status` reports deterministic WireGuard IPv4/IPv6 + 4D telemetry
+    //    - Deploy a `placement.target = "mesh"` GPU workload (`requires = ["gpu", "vram:16384", "region:us-west"]`)
+    //      and verify the 4D MeshScheduler places it on `node-gpu-west`
+    //    - Verify P2P CAS blob transfer via `PUT` and `GET /_nexus/mesh/blobs/{cid}`
+    let gossip_gpu = serde_json::json!({
+        "node_id": "node-gpu-west",
+        "wg_endpoint": "198.51.100.10:51820",
+        "resources": {
+            "cpu_cores": 32,
+            "cpu_load_pct": 12,
+            "memory_total": 68_719_476_736u64,
+            "memory_free": 60_000_000_000u64,
+            "storage_total": 2_000_000_000_000u64,
+            "storage_free": 1_800_000_000_000u64,
+            "gpus": [{
+                "name": "RTX 4090",
+                "vram_total": 24_576_000_000u64,
+                "vram_free": 22_000_000_000u64
+            }],
+            "is_green": true,
+            "labels": {
+                "region": "us-west",
+                "tier": "gpu"
+            },
+            "timestamp": 1700000100
+        }
+    });
+    let mut r_gossip = TestClient::post("http://127.0.0.1/_nexus/mesh/gossip")
+        .add_header("Authorization", format!("Bearer {}", owner_tok), true)
+        .add_header("Content-Type", "application/json", true)
+        .body(gossip_gpu.to_string())
+        .send(&service)
+        .await;
+    assert_eq!(r_gossip.status_code, Some(salvo::http::StatusCode::OK));
+    let gossip_resp: serde_json::Value = r_gossip.take_json().await.unwrap();
+    assert_eq!(gossip_resp["accepted"], true);
+    assert!(gossip_resp["mesh_ipv4"].as_str().unwrap().starts_with("100."));
+    assert!(gossip_resp["mesh_ipv6"].as_str().unwrap().starts_with("fd00:6e78:"));
+
+    let mut r_mesh_status = TestClient::get("http://127.0.0.1/_nexus/mesh/status")
+        .add_header("Authorization", format!("Bearer {}", owner_tok), true)
+        .send(&service)
+        .await;
+    assert_eq!(r_mesh_status.status_code, Some(salvo::http::StatusCode::OK));
+    let mesh_status: serde_json::Value = r_mesh_status.take_json().await.unwrap();
+    assert!(mesh_status["peer_count"].as_u64().unwrap() >= 1);
+
+    let mesh_toml = format!(
+        r#"
+api_version = "nexus.io/v1"
+kind = "Application"
+
+[metadata]
+name = "inference-cluster"
+version = "1.0.0"
+
+[topology]
+mode = "mesh"
+
+[cells.llm_worker]
+artifact = "{cid}"
+replicas = 1
+
+[cells.llm_worker.placement]
+target = "mesh"
+requires = ["gpu", "vram:16384", "region:us-west"]
+"#
+    );
+    let mut r_mesh_deploy = TestClient::post("http://127.0.0.1/_nexus/deploy")
+        .add_header("Authorization", format!("Bearer {}", owner_tok), true)
+        .add_header("Content-Type", "application/toml", true)
+        .body(mesh_toml)
+        .send(&service)
+        .await;
+    assert_eq!(r_mesh_deploy.status_code, Some(salvo::http::StatusCode::ACCEPTED));
+    let mesh_op: serde_json::Value = r_mesh_deploy.take_json().await.unwrap();
+    assert_eq!(mesh_op["status"], "succeeded");
+
+    let mut r_mesh_app = TestClient::get("http://127.0.0.1/_nexus/apps/inference-cluster")
+        .add_header("Authorization", format!("Bearer {}", owner_tok), true)
+        .send(&service)
+        .await;
+    assert_eq!(r_mesh_app.status_code, Some(salvo::http::StatusCode::OK));
+    let mesh_app_rec: serde_json::Value = r_mesh_app.take_json().await.unwrap();
+    assert_eq!(
+        mesh_app_rec["cells"]["llm_worker"]["assigned_nodes"],
+        serde_json::json!(["node-gpu-west"])
+    );
+    assert_eq!(
+        mesh_app_rec["cells"]["llm_worker"]["mesh_endpoints"],
+        serde_json::json!(["198.51.100.10:51820"])
+    );
+
+    // P2P BLAKE3-verified CAS blob transfer endpoint:
+    let blob_payload = b"nexus-mesh-p2p-verified-blob-payload";
+    let blob_cid = blake3::hash(blob_payload).to_hex().to_string();
+    let r_blob_put = TestClient::put(format!("http://127.0.0.1/_nexus/mesh/blobs/{}", blob_cid))
+        .add_header("Authorization", format!("Bearer {}", owner_tok), true)
+        .body(blob_payload.as_slice())
+        .send(&service)
+        .await;
+    assert_eq!(r_blob_put.status_code, Some(salvo::http::StatusCode::CREATED));
+
+    let r_blob_get = TestClient::get(format!("http://127.0.0.1/_nexus/mesh/blobs/{}", blob_cid))
+        .add_header("Authorization", format!("Bearer {}", owner_tok), true)
+        .send(&service)
+        .await;
+    assert_eq!(r_blob_get.status_code, Some(salvo::http::StatusCode::OK));
 }

@@ -615,6 +615,99 @@ pub fn authenticate_user(
     Ok(None)
 }
 
+/// Public, sanitized user summary (never exposes Argon2 password hashes).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PublicUserInfo {
+    pub name: String,
+    pub level: String,
+    pub roles: Vec<String>,
+}
+
+pub fn list_users(
+    storage: &dyn StorageBackend,
+    ns: &str,
+    db: &str,
+) -> Result<Vec<PublicUserInfo>> {
+    let mut seen = std::collections::BTreeMap::new();
+    for (u_ns, u_db) in [(ns, db), (ns, ""), ("", "")] {
+        let prefix = encode_key(PREFIX_USER_META, &[u_ns, u_db]);
+        for (_, raw) in storage.scan_prefix(&prefix)? {
+            if let Ok(meta) = serde_json::from_slice::<UserMeta>(&raw) {
+                seen.entry(meta.name.clone()).or_insert(PublicUserInfo {
+                    name: meta.name,
+                    level: meta.level,
+                    roles: meta.roles,
+                });
+            }
+        }
+    }
+    Ok(seen.into_values().collect())
+}
+
+pub fn has_any_user(storage: &dyn StorageBackend, ns: &str, db: &str) -> Result<bool> {
+    Ok(!list_users(storage, ns, db)?.is_empty())
+}
+
+fn is_owner_roles(roles: &[String]) -> bool {
+    roles
+        .iter()
+        .any(|r| matches!(r.trim().to_ascii_uppercase().as_str(), "OWNER" | "ADMIN"))
+}
+
+fn count_owners(storage: &dyn StorageBackend, ns: &str, db: &str) -> Result<usize> {
+    Ok(list_users(storage, ns, db)?
+        .into_iter()
+        .filter(|u| is_owner_roles(&u.roles))
+        .count())
+}
+
+/// Update an existing user's roles and optionally reset their password.
+/// Enforces last-OWNER protection so the workspace can never be locked out.
+pub fn update_user(
+    storage: &dyn StorageBackend,
+    ns: &str,
+    db: &str,
+    name: &str,
+    roles: Vec<String>,
+    new_password: Option<&str>,
+) -> Result<Option<PublicUserInfo>> {
+    let key = encode_key(PREFIX_USER_META, &[ns, db, name]);
+    let Some(raw) = storage.get(&key)? else {
+        return Ok(None);
+    };
+    let mut meta: UserMeta = serde_json::from_slice(&raw)?;
+    if is_owner_roles(&meta.roles) && !is_owner_roles(&roles) && count_owners(storage, ns, db)? <= 1 {
+        return Err(anyhow!("Cannot demote the last remaining OWNER"));
+    }
+    meta.roles = roles;
+    if let Some(pass) = new_password {
+        if !pass.is_empty() {
+            meta.password_hash = hash_password(pass);
+        }
+    }
+    storage.put(&key, &serde_json::to_vec(&meta)?)?;
+    Ok(Some(PublicUserInfo {
+        name: meta.name,
+        level: meta.level,
+        roles: meta.roles,
+    }))
+}
+
+/// Delete an existing user from `(ns, db)`.
+/// Enforces last-OWNER protection so the final OWNER account cannot be removed.
+pub fn delete_user(storage: &dyn StorageBackend, ns: &str, db: &str, name: &str) -> Result<bool> {
+    let key = encode_key(PREFIX_USER_META, &[ns, db, name]);
+    let Some(raw) = storage.get(&key)? else {
+        return Ok(false);
+    };
+    let meta: UserMeta = serde_json::from_slice(&raw)?;
+    if is_owner_roles(&meta.roles) && count_owners(storage, ns, db)? <= 1 {
+        return Err(anyhow!("Cannot delete the last remaining OWNER"));
+    }
+    let _ = storage.delete(&key)?;
+    Ok(true)
+}
+
 pub fn save_access(
     storage: &dyn StorageBackend,
     ns: &str,

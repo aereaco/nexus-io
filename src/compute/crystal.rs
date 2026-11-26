@@ -65,6 +65,17 @@ impl NexusHostContext {
         self
     }
 
+    /// Re-derive effective capabilities intersected with the caller's verified IAM `AuthContext`.
+    pub fn with_auth(mut self, auth: Option<&nexus_db::auth::AuthContext>) -> Self {
+        self.capabilities = CapabilitySet::resolve_effective(
+            &CapabilitySet::standard_cell(),
+            &CapabilitySet::standard_cell(),
+            auth,
+            &self.db_config,
+        );
+        self
+    }
+
     pub fn with_request_id(mut self, request_id: Option<String>) -> Self {
         self.request_id = request_id;
         self

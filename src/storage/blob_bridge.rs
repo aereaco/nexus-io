@@ -153,7 +153,8 @@ pub struct BlobBridge {
 
 impl BlobBridge {
     pub async fn new(db: Arc<Database>) -> Result<Self> {
-        Self::new_in(db, ".").await
+        let dir = std::env::var("NEXUS_DATA_DIR").unwrap_or_else(|_| ".nexus".to_string());
+        Self::new_in(db, dir).await
     }
 
     /// Initialize `BlobBridge` inside an explicit writable `data_dir` (required on Android/iOS sandboxes).
@@ -180,6 +181,10 @@ impl BlobBridge {
 
     pub fn node_id(&self) -> &str {
         &self.node.node_id
+    }
+
+    pub fn db(&self) -> &Arc<Database> {
+        &self.db
     }
 
     /// Always pin `BlobBridge` metadata operations to the `pinned` `nexus::system` scope

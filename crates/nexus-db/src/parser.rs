@@ -634,13 +634,23 @@ impl<'a> Lexer<'a> {
                     tokens.push(Token::Param(name));
                 }
                 '0'..='9' => {
+                    let after_colon = matches!(tokens.last(), Some(Token::Colon));
                     let mut num = String::new();
                     let mut is_float = false;
+                    let mut is_record_ident = false;
                     while let Some(&ch) = self.chars.peek() {
                         if ch.is_ascii_digit() {
                             num.push(ch);
                             self.chars.next();
-                        } else if ch == '.' && !is_float {
+                        } else if after_colon && !is_float && (ch.is_ascii_alphabetic() || ch == '_') {
+                            // Digit-leading alphanumeric/hex record ID (e.g. `erp_po:91faeb...` or `erp_po:00a1b2...`)
+                            is_record_ident = true;
+                            num.push(ch);
+                            self.chars.next();
+                        } else if is_record_ident && (ch.is_ascii_alphanumeric() || ch == '_') {
+                            num.push(ch);
+                            self.chars.next();
+                        } else if ch == '.' && !is_float && !is_record_ident {
                             let mut lookahead = self.chars.clone();
                             lookahead.next();
                             if lookahead.peek().map(|n| n.is_ascii_digit()).unwrap_or(false) {
@@ -654,7 +664,9 @@ impl<'a> Lexer<'a> {
                             break;
                         }
                     }
-                    if is_float {
+                    if is_record_ident || (after_colon && num.len() > 1 && num.starts_with('0')) {
+                        tokens.push(Token::Ident(num));
+                    } else if is_float {
                         tokens.push(Token::Float(num.parse()?));
                     } else {
                         tokens.push(Token::Int(num.parse()?));

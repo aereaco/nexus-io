@@ -5,11 +5,45 @@ use rand::RngCore;
 use base64::{Engine as _, engine::general_purpose};
 
 /// Configuration for a WireGuard Peer
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PeerConfig {
     pub public_key: String,
     pub endpoint: Option<String>,
     pub _allowed_ips: Vec<String>,
+}
+
+impl PeerConfig {
+    /// Deterministic RFC 6598 CGNAT (`100.64.0.0/10`) WireGuard overlay IPv4 derived from `blake3(public_key)`.
+    /// Eliminates central DHCP coordination while guaranteeing consistent L3 addressing across peers.
+    pub fn mesh_ipv4(&self) -> String {
+        derive_mesh_ipv4(&self.public_key)
+    }
+
+    /// Deterministic RFC 4193 ULA (`fd00:6e78::/32`) WireGuard overlay IPv6 derived from `blake3(public_key)`.
+    pub fn mesh_ipv6(&self) -> String {
+        derive_mesh_ipv6(&self.public_key)
+    }
+}
+
+/// Deterministically derive an RFC 6598 CGNAT IPv4 (`100.64.0.1` – `100.127.255.254`) from a WireGuard public key.
+pub fn derive_mesh_ipv4(pubkey: &str) -> String {
+    let h = blake3::hash(pubkey.as_bytes());
+    let b = h.as_bytes();
+    let octet2 = 64 + (b[0] & 0x3F); // 64..=127 (/10 mask)
+    let octet3 = b[1];
+    let octet4 = (b[2] % 254) + 1; // 1..=254 (avoid .0 and .255)
+    format!("100.{}.{}.{}", octet2, octet3, octet4)
+}
+
+/// Deterministically derive an RFC 4193 IPv6 ULA (`fd00:6e78::/32`) from a WireGuard public key.
+pub fn derive_mesh_ipv6(pubkey: &str) -> String {
+    let h = blake3::hash(pubkey.as_bytes());
+    let b = h.as_bytes();
+    let g1 = u16::from_be_bytes([b[0], b[1]]);
+    let g2 = u16::from_be_bytes([b[2], b[3]]);
+    let g3 = u16::from_be_bytes([b[4], b[5]]);
+    let g4 = u16::from_be_bytes([b[6], b[7]]).max(1);
+    format!("fd00:6e78::{:04x}:{:04x}:{:04x}:{:04x}", g1, g2, g3, g4)
 }
 
 /// WireGuardManager handles zero-trust VPN mesh networking
@@ -217,6 +251,8 @@ impl WireGuardInterface {
     }
     
     /// Format a WireGuard UAPI `set=1` peer configuration block for live interface sync.
+    /// Automatically assigns each peer's deterministic CGNAT `<mesh_ipv4>/32` and ULA `<mesh_ipv6>/128`
+    /// when `_allowed_ips` is empty or wildcard, preventing route collisions across the mesh.
     pub fn format_uapi_set_peers(peers: &[PeerConfig]) -> String {
         let mut out = String::from("set=1\n");
         for peer in peers {
@@ -226,8 +262,15 @@ impl WireGuardInterface {
                 if let Some(ref ep) = peer.endpoint {
                     out.push_str(&format!("endpoint={}\n", ep));
                 }
-                for cidr in &peer._allowed_ips {
-                    out.push_str(&format!("allowed_ip={}\n", cidr));
+                if peer._allowed_ips.is_empty()
+                    || (peer._allowed_ips.len() == 1 && peer._allowed_ips[0] == "0.0.0.0/0")
+                {
+                    out.push_str(&format!("allowed_ip={}/32\n", peer.mesh_ipv4()));
+                    out.push_str(&format!("allowed_ip={}/128\n", peer.mesh_ipv6()));
+                } else {
+                    for cidr in &peer._allowed_ips {
+                        out.push_str(&format!("allowed_ip={}\n", cidr));
+                    }
                 }
                 out.push_str("persistent_keepalive_interval=25\n");
             }

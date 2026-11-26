@@ -152,11 +152,13 @@ impl Database {
     }
 
     pub async fn init() -> Self {
-        Self::init_in(".").await
+        let dir = std::env::var("NEXUS_DATA_DIR").unwrap_or_else(|_| ".nexus".to_string());
+        Self::init_in(dir).await
     }
 
     /// Initialize `nexus-db` (`redb` ACID MVCC disk store) inside an explicit writable `data_dir`.
     pub async fn init_in(data_dir: impl AsRef<std::path::Path>) -> Self {
+        let _ = std::fs::create_dir_all(data_dir.as_ref());
         let db_path = data_dir.as_ref().join("nexus.redb");
         let inner = NexusDb::open_disk(&db_path).expect("Failed to open nexus-db redb store");
         let client = DbClient::new(inner.clone());

@@ -68,7 +68,22 @@ Application architecture and deployment topology are independent — the same ap
   - `GET /_nexus/deploy/{operation_id}` (inspect reconciliation status and plan).
   - `GET /_nexus/apps/{app_id}` (inspect reconciled `DeploymentRecord` and cell states).
 
-## 7. Semantic Deployment Profiles (`Cargo.toml`)
+## 7. Decentralized P2P WireGuard Mesh Fabric & 4D Scheduler (`src/storage/wireguard.rs`, `src/storage/mesh.rs`, `src/compute/router.rs`)
+Every Nexus-IO node participates in a decentralized, peer-to-peer compute and storage fabric without a central master node:
+
+- **Deterministic Cryptographic WireGuard Addressing (`src/storage/wireguard.rs`):**
+  - Each peer's 32-byte X25519 WireGuard public key deterministically hashes via BLAKE3 into a collision-resistant IPv4 CGNAT address (`100.64.0.0/10` via `derive_mesh_ipv4`) and an IPv6 ULA address (`fd00:6e78::/32` via `derive_mesh_ipv6`), formatted directly into cross-platform Userspace WireGuard UAPI frames (`format_uapi_set_peers`).
+- **4D Node Resource Telemetry & Gossip Replication (`src/compute/telemetry.rs`, `src/storage/mesh.rs`):**
+  - Nodes advertise real-time 4D capacity (`NodeResources`: CPU cores/load, GPU/VRAM, Memory free/total, Storage disk free/total, green-energy status, and placement labels) via `MeshGossipPayload`.
+  - `MeshReactor::ingest_gossip()` applies CRDT Last-Write-Wins (LWW) updates into both the `peer_registry` redb table and the `sys::node` SurrealQL system table.
+- **4D Compute + Data-Locality Scheduler (`src/compute/router.rs`):**
+  - When a cell targets `PlacementTarget::Mesh`, `InferenceRouter::select_ranked_nodes()` filters and scores all live peers across 4 dimensions (CPU headroom, GPU/VRAM availability, free RAM, free disk storage), adds a **+25.0 BLAKE3 Highest Random Weight (HRW) Rendezvous Hashing data-locality bonus** when a peer already hosts the cell's artifact shard (`select_hrw_replicas`), and applies a **+10.0 green energy bonus**.
+- **P2P Mesh HTTP Endpoints (`src/ux/gateway.rs`):**
+  - `GET /_nexus/mesh/status` — Returns active WireGuard tunnel addresses, UAPI configuration preview, and live 4D peer telemetry snapshot.
+  - `POST /_nexus/mesh/gossip` — Ingests peer WireGuard + 4D telemetry heartbeats and returns deterministic mesh IPv4/IPv6 assignments.
+  - `GET / PUT /_nexus/mesh/blobs/{cid}` — Content-addressed P2P blob transfer with strict end-to-end BLAKE3 verification.
+
+## 8. Semantic Deployment Profiles (`Cargo.toml`)
 - **`core`** *(default, 422 unique crates, 15.87 MB stripped)*: `runtime-wasm`, `db-auth`, `db-cbor` + `BlobBridge`/`CasStore` + `UxGateway` + `IAM` + `NexusMetrics`.
 - **`full`** *(1,161 unique crates)*: `core` + `runtime-all`, `db-all`, `net-all`, `storage-all`, `serve-all`, `ops-all`.
 - **Composable GUI:** `--features gui-all` (`gui-webview`) adds OS-autodetected native WebView (WebView2 / WKWebView / WebKitGTK / Android / iOS) to any profile.

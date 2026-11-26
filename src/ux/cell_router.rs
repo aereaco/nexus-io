@@ -472,7 +472,7 @@ impl Handler for CellGatewayHandler {
                     let query = req.uri().query().unwrap_or("");
                     match self
                         .cells
-                        .invoke_http_with_request_id(
+                        .invoke_http_with_auth(
                             &app,
                             &cell_id,
                             "POST",
@@ -480,6 +480,7 @@ impl Handler for CellGatewayHandler {
                             query,
                             &raw_bytes,
                             req_id,
+                            depot_auth_context(depot),
                         )
                         .await
                     {
@@ -540,7 +541,7 @@ impl Handler for CellGatewayHandler {
                     let query = req.uri().query().unwrap_or("");
                     match self
                         .cells
-                        .invoke_http_with_request_id(
+                        .invoke_http_with_auth(
                             &app,
                             &cell_id,
                             "GET",
@@ -548,6 +549,7 @@ impl Handler for CellGatewayHandler {
                             query,
                             b"",
                             req_id,
+                            depot_auth_context(depot),
                         )
                         .await
                     {

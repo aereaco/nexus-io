@@ -272,6 +272,71 @@ impl NexusDb {
         )
     }
 
+    /// List sanitized users (never password hashes) visible in `(ns, db)` (`feature = "auth"`).
+    #[cfg(feature = "auth")]
+    pub fn list_users(&self, ns: &str, db: &str) -> Result<Vec<crate::auth::PublicUserInfo>> {
+        crate::auth::list_users(self.storage.as_ref(), &sanitize_ident(ns), &sanitize_ident(db))
+    }
+
+    /// Returns `true` if at least one IAM user exists in `(ns, db)` / namespace / root (`feature = "auth"`).
+    #[cfg(feature = "auth")]
+    pub fn has_any_user(&self, ns: &str, db: &str) -> Result<bool> {
+        crate::auth::has_any_user(self.storage.as_ref(), &sanitize_ident(ns), &sanitize_ident(db))
+    }
+
+    /// Create or update an IAM user with Argon2 password hashing (`feature = "auth"`).
+    #[cfg(feature = "auth")]
+    pub fn create_user(
+        &self,
+        ns: &str,
+        db: &str,
+        name: &str,
+        level: &str,
+        password: &str,
+        roles: Vec<String>,
+    ) -> Result<()> {
+        crate::auth::save_user(
+            self.storage.as_ref(),
+            &sanitize_ident(ns),
+            &sanitize_ident(db),
+            name,
+            level,
+            password,
+            roles,
+        )
+    }
+
+    /// Update an IAM user's roles and optionally reset password (`feature = "auth"`).
+    #[cfg(feature = "auth")]
+    pub fn update_user(
+        &self,
+        ns: &str,
+        db: &str,
+        name: &str,
+        roles: Vec<String>,
+        new_password: Option<&str>,
+    ) -> Result<Option<crate::auth::PublicUserInfo>> {
+        crate::auth::update_user(
+            self.storage.as_ref(),
+            &sanitize_ident(ns),
+            &sanitize_ident(db),
+            name,
+            roles,
+            new_password,
+        )
+    }
+
+    /// Delete an IAM user (`feature = "auth"`), enforcing last-OWNER protection.
+    #[cfg(feature = "auth")]
+    pub fn delete_user(&self, ns: &str, db: &str, name: &str) -> Result<bool> {
+        crate::auth::delete_user(
+            self.storage.as_ref(),
+            &sanitize_ident(ns),
+            &sanitize_ident(db),
+            name,
+        )
+    }
+
     /// Issue a revocable `TYPE BEARER` grant (`feature = "auth"`).
     #[cfg(feature = "auth")]
     pub fn grant_bearer(

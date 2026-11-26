@@ -23,6 +23,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         enable_metrics: false,
         acme_domain: None,
         acme_email: None,
+        ..GatewayConfig::default()
     };
 
     // Start gateway

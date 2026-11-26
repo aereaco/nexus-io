@@ -59,7 +59,106 @@ pub struct AppManifest {
     pub topology: TopologySpec,
     #[serde(default)]
     pub defaults: CellDefaults,
+    #[serde(default)]
+    pub gateway: Option<GatewaySpec>,
+    #[serde(default)]
     pub cells: BTreeMap<String, CellSpec>,
+}
+
+/// Declarative gateway & service activation specification.
+/// **Zero-trust default:** every service defaults to `false` (strictly opt-in).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GatewaySpec {
+    /// Listen address for the primary gateway (e.g. `"127.0.0.1:8443"`).
+    #[serde(default)]
+    pub bind: Option<String>,
+    /// Enable the port 80/8080 HTTP→HTTPS redirect listener (default: `false`).
+    #[serde(default)]
+    pub enable_http_redirect: bool,
+    /// Opt-in service flags (`rpc`, `cells`, `s3`, `graphql`, `pgwire`, `mysqlwire`, `sqlite`, `metrics`).
+    #[serde(default)]
+    pub services: GatewayServicesSpec,
+    /// Opt-in static web application & SPA serving (requires `serve-web` feature + explicit `root`).
+    #[serde(default)]
+    pub web: Option<WebServiceSpec>,
+    /// Opt-in reverse proxy routes (requires `serve-proxy` feature).
+    #[serde(default)]
+    pub proxy: Option<ProxyServiceSpec>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayServicesSpec {
+    #[serde(default)]
+    pub rpc: bool,
+    #[serde(default)]
+    pub cells: bool,
+    #[serde(default)]
+    pub s3: bool,
+    #[serde(default)]
+    pub graphql: bool,
+    #[serde(default)]
+    pub sqlite: bool,
+    #[serde(default)]
+    pub pgwire: bool,
+    #[serde(default)]
+    pub pgwire_port: Option<u16>,
+    #[serde(default)]
+    pub mysqlwire: bool,
+    #[serde(default)]
+    pub mysqlwire_port: Option<u16>,
+    #[serde(default)]
+    pub metrics: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebServiceSpec {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Explicit web bundle root directory (resolved relative to the manifest file if relative).
+    #[serde(default)]
+    pub root: Option<String>,
+    /// Optional framework dist bundle directory (mounted at `/dist/*`).
+    #[serde(default)]
+    pub dist: Option<String>,
+    /// Enable HTML-only SPA fallback to `index.html` (default: `true`).
+    #[serde(default = "default_true")]
+    pub spa_fallback: bool,
+    /// `Cross-Origin-Opener-Policy` header (`"none"` disables).
+    #[serde(default)]
+    pub coop: Option<String>,
+    /// `Cross-Origin-Embedder-Policy` header (`"none"` disables).
+    #[serde(default)]
+    pub coep: Option<String>,
+}
+
+impl Default for WebServiceSpec {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            root: None,
+            dist: None,
+            spa_fallback: true,
+            coop: None,
+            coep: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProxyServiceSpec {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Named upstream targets (`/proxy/<name>/*` -> upstream URL).
+    #[serde(default)]
+    pub upstreams: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -310,6 +409,163 @@ impl AppManifest {
         serde_json::from_str(src).context("Failed to parse AppManifest JSON")
     }
 
+    pub fn from_yaml(src: &str) -> Result<Self> {
+        #[cfg(feature = "ops-k8s")]
+        {
+            serde_norway::from_str(src).context("Failed to parse AppManifest YAML")
+        }
+        #[cfg(not(feature = "ops-k8s"))]
+        {
+            let _ = src;
+            anyhow::bail!("YAML manifests require compiling with the 'ops-k8s' feature (use TOML or JSON)")
+        }
+    }
+
+    /// Load an `AppManifest` from a `.toml`, `.json`, or `.yaml`/`.yml` file.
+    pub fn from_file(path: &std::path::Path) -> Result<Self> {
+        let raw = std::fs::read_to_string(path)
+            .with_context(|| format!("Failed to read manifest '{}'", path.display()))?;
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|s| s.to_ascii_lowercase())
+            .unwrap_or_default();
+        match ext.as_str() {
+            "json" => Self::from_json(&raw),
+            "yaml" | "yml" => Self::from_yaml(&raw),
+            _ => {
+                let trimmed = raw.trim_start();
+                if trimmed.starts_with('{') {
+                    Self::from_json(&raw)
+                } else {
+                    Self::from_toml(&raw)
+                }
+            }
+        }
+    }
+
+    /// Compile the declared `[gateway]` section into a validated, strictly opt-in `GatewayConfig`.
+    /// Fails fast if any declared service requires a Cargo feature not compiled into this binary
+    /// or if a declared web root/dist path does not exist.
+    pub fn compile_gateway_config(
+        &self,
+        manifest_dir: &std::path::Path,
+    ) -> Result<crate::ux::GatewayConfig> {
+        let Some(ref gw) = self.gateway else {
+            anyhow::bail!("Manifest '{}' does not declare a [gateway] section", self.metadata.name);
+        };
+
+        let mut cfg = crate::ux::GatewayConfig {
+            enable_https: true,
+            enable_http: gw.enable_http_redirect,
+            bind_addr: gw.bind.clone(),
+            enable_rpc: gw.services.rpc,
+            enable_cells: gw.services.cells,
+            enable_s3: gw.services.s3,
+            enable_graphql: gw.services.graphql,
+            enable_sqlite: gw.services.sqlite,
+            enable_pgwire: gw.services.pgwire,
+            pgwire_port: gw.services.pgwire_port.unwrap_or(5432),
+            enable_mysqlwire: gw.services.mysqlwire,
+            mysqlwire_port: gw.services.mysqlwire_port.unwrap_or(3306),
+            enable_metrics: gw.services.metrics,
+            ..crate::ux::GatewayConfig::default()
+        };
+
+        // Compile-time feature parity checks (fail fast instead of silently ignoring)
+        #[cfg(not(feature = "db-graphql"))]
+        if cfg.enable_graphql {
+            anyhow::bail!("Manifest enables gateway.services.graphql, but this binary was compiled without the 'db-graphql' feature");
+        }
+        #[cfg(not(feature = "db-sqlite"))]
+        if cfg.enable_sqlite {
+            anyhow::bail!("Manifest enables gateway.services.sqlite, but this binary was compiled without the 'db-sqlite' feature");
+        }
+        #[cfg(not(feature = "db-pgwire"))]
+        if cfg.enable_pgwire {
+            anyhow::bail!("Manifest enables gateway.services.pgwire, but this binary was compiled without the 'db-pgwire' feature");
+        }
+        #[cfg(not(feature = "db-mysqlwire"))]
+        if cfg.enable_mysqlwire {
+            anyhow::bail!("Manifest enables gateway.services.mysqlwire, but this binary was compiled without the 'db-mysqlwire' feature");
+        }
+
+        if let Some(ref web) = gw.web {
+            if web.enabled {
+                #[cfg(not(feature = "serve-web"))]
+                anyhow::bail!("Manifest enables gateway.web, but this binary was compiled without the 'serve-web' feature");
+
+                let Some(ref raw_root) = web.root else {
+                    anyhow::bail!("gateway.web.enabled = true requires an explicit gateway.web.root path");
+                };
+                let resolved_root = {
+                    let p = std::path::PathBuf::from(raw_root);
+                    if p.is_absolute() { p } else { manifest_dir.join(p) }
+                };
+                if !resolved_root.is_dir() {
+                    anyhow::bail!(
+                        "Declared gateway.web.root '{}' (resolved to '{}') does not exist or is not a directory",
+                        raw_root,
+                        resolved_root.display()
+                    );
+                }
+                cfg.enable_web = true;
+                cfg.web_root = Some(resolved_root);
+                cfg.spa_fallback = web.spa_fallback;
+
+                if let Some(ref raw_dist) = web.dist {
+                    let resolved_dist = {
+                        let p = std::path::PathBuf::from(raw_dist);
+                        if p.is_absolute() { p } else { manifest_dir.join(p) }
+                    };
+                    if !resolved_dist.is_dir() {
+                        anyhow::bail!(
+                            "Declared gateway.web.dist '{}' (resolved to '{}') does not exist or is not a directory",
+                            raw_dist,
+                            resolved_dist.display()
+                        );
+                    }
+                    cfg.dist_root = Some(resolved_dist);
+                }
+
+                let normalize_hdr = |opt: &Option<String>, default_val: &str| -> Option<String> {
+                    match opt {
+                        Some(v) => {
+                            let t = v.trim();
+                            if t.is_empty()
+                                || t.eq_ignore_ascii_case("none")
+                                || t.eq_ignore_ascii_case("off")
+                                || t.eq_ignore_ascii_case("false")
+                            {
+                                None
+                            } else {
+                                Some(t.to_string())
+                            }
+                        }
+                        None => Some(default_val.to_string()),
+                    }
+                };
+                cfg.coop_header = normalize_hdr(&web.coop, "same-origin");
+                cfg.coep_header = normalize_hdr(&web.coep, "credentialless");
+            }
+        }
+
+        if let Some(ref proxy) = gw.proxy {
+            if proxy.enabled {
+                #[cfg(not(feature = "serve-proxy"))]
+                {
+                    anyhow::bail!("Manifest enables gateway.proxy, but this binary was compiled without the 'serve-proxy' feature");
+                }
+                #[cfg(feature = "serve-proxy")]
+                {
+                    cfg.enable_proxy = true;
+                }
+            }
+        }
+
+        Ok(cfg)
+    }
+
     pub fn to_toml(&self) -> Result<String> {
         toml::to_string_pretty(self).context("Failed to serialize AppManifest to TOML")
     }
@@ -345,8 +601,8 @@ impl AppManifest {
         if self.metadata.version.trim().is_empty() {
             anyhow::bail!("metadata.version must not be empty");
         }
-        if self.cells.is_empty() {
-            anyhow::bail!("AppManifest must declare at least one cell");
+        if self.cells.is_empty() && self.gateway.is_none() {
+            anyhow::bail!("AppManifest must declare at least one cell or a [gateway] section");
         }
 
         for (cell_id, spec) in &self.cells {
@@ -653,6 +909,10 @@ pub struct DeployedCellState {
     pub placement: PlacementTarget,
     pub migration_policy: MigrationPolicy,
     pub replicas: u32,
+    #[serde(default)]
+    pub assigned_nodes: Vec<String>,
+    #[serde(default)]
+    pub mesh_endpoints: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -751,14 +1011,50 @@ impl ManifestReconciler {
         let app = &validated.manifest.metadata.name;
         let plan = Self::plan(blobs, validated).await?;
 
-        // Enforce local acceptance boundary: reject mesh placement explicitly until mesh scheduler lands
-        for a in &plan.actions {
-            if a.action != CellActionKind::Remove && a.placement == PlacementTarget::Mesh {
-                anyhow::bail!(
-                    "Cell '{}/{}' targets `placement = mesh`, which is declared in schema but not yet supported by the local reconciler",
-                    app,
-                    a.cell_id
+        // Pre-validate mesh placement against live 4D MeshScheduler (`peer_registry` + `NodeResources`)
+        let mut scheduled_mesh_targets: BTreeMap<String, (Vec<String>, Vec<String>)> = BTreeMap::new();
+        let has_mesh_actions = plan
+            .actions
+            .iter()
+            .any(|a| a.action != CellActionKind::Remove && a.placement == PlacementTarget::Mesh);
+        if has_mesh_actions {
+            let (_records, peer_configs, grid_state) =
+                crate::storage::mesh::MeshReactor::load_mesh_snapshot(blobs.db()).await?;
+            let scheduler = crate::compute::InferenceRouter::from_snapshot(grid_state);
+            let empty_labels: Vec<String> = Vec::new();
+            for a in &plan.actions {
+                if a.action == CellActionKind::Remove || a.placement != PlacementTarget::Mesh {
+                    continue;
+                }
+                let spec = &validated.manifest.cells[&a.cell_id];
+                let (requires, labels) = match &spec.placement {
+                    Some(p) => (p.requires.as_slice(), &p.labels),
+                    None => (&[][..], &empty_labels),
+                };
+                let min_ram_mb = 64u64;
+                let replicas = (spec.replicas.max(1)) as usize;
+                let req = crate::compute::ComputeRequirements::from_placement(
+                    requires,
+                    labels,
+                    min_ram_mb,
+                    Some(format!("{}/{}", app, a.cell_id)),
                 );
+                let winners = scheduler.select_ranked_nodes(&peer_configs, &req, replicas);
+                if winners.len() < replicas {
+                    anyhow::bail!(
+                        "Cell '{}/{}' targets `placement = mesh`, but no eligible mesh peers in peer_registry satisfy its 4D resource/capability requirements (needed {}, found {})",
+                        app,
+                        a.cell_id,
+                        replicas,
+                        winners.len()
+                    );
+                }
+                let node_ids: Vec<String> = winners.iter().map(|(p, _)| p.public_key.clone()).collect();
+                let endpoints: Vec<String> = winners
+                    .iter()
+                    .map(|(p, _)| p.endpoint.clone().unwrap_or_else(|| p.mesh_ipv4()))
+                    .collect();
+                scheduled_mesh_targets.insert(a.cell_id.clone(), (node_ids, endpoints));
             }
         }
 
@@ -831,6 +1127,10 @@ impl ManifestReconciler {
                     .await?;
 
                 let live_state = cells.cell_state(app, &act.cell_id).await;
+                let (assigned_nodes, mesh_endpoints) = scheduled_mesh_targets
+                    .get(&act.cell_id)
+                    .cloned()
+                    .unwrap_or_else(|| (vec![blobs.node_id().to_string()], vec!["127.0.0.1".to_string()]));
                 next_cells.insert(
                     act.cell_id.clone(),
                     DeployedCellState {
@@ -842,6 +1142,8 @@ impl ManifestReconciler {
                         placement: compiled.effective_placement,
                         migration_policy: compiled.migration_policy,
                         replicas: compiled.replicas,
+                        assigned_nodes,
+                        mesh_endpoints,
                     },
                 );
             }

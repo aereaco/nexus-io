@@ -3,7 +3,25 @@ use salvo::http::{header, Method};
 use bytes::Bytes;
 use std::sync::Arc;
 
+use crate::iam::capabilities::{Capability, CapabilitySet};
+use crate::observability::global_metrics;
 use crate::storage::BlobBridge;
+use crate::ux::iam::depot_auth_context;
+
+fn require_blob_capability(depot: &Depot, res: &mut Response, cap: Capability) -> bool {
+    let auth = depot_auth_context(depot);
+    let caps = CapabilitySet::from_auth_context(auth.as_ref());
+    if caps.has(cap) {
+        return true;
+    }
+    global_metrics().inc_iam_auth_denial();
+    res.status_code(StatusCode::FORBIDDEN);
+    res.render(Json(serde_json::json!({
+        "code": 403,
+        "details": format!("Missing required capability {:?}", cap)
+    })));
+    false
+}
 
 /// S3 request handler struct
 #[derive(Clone)]
@@ -16,15 +34,35 @@ impl Handler for S3ProxyHandler {
     async fn handle(
         &self,
         req: &mut Request,
-        _depot: &mut Depot,
+        depot: &mut Depot,
         res: &mut Response,
         _ctrl: &mut FlowCtrl,
     ) {
         match req.method() {
-            &Method::GET => self.handle_get(req, res).await,
-            &Method::PUT => self.handle_put(req, res).await,
-            &Method::DELETE => self.handle_delete(req, res).await,
-            &Method::HEAD => self.handle_head(req, res).await,
+            &Method::GET => {
+                if !require_blob_capability(depot, res, Capability::BlobRead) {
+                    return;
+                }
+                self.handle_get(req, res).await;
+            }
+            &Method::PUT => {
+                if !require_blob_capability(depot, res, Capability::BlobWrite) {
+                    return;
+                }
+                self.handle_put(req, res).await;
+            }
+            &Method::DELETE => {
+                if !require_blob_capability(depot, res, Capability::BlobWrite) {
+                    return;
+                }
+                self.handle_delete(req, res).await;
+            }
+            &Method::HEAD => {
+                if !require_blob_capability(depot, res, Capability::BlobRead) {
+                    return;
+                }
+                self.handle_head(req, res).await;
+            }
             _ => {
                 res.status_code(StatusCode::METHOD_NOT_ALLOWED);
                 res.render(Text::Plain("Method not allowed"));
@@ -54,6 +92,9 @@ impl S3ProxyHandler {
                 // Set S3-specific headers
                 res.headers_mut().insert("x-amz-request-id", header::HeaderValue::from_static("nexus-io-gateway"));
                 res.headers_mut().insert(header::CONTENT_LENGTH, header::HeaderValue::from(data.len()));
+                if let Ok(Some(meta)) = self.garage.head_object(&bucket, &key).await {
+                    res.add_header("ETag", format!("\"{}\"", meta.etag), true).ok();
+                }
                 
                 if let Some(content_type) = guess_content_type(&key) {
                     if let Ok(value) = header::HeaderValue::from_str(content_type) {
@@ -213,7 +254,14 @@ fn parse_s3_path(req: &Request) -> Option<(String, String)> {
     let bucket = parts.next()?.to_string();
     let key = parts.next().unwrap_or("").to_string();
     
-    if bucket.is_empty() {
+    if bucket.is_empty()
+        || bucket.contains("..")
+        || bucket.contains('\\')
+        || bucket.contains('\0')
+        || key.contains('\0')
+        || key.contains('\\')
+        || key.split('/').any(|seg| seg == "..")
+    {
         return None;
     }
     
