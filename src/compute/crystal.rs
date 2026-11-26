@@ -806,10 +806,7 @@ fn register_nexus_host_abi(linker: &mut Linker<CrystalWasiState>) -> Result<()> 
                     capacity as usize,
                     crate::arena::TransportMode::PortableCopy,
                 ) {
-                    Ok(desc) => {
-                        // Pack `(generation: u32 << 32) | (id: u32)` for compact C-ABI handle
-                        ((desc.handle.generation as i64) << 32) | (desc.handle.id as i64 & 0xFFFF_FFFF)
-                    }
+                    Ok(desc) => desc.handle.pack_i64(),
                     Err(_) => -3,
                 }
             },
@@ -825,22 +822,34 @@ fn register_nexus_host_abi(linker: &mut Linker<CrystalWasiState>) -> Result<()> 
              src_ptr: i32,
              src_len: i32|
              -> i32 {
-                let Some(src) = read_guest_bytes(&mut caller, src_ptr, src_len) else {
+                if src_ptr < 0 || src_len < 0 {
                     return -4;
-                };
+                }
                 let Some(owner) = caller.data().arena_owner.clone() else {
                     return -1;
                 };
-                let handle = crate::arena::RingBufferHandle {
-                    id: (packed_handle & 0xFFFF_FFFF) as u64,
-                    generation: ((packed_handle >> 32) & 0xFFFF_FFFF) as u32,
+                let handle = crate::arena::RingBufferHandle::unpack_i64(packed_handle);
+                let ring = match crate::arena::NexusSharedArena::global().get_ring(handle, Some(&owner)) {
+                    Ok(r) => r,
+                    Err(crate::arena::ArenaError::PermissionDenied) => return -2,
+                    Err(_) => return -3,
                 };
-                match crate::arena::NexusSharedArena::global().get_ring(handle, Some(&owner)) {
-                    Ok(ring) => match ring.write(&src) {
-                        Ok(n) => n as i32,
-                        Err(_) => -3,
-                    },
-                    Err(crate::arena::ArenaError::PermissionDenied) => -2,
+                let Some(mem) = caller.get_export("memory").and_then(|e| e.into_memory()) else {
+                    return -4;
+                };
+                let start = src_ptr as usize;
+                let end = match start.checked_add(src_len as usize) {
+                    Some(v) => v,
+                    None => return -4,
+                };
+                let data = mem.data(&caller);
+                if end > data.len() {
+                    return -4;
+                }
+                // Direct slice transfer from Wasm linear memory into SPSC ring (zero temp Vec)
+                match ring.write(&data[start..end]) {
+                    Ok(n) => n as i32,
+                    Err(crate::arena::ArenaError::Busy) => -5,
                     Err(_) => -3,
                 }
             },
@@ -856,25 +865,34 @@ fn register_nexus_host_abi(linker: &mut Linker<CrystalWasiState>) -> Result<()> 
              dst_ptr: i32,
              dst_cap: i32|
              -> i32 {
-                if dst_cap < 0 {
+                if dst_ptr < 0 || dst_cap < 0 {
                     return -4;
                 }
                 let Some(owner) = caller.data().arena_owner.clone() else {
                     return -1;
                 };
-                let handle = crate::arena::RingBufferHandle {
-                    id: (packed_handle & 0xFFFF_FFFF) as u64,
-                    generation: ((packed_handle >> 32) & 0xFFFF_FFFF) as u32,
+                let handle = crate::arena::RingBufferHandle::unpack_i64(packed_handle);
+                let ring = match crate::arena::NexusSharedArena::global().get_ring(handle, Some(&owner)) {
+                    Ok(r) => r,
+                    Err(crate::arena::ArenaError::PermissionDenied) => return -2,
+                    Err(_) => return -3,
                 };
-                match crate::arena::NexusSharedArena::global().get_ring(handle, Some(&owner)) {
-                    Ok(ring) => {
-                        let mut tmp = vec![0u8; dst_cap as usize];
-                        match ring.read(&mut tmp) {
-                            Ok(n) => write_guest_bytes(&mut caller, dst_ptr, dst_cap, &tmp[..n]),
-                            Err(_) => -3,
-                        }
-                    }
-                    Err(crate::arena::ArenaError::PermissionDenied) => -2,
+                let Some(mem) = caller.get_export("memory").and_then(|e| e.into_memory()) else {
+                    return -4;
+                };
+                let start = dst_ptr as usize;
+                let end = match start.checked_add(dst_cap as usize) {
+                    Some(v) => v,
+                    None => return -4,
+                };
+                let data = mem.data_mut(&mut caller);
+                if end > data.len() {
+                    return -4;
+                }
+                // Direct slice transfer from SPSC ring into Wasm linear memory (zero temp Vec)
+                match ring.read(&mut data[start..end]) {
+                    Ok(n) => n as i32,
+                    Err(crate::arena::ArenaError::Busy) => -5,
                     Err(_) => -3,
                 }
             },

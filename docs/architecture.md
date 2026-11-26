@@ -87,15 +87,17 @@ Every Nexus-IO node participates in a decentralized, peer-to-peer compute and st
 Nexus-IO acts as a **universal application runtime** shared across all Wasm hosted guests (Rust, Go, Python, PHP, QuickJS/TS) and Nexus-UX frontends across Windows, Linux, macOS, Android, iOS, and headless edge nodes:
 
 - **General-Purpose Data Plane (`src/arena.rs` — `NexusSharedArena`):**
-  - Provides generation-validated handles (`SharedBufferHandle`, `RingBufferHandle`, `BufferLease`), `TransportMode::SharedMemory | PortableCopy`, and lock-free `SpscRingBuffer` streams (`Acquire`/`Release` atomic cursor ordering).
-  - Every handle is tagged with an `owner_id` (e.g. `cell:<app>/<cell_id>`) and deterministically revoked via `revoke_owner()` when a Wasm cell exits or hibernates.
+  - Provides explicitly bounded `u32` generation-validated handles (`SharedBufferHandle`, `RingBufferHandle`, `BufferLease`), exclusive `RingProducer`/`RingConsumer` endpoints, and lock-free `SpscRingBuffer` streams with runtime-enforced single-producer/single-consumer exclusivity (`Err(ArenaError::Busy)` on same-side concurrency).
+  - Uses a 64-bit linearized `LifecycleGate` (`REVOKED_BIT` + active-op count) so `revoke_owner()` drains all in-flight operations before returning, preventing post-revocation cursor publication.
+  - Currently implements `TransportMode::PortableCopy` (direct slice transfer to/from Wasm linear memory with zero intermediate heap `Vec` and zero serialization); `TransportMode::SharedMemory` explicitly returns `UnsupportedTransport` until real imported Wasm shared-memory mapping is wired.
 - **Capability-Oriented Hardware Discovery & Live OS Consent (`src/hardware/mod.rs`):**
   - Separates device discovery (`HardwareClass::Camera`, `Audio`, `Sensor`, `Gpu`, `OsUi`, etc.) from authority (`Capability::HwInfo`, `HwCamera`, `HwAudio`, `HwSensor`, `HwBus`, `HwGpu`, `HwBiometrics`, `OsUi`, `OsClipboard`).
   - Enforces $C_{\text{effective}} = C_{\text{requested}} \cap C_{\text{operator}} \cap C_{\text{IAM}} \cap C_{\text{OS}}$, querying live OS permission state (`ConsentState::NotDetermined | Granted | Denied | Restricted | Unsupported`) via `ConsentProvider` rather than trusting cached grants.
 - **Dual-Mode OS UI (`OsShellProvider` + Versioned Retained-Mode `UiOpHeader`):**
   - Apps choose freely between Native WebView (`gui-webview`) and Native OS Shell/Widget APIs (`ui.window.*`, `ui.dialog.*`, `ui.notify.*`, `ui.tray.*`, `ui.clipboard.*`, `ui.haptics.*`, plus the 16-byte fixed binary `UiOpHeader` batch protocol).
 - **Dual Interface Contract (`nexus_host` C-ABI + `wit/nexus-host.wit`):**
-  - Both low-level `nexus_host` imports (`nexus_hw_list`, `nexus_hw_call`, `nexus_ui_commit_ops`, `nexus_ring_alloc`, `nexus_ring_write`, `nexus_ring_read`) and canonical WIT interfaces (`nexus:host@0.1.0`) resolve to the exact same `HardwareRegistry` and `NexusSharedArena`.
+  - `nexus_host` Preview 1 C-ABI imports (`nexus_hw_list`, `nexus_hw_call`, `nexus_ui_commit_ops`, `nexus_ring_alloc`, `nexus_ring_write`, `nexus_ring_read`) are active today and route directly to `HardwareRegistry` and `NexusSharedArena`.
+  - `wit/nexus-host.wit` (`package nexus:host@0.1.0`) defines the canonical Component Model contract to be bound to the same `HardwareRegistry::dispatch_authorized` & `NexusSharedArena` backend.
   - Gateway exposes `GET /_nexus/hardware` and `POST /_nexus/hardware/call` (strictly IAM + capability gated).
 
 ## 9. Semantic Deployment Profiles (`Cargo.toml`)

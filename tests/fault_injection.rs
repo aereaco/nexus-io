@@ -1041,13 +1041,10 @@ async fn universal_host_hardware_ui_and_shared_arena_security_and_lifecycle() {
     assert!(packed_h > 0);
 
     // After guest exit, `CrystalEngine` MUST have deterministically revoked the guest's ring handle!
-    let leaked_handle = RingBufferHandle {
-        id: (packed_h & 0xFFFF_FFFF) as u64,
-        generation: ((packed_h >> 32) & 0xFFFF_FFFF) as u32,
-    };
+    let leaked_handle = RingBufferHandle::unpack_i64(packed_h);
     assert_eq!(
         NexusSharedArena::global()
-            .get_ring(leaked_handle, Some("cell:hal-demo/sensor-cell"))
+            .get_ring(leaked_handle, None)
             .err(),
         Some(ArenaError::Revoked)
     );
