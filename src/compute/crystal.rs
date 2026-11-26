@@ -388,6 +388,10 @@ impl CrystalEngine {
                 .map_err(wt_err)?;
         }
 
+        let owner_key = host
+            .as_ref()
+            .map(|h| format!("cell:{}/{}", h.app, h.cell_id));
+
         let state = CrystalWasiState {
             wasi: builder.build_p1(),
             host,
@@ -404,7 +408,14 @@ impl CrystalEngine {
             .get_typed_func::<(), ()>(&mut store, "_start")
             .map_err(|e| anyhow!("WASI module missing '_start' entrypoint: {}", e))?;
 
-        let exit_code = match start.call(&mut store, ()) {
+        let exit_res = start.call(&mut store, ());
+
+        // Deterministic ZCZS arena cleanup: revoke all active buffer/ring handles owned by this cell
+        if let Some(ref owner) = owner_key {
+            crate::arena::NexusSharedArena::global().revoke_owner(owner);
+        }
+
+        let exit_code = match exit_res {
             Ok(()) => 0,
             Err(err) => {
                 if let Some(exit) = err.downcast_ref::<wasmtime_wasi::I32Exit>() {
@@ -666,6 +677,198 @@ fn register_nexus_host_abi(linker: &mut Linker<CrystalWasiState>) -> Result<()> 
                 match run_host_future(host.blobs.get_object(&bucket, &key)) {
                     Ok(Some(bytes)) => write_guest_bytes(&mut caller, out_ptr, out_cap, &bytes),
                     Ok(None) => 0,
+                    Err(_) => -3,
+                }
+            },
+        )
+        .map_err(wt_err)?;
+
+    // --- Universal Native Hardware & OS Native UI C-ABI (`nexus_host`) ---
+    linker
+        .func_wrap(
+            "nexus_host",
+            "nexus_hw_list",
+            |mut caller: Caller<'_, CrystalWasiState>,
+             class_ptr: i32,
+             class_len: i32,
+             out_ptr: i32,
+             out_cap: i32|
+             -> i32 {
+                let Some(host) = caller.data().host.clone() else {
+                    return -1;
+                };
+                if !host.capabilities.has(Capability::HwInfo) {
+                    global_metrics().inc_iam_auth_denial();
+                    return -2;
+                }
+                let filter = if class_len > 0 {
+                    let Some(bytes) = read_guest_bytes(&mut caller, class_ptr, class_len) else {
+                        return -4;
+                    };
+                    crate::hardware::HardwareClass::from_str_filter(&String::from_utf8_lossy(&bytes))
+                } else {
+                    None
+                };
+                let devices = crate::hardware::HardwareRegistry::global().list_devices(filter);
+                let json = serde_json::to_vec(&devices).unwrap_or_else(|_| b"[]".to_vec());
+                write_guest_bytes(&mut caller, out_ptr, out_cap, &json)
+            },
+        )
+        .map_err(wt_err)?;
+
+    linker
+        .func_wrap(
+            "nexus_host",
+            "nexus_hw_call",
+            |mut caller: Caller<'_, CrystalWasiState>,
+             op_ptr: i32,
+             op_len: i32,
+             payload_ptr: i32,
+             payload_len: i32,
+             out_ptr: i32,
+             out_cap: i32|
+             -> i32 {
+                let Some(op_bytes) = read_guest_bytes(&mut caller, op_ptr, op_len) else {
+                    return -4;
+                };
+                let payload_bytes = if payload_len > 0 {
+                    let Some(b) = read_guest_bytes(&mut caller, payload_ptr, payload_len) else {
+                        return -4;
+                    };
+                    b
+                } else {
+                    b"{}".to_vec()
+                };
+                let Some(host) = caller.data().host.clone() else {
+                    return -1;
+                };
+                let op = String::from_utf8_lossy(&op_bytes).to_string();
+                let req_cap = crate::hardware::required_capability_for_op(&op);
+                if !host.capabilities.has(req_cap) {
+                    global_metrics().inc_iam_auth_denial();
+                    return -2;
+                }
+                let payload_val: serde_json::Value =
+                    serde_json::from_slice(&payload_bytes).unwrap_or_else(|_| serde_json::json!({}));
+                let resp = crate::hardware::HardwareRegistry::global().dispatch(&op, &payload_val);
+                let json = serde_json::to_vec(&resp).unwrap_or_else(|_| b"{}".to_vec());
+                write_guest_bytes(&mut caller, out_ptr, out_cap, &json)
+            },
+        )
+        .map_err(wt_err)?;
+
+    linker
+        .func_wrap(
+            "nexus_host",
+            "nexus_ui_commit_ops",
+            |mut caller: Caller<'_, CrystalWasiState>,
+             batch_ptr: i32,
+             batch_len: i32,
+             out_ptr: i32,
+             out_cap: i32|
+             -> i32 {
+                let Some(batch) = read_guest_bytes(&mut caller, batch_ptr, batch_len) else {
+                    return -4;
+                };
+                let Some(host) = caller.data().host.clone() else {
+                    return -1;
+                };
+                if !host.capabilities.has(Capability::OsUi) {
+                    global_metrics().inc_iam_auth_denial();
+                    return -2;
+                }
+                let resp = crate::hardware::HardwareRegistry::global().commit_ui_ops(&batch);
+                let json = serde_json::to_vec(&resp).unwrap_or_else(|_| b"{}".to_vec());
+                write_guest_bytes(&mut caller, out_ptr, out_cap, &json)
+            },
+        )
+        .map_err(wt_err)?;
+
+    // --- General-Purpose `NexusSharedArena` SPSC Ring Buffer C-ABI ---
+    linker
+        .func_wrap(
+            "nexus_host",
+            "nexus_ring_alloc",
+            |caller: Caller<'_, CrystalWasiState>, capacity: i32| -> i64 {
+                if capacity <= 0 {
+                    return -4;
+                }
+                let Some(host) = caller.data().host.clone() else {
+                    return -1;
+                };
+                let owner = format!("cell:{}/{}", host.app, host.cell_id);
+                match crate::arena::NexusSharedArena::global().alloc_ring(
+                    owner,
+                    "guest.ring",
+                    capacity as usize,
+                    crate::arena::TransportMode::PortableCopy,
+                ) {
+                    Ok(desc) => {
+                        // Pack `(generation: u32 << 32) | (id: u32)` for compact C-ABI handle
+                        ((desc.handle.generation as i64) << 32) | (desc.handle.id as i64 & 0xFFFF_FFFF)
+                    }
+                    Err(_) => -3,
+                }
+            },
+        )
+        .map_err(wt_err)?;
+
+    linker
+        .func_wrap(
+            "nexus_host",
+            "nexus_ring_write",
+            |mut caller: Caller<'_, CrystalWasiState>,
+             packed_handle: i64,
+             src_ptr: i32,
+             src_len: i32|
+             -> i32 {
+                let Some(src) = read_guest_bytes(&mut caller, src_ptr, src_len) else {
+                    return -4;
+                };
+                let Some(host) = caller.data().host.clone() else {
+                    return -1;
+                };
+                let owner = format!("cell:{}/{}", host.app, host.cell_id);
+                let handle = crate::arena::RingBufferHandle {
+                    id: (packed_handle & 0xFFFF_FFFF) as u64,
+                    generation: ((packed_handle >> 32) & 0xFFFF_FFFF) as u32,
+                };
+                match crate::arena::NexusSharedArena::global().get_ring(handle, Some(&owner)) {
+                    Ok(ring) => ring.write(&src) as i32,
+                    Err(crate::arena::ArenaError::PermissionDenied) => -2,
+                    Err(_) => -3,
+                }
+            },
+        )
+        .map_err(wt_err)?;
+
+    linker
+        .func_wrap(
+            "nexus_host",
+            "nexus_ring_read",
+            |mut caller: Caller<'_, CrystalWasiState>,
+             packed_handle: i64,
+             dst_ptr: i32,
+             dst_cap: i32|
+             -> i32 {
+                if dst_cap < 0 {
+                    return -4;
+                }
+                let Some(host) = caller.data().host.clone() else {
+                    return -1;
+                };
+                let owner = format!("cell:{}/{}", host.app, host.cell_id);
+                let handle = crate::arena::RingBufferHandle {
+                    id: (packed_handle & 0xFFFF_FFFF) as u64,
+                    generation: ((packed_handle >> 32) & 0xFFFF_FFFF) as u32,
+                };
+                match crate::arena::NexusSharedArena::global().get_ring(handle, Some(&owner)) {
+                    Ok(ring) => {
+                        let mut tmp = vec![0u8; dst_cap as usize];
+                        let n = ring.read(&mut tmp);
+                        write_guest_bytes(&mut caller, dst_ptr, dst_cap, &tmp[..n])
+                    }
+                    Err(crate::arena::ArenaError::PermissionDenied) => -2,
                     Err(_) => -3,
                 }
             },

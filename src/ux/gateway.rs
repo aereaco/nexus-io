@@ -766,6 +766,18 @@ impl UxGateway {
                         .put(MeshBlobTransferHandler {
                             garage: self.garage.clone(),
                         }),
+                )
+                .push(
+                    Router::with_path("/_nexus/hardware")
+                        .hoop(gate.clone())
+                        .hoop(crate::ux::iam::IamMiddleware::authenticated(self.db.clone()))
+                        .get(HardwareListHandler),
+                )
+                .push(
+                    Router::with_path("/_nexus/hardware/call")
+                        .hoop(gate.clone())
+                        .hoop(crate::ux::iam::IamMiddleware::authenticated(self.db.clone()))
+                        .post(HardwareCallHandler),
                 );
         }
 
@@ -1276,6 +1288,98 @@ impl Handler for MeshBlobTransferHandler {
                 res.status_code(StatusCode::METHOD_NOT_ALLOWED);
             }
         }
+    }
+}
+
+#[derive(Clone)]
+struct HardwareListHandler;
+
+#[async_trait]
+impl Handler for HardwareListHandler {
+    async fn handle(
+        &self,
+        req: &mut Request,
+        depot: &mut Depot,
+        res: &mut Response,
+        _ctrl: &mut FlowCtrl,
+    ) {
+        use crate::hardware::{HardwareClass, HardwareRegistry};
+        use crate::iam::capabilities::{Capability, CapabilitySet};
+
+        let auth = crate::ux::iam::depot_auth_context(depot);
+        let caller_caps = CapabilitySet::from_auth_context(auth.as_ref());
+        if !caller_caps.has(Capability::HwInfo) {
+            crate::observability::global_metrics().inc_iam_auth_denial();
+            res.status_code(StatusCode::FORBIDDEN);
+            res.render(Json(serde_json::json!({ "error": "Missing required capability hw.info" })));
+            return;
+        }
+        let class_filter = req
+            .query::<String>("class")
+            .and_then(|c| HardwareClass::from_str_filter(&c));
+        let devices = HardwareRegistry::global().list_devices(class_filter);
+        res.status_code(StatusCode::OK);
+        res.render(Json(serde_json::json!({
+            "os": std::env::consts::OS,
+            "arch": std::env::consts::ARCH,
+            "devices": devices,
+        })));
+    }
+}
+
+#[derive(Clone)]
+struct HardwareCallHandler;
+
+#[async_trait]
+impl Handler for HardwareCallHandler {
+    async fn handle(
+        &self,
+        req: &mut Request,
+        depot: &mut Depot,
+        res: &mut Response,
+        _ctrl: &mut FlowCtrl,
+    ) {
+        use crate::hardware::{required_capability_for_op, HardwareRegistry, HardwareStatus};
+        use crate::iam::capabilities::CapabilitySet;
+
+        #[derive(serde::Deserialize)]
+        struct HwCallBody {
+            op: String,
+            #[serde(default)]
+            payload: serde_json::Value,
+        }
+
+        let body: HwCallBody = match req.parse_json().await {
+            Ok(b) => b,
+            Err(e) => {
+                res.status_code(StatusCode::BAD_REQUEST);
+                res.render(Json(serde_json::json!({ "error": format!("Invalid hardware call JSON: {}", e) })));
+                return;
+            }
+        };
+
+        let req_cap = required_capability_for_op(&body.op);
+        let auth = crate::ux::iam::depot_auth_context(depot);
+        let caller_caps = CapabilitySet::from_auth_context(auth.as_ref());
+        if !caller_caps.has(req_cap) {
+            crate::observability::global_metrics().inc_iam_auth_denial();
+            res.status_code(StatusCode::FORBIDDEN);
+            res.render(Json(serde_json::json!({
+                "error": format!("Missing required capability {:?} for '{}'", req_cap, body.op)
+            })));
+            return;
+        }
+
+        let resp = HardwareRegistry::global().dispatch(&body.op, &body.payload);
+        let code = match resp.status {
+            HardwareStatus::Ok => StatusCode::OK,
+            HardwareStatus::PermissionDenied | HardwareStatus::ConsentRequired => StatusCode::FORBIDDEN,
+            HardwareStatus::InvalidRequest => StatusCode::BAD_REQUEST,
+            HardwareStatus::DeviceNotFound => StatusCode::NOT_FOUND,
+            _ => StatusCode::NOT_IMPLEMENTED,
+        };
+        res.status_code(code);
+        res.render(Json(resp));
     }
 }
 

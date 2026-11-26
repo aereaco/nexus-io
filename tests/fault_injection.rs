@@ -945,3 +945,122 @@ requires = ["gpu", "vram:16384", "region:us-west"]
         .await;
     assert_eq!(r_blob_get.status_code, Some(salvo::http::StatusCode::OK));
 }
+
+/// Milestone 1 Universal Host Test:
+/// Proves that WASI guests share the exact same capability-gated `nexus_host` Hardware + OS UI
+/// + `NexusSharedArena` SPSC ring ABI, enforcing default-deny `-2` when capabilities are missing,
+/// validating versioned `UiOpHeader` batches, and deterministically revoking handles on exit.
+#[tokio::test(flavor = "multi_thread")]
+async fn universal_host_hardware_ui_and_shared_arena_security_and_lifecycle() {
+    use nexus_io::arena::{ArenaError, NexusSharedArena, RingBufferHandle};
+    use nexus_io::compute::crystal::{CrystalEngine, NexusHostContext, WasiRunConfig};
+    use nexus_io::hardware::{UiOpCode, UiOpHeader, UI_OP_PROTOCOL_VERSION};
+    use nexus_io::iam::capabilities::{Capability, CapabilitySet};
+    use nexus_io::js::cell::CellDbConfig;
+
+    let db = Arc::new(Database::open_mem());
+    let blobs = Arc::new(BlobBridge::new(db.clone()).await.unwrap());
+    let engine = CrystalEngine::new().unwrap();
+
+    // WASI guest that:
+    //  1) Calls `nexus_hw_call("system.info", "{}")` -> expects > 0 bytes when `hw.info` is granted
+    //  2) Calls `nexus_hw_call("camera.capture", "{}")` -> expects `-2` (denied: lacks `hw.camera`)
+    //  3) Allocates an SPSC ring (`nexus_ring_alloc(32)`), writes "hi", reads it back (`2`),
+    //     and writes the packed handle to stdout (8 bytes) so host can verify deterministic revocation after exit!
+    let wat = r#"
+    (module
+      (import "nexus_host" "nexus_hw_call" (func $hw_call (param i32 i32 i32 i32 i32 i32) (result i32)))
+      (import "nexus_host" "nexus_ring_alloc" (func $ring_alloc (param i32) (result i64)))
+      (import "nexus_host" "nexus_ring_write" (func $ring_write (param i64 i32 i32) (result i32)))
+      (import "nexus_host" "nexus_ring_read" (func $ring_read (param i64 i32 i32) (result i32)))
+      (import "wasi_snapshot_preview1" "fd_write" (func $fd_write (param i32 i32 i32 i32) (result i32)))
+      (memory (export "memory") 1)
+      (data (i32.const 0) "system.info")
+      (data (i32.const 32) "camera.capture")
+      (data (i32.const 64) "{}")
+      (data (i32.const 80) "hi")
+      (func (export "_start")
+        (local $r1 i32)
+        (local $r2 i32)
+        (local $h i64)
+        (local $rw i32)
+        (local $rr i32)
+        ;; 1. system.info (allowed by hw.info)
+        (local.set $r1 (call $hw_call (i32.const 0) (i32.const 11) (i32.const 64) (i32.const 2) (i32.const 256) (i32.const 512)))
+        ;; 2. camera.capture (MUST return -2: denied by CapabilitySet)
+        (local.set $r2 (call $hw_call (i32.const 32) (i32.const 14) (i32.const 64) (i32.const 2) (i32.const 256) (i32.const 512)))
+        ;; 3. SPSC ring alloc, write "hi", read back
+        (local.set $h (call $ring_alloc (i32.const 32)))
+        (local.set $rw (call $ring_write (local.get $h) (i32.const 80) (i32.const 2)))
+        (local.set $rr (call $ring_read (local.get $h) (i32.const 96) (i32.const 8)))
+        ;; Store results at offset 128..152 (r1: i32, r2: i32, rw: i32, rr: i32, h: i64)
+        (i32.store (i32.const 128) (local.get $r1))
+        (i32.store (i32.const 132) (local.get $r2))
+        (i32.store (i32.const 136) (local.get $rw))
+        (i32.store (i32.const 140) (local.get $rr))
+        (i64.store (i32.const 144) (local.get $h))
+        ;; Write 24 bytes from 128 to stdout via iovec at 200
+        (i32.store (i32.const 200) (i32.const 128))
+        (i32.store (i32.const 204) (i32.const 24))
+        (drop (call $fd_write (i32.const 1) (i32.const 200) (i32.const 1) (i32.const 208)))
+      )
+    )
+    "#;
+
+    let host = NexusHostContext::new(
+        "hal-demo",
+        "sensor-cell",
+        CellDbConfig::stateless(),
+        db.clone(),
+        blobs.clone(),
+    )
+    .with_capabilities(CapabilitySet::from_iter([
+        Capability::HwInfo,
+        Capability::OsUi,
+    ]));
+
+    let out = tokio::task::spawn_blocking(move || {
+        engine.run_wasi_with_host(wat.as_bytes(), WasiRunConfig::default(), host)
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(out.exit_code, 0);
+    assert_eq!(out.stdout.len(), 24);
+
+    let r1 = i32::from_le_bytes(out.stdout[0..4].try_into().unwrap());
+    let r2 = i32::from_le_bytes(out.stdout[4..8].try_into().unwrap());
+    let rw = i32::from_le_bytes(out.stdout[8..12].try_into().unwrap());
+    let rr = i32::from_le_bytes(out.stdout[12..16].try_into().unwrap());
+    let packed_h = i64::from_le_bytes(out.stdout[16..24].try_into().unwrap());
+
+    assert!(r1 > 0, "system.info MUST succeed when hw.info is granted (got {})", r1);
+    assert_eq!(r2, -2, "camera.capture MUST fail closed with -2 when hw.camera is not granted");
+    assert_eq!(rw, 2, "SPSC ring write must return 2 bytes");
+    assert_eq!(rr, 2, "SPSC ring read must return 2 bytes");
+    assert!(packed_h > 0);
+
+    // After guest exit, `CrystalEngine` MUST have deterministically revoked the guest's ring handle!
+    let leaked_handle = RingBufferHandle {
+        id: (packed_h & 0xFFFF_FFFF) as u64,
+        generation: ((packed_h >> 32) & 0xFFFF_FFFF) as u32,
+    };
+    assert_eq!(
+        NexusSharedArena::global()
+            .get_ring(leaked_handle, Some("cell:hal-demo/sensor-cell"))
+            .err(),
+        Some(ArenaError::Revoked)
+    );
+
+    // Verify versioned binary UiOpHeader batch round-trip
+    let hdr = UiOpHeader {
+        version: UI_OP_PROTOCOL_VERSION,
+        opcode: UiOpCode::CreateNode as u16,
+        payload_len: 4,
+        node_id: 7,
+    };
+    let mut batch = Vec::new();
+    batch.extend_from_slice(&hdr.to_le_bytes());
+    batch.extend_from_slice(b"btn1");
+    assert_eq!(nexus_io::hardware::validate_ui_op_batch(&batch).unwrap(), 1);
+}

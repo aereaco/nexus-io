@@ -32,6 +32,25 @@ pub enum Capability {
     SecretsRead,
     #[serde(rename = "metrics.read")]
     MetricsRead,
+    // Universal Native Hardware & OS Native UI Capabilities (Default-Deny)
+    #[serde(rename = "hw.info")]
+    HwInfo,
+    #[serde(rename = "hw.camera")]
+    HwCamera,
+    #[serde(rename = "hw.audio")]
+    HwAudio,
+    #[serde(rename = "hw.sensor")]
+    HwSensor,
+    #[serde(rename = "hw.bus")]
+    HwBus,
+    #[serde(rename = "hw.gpu")]
+    HwGpu,
+    #[serde(rename = "hw.biometrics")]
+    HwBiometrics,
+    #[serde(rename = "os.ui")]
+    OsUi,
+    #[serde(rename = "os.clipboard")]
+    OsClipboard,
 }
 
 impl Capability {
@@ -49,6 +68,15 @@ impl Capability {
             "runtime.install" => Some(Self::RuntimeInstall),
             "secrets.read" => Some(Self::SecretsRead),
             "metrics.read" => Some(Self::MetricsRead),
+            "hw.info" => Some(Self::HwInfo),
+            "hw.camera" => Some(Self::HwCamera),
+            "hw.audio" => Some(Self::HwAudio),
+            "hw.sensor" => Some(Self::HwSensor),
+            "hw.bus" => Some(Self::HwBus),
+            "hw.gpu" => Some(Self::HwGpu),
+            "hw.biometrics" => Some(Self::HwBiometrics),
+            "os.ui" => Some(Self::OsUi),
+            "os.clipboard" => Some(Self::OsClipboard),
             _ => None,
         }
     }
@@ -120,6 +148,15 @@ impl CapabilitySet {
             Capability::RuntimeInstall,
             Capability::SecretsRead,
             Capability::MetricsRead,
+            Capability::HwInfo,
+            Capability::HwCamera,
+            Capability::HwAudio,
+            Capability::HwSensor,
+            Capability::HwBus,
+            Capability::HwGpu,
+            Capability::HwBiometrics,
+            Capability::OsUi,
+            Capability::OsClipboard,
         ])
     }
 
@@ -148,10 +185,16 @@ impl CapabilitySet {
                 Capability::BlobWrite,
                 Capability::CellSpawn,
                 Capability::MetricsRead,
+                Capability::HwInfo,
+                Capability::OsUi,
             ])
         } else {
             // Viewer / Record-level identity: strictly read-only
-            Self::read_only_cell()
+            Self::from_iter([
+                Capability::DbRead,
+                Capability::BlobRead,
+                Capability::HwInfo,
+            ])
         }
     }
 

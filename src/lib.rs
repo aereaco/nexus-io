@@ -1,7 +1,9 @@
+pub mod arena;
 pub mod compute;
 pub mod db;
 pub mod economy;
 pub mod ffi;
+pub mod hardware;
 pub mod iam;
 pub mod js;
 pub mod observability;
