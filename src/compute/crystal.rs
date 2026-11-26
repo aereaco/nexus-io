@@ -85,6 +85,7 @@ impl NexusHostContext {
 struct CrystalWasiState {
     wasi: WasiP1Ctx,
     host: Option<NexusHostContext>,
+    arena_owner: Option<String>,
 }
 
 /// Capability-scoped configuration for executing any WASI polyglot module
@@ -388,13 +389,16 @@ impl CrystalEngine {
                 .map_err(wt_err)?;
         }
 
-        let owner_key = host
-            .as_ref()
-            .map(|h| format!("cell:{}/{}", h.app, h.cell_id));
+        let owner_key = host.as_ref().map(|h| {
+            crate::arena::NexusSharedArena::global()
+                .mint_owner_id(&h.app, &h.cell_id)
+                .as_canonical()
+        });
 
         let state = CrystalWasiState {
             wasi: builder.build_p1(),
             host,
+            arena_owner: owner_key.clone(),
         };
         let mut store = Store::new(&self.engine, state);
         store.set_fuel(cfg.fuel_limit).map_err(wt_err)?;
@@ -793,10 +797,9 @@ fn register_nexus_host_abi(linker: &mut Linker<CrystalWasiState>) -> Result<()> 
                 if capacity <= 0 {
                     return -4;
                 }
-                let Some(host) = caller.data().host.clone() else {
+                let Some(owner) = caller.data().arena_owner.clone() else {
                     return -1;
                 };
-                let owner = format!("cell:{}/{}", host.app, host.cell_id);
                 match crate::arena::NexusSharedArena::global().alloc_ring(
                     owner,
                     "guest.ring",
@@ -825,16 +828,18 @@ fn register_nexus_host_abi(linker: &mut Linker<CrystalWasiState>) -> Result<()> 
                 let Some(src) = read_guest_bytes(&mut caller, src_ptr, src_len) else {
                     return -4;
                 };
-                let Some(host) = caller.data().host.clone() else {
+                let Some(owner) = caller.data().arena_owner.clone() else {
                     return -1;
                 };
-                let owner = format!("cell:{}/{}", host.app, host.cell_id);
                 let handle = crate::arena::RingBufferHandle {
                     id: (packed_handle & 0xFFFF_FFFF) as u64,
                     generation: ((packed_handle >> 32) & 0xFFFF_FFFF) as u32,
                 };
                 match crate::arena::NexusSharedArena::global().get_ring(handle, Some(&owner)) {
-                    Ok(ring) => ring.write(&src) as i32,
+                    Ok(ring) => match ring.write(&src) {
+                        Ok(n) => n as i32,
+                        Err(_) => -3,
+                    },
                     Err(crate::arena::ArenaError::PermissionDenied) => -2,
                     Err(_) => -3,
                 }
@@ -854,10 +859,9 @@ fn register_nexus_host_abi(linker: &mut Linker<CrystalWasiState>) -> Result<()> 
                 if dst_cap < 0 {
                     return -4;
                 }
-                let Some(host) = caller.data().host.clone() else {
+                let Some(owner) = caller.data().arena_owner.clone() else {
                     return -1;
                 };
-                let owner = format!("cell:{}/{}", host.app, host.cell_id);
                 let handle = crate::arena::RingBufferHandle {
                     id: (packed_handle & 0xFFFF_FFFF) as u64,
                     generation: ((packed_handle >> 32) & 0xFFFF_FFFF) as u32,
@@ -865,8 +869,10 @@ fn register_nexus_host_abi(linker: &mut Linker<CrystalWasiState>) -> Result<()> 
                 match crate::arena::NexusSharedArena::global().get_ring(handle, Some(&owner)) {
                     Ok(ring) => {
                         let mut tmp = vec![0u8; dst_cap as usize];
-                        let n = ring.read(&mut tmp);
-                        write_guest_bytes(&mut caller, dst_ptr, dst_cap, &tmp[..n])
+                        match ring.read(&mut tmp) {
+                            Ok(n) => write_guest_bytes(&mut caller, dst_ptr, dst_cap, &tmp[..n]),
+                            Err(_) => -3,
+                        }
                     }
                     Err(crate::arena::ArenaError::PermissionDenied) => -2,
                     Err(_) => -3,

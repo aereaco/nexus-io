@@ -740,22 +740,44 @@ pub struct HardwareRegistry {
 static GLOBAL_HW_REGISTRY: OnceLock<Arc<HardwareRegistry>> = OnceLock::new();
 
 impl HardwareRegistry {
+    pub fn new() -> Self {
+        Self {
+            providers: RwLock::new(vec![Arc::new(NativeSystemProvider)]),
+            shell_provider: RwLock::new(Arc::new(DefaultOsShellProvider::default())),
+            consent_provider: RwLock::new(Arc::new(DefaultConsentProvider)),
+        }
+    }
+
     pub fn global() -> Arc<Self> {
         GLOBAL_HW_REGISTRY
-            .get_or_init(|| {
-                Arc::new(Self {
-                    providers: RwLock::new(vec![Arc::new(NativeSystemProvider)]),
-                    shell_provider: RwLock::new(Arc::new(DefaultOsShellProvider::default())),
-                    consent_provider: RwLock::new(Arc::new(DefaultConsentProvider)),
-                })
-            })
+            .get_or_init(|| Arc::new(Self::new()))
             .clone()
     }
 
-    pub fn register_provider(&self, provider: Arc<dyn HardwareProvider>) {
-        if let Ok(mut list) = self.providers.write() {
-            list.push(provider);
+    /// Register a hardware provider, rejecting duplicate `provider_name()` registrations.
+    pub fn register_provider(&self, provider: Arc<dyn HardwareProvider>) -> Result<(), String> {
+        let mut list = self
+            .providers
+            .write()
+            .map_err(|_| "HardwareRegistry lock poisoned".to_string())?;
+        if list.iter().any(|p| p.provider_name() == provider.provider_name()) {
+            return Err(format!(
+                "Duplicate hardware provider '{}' is already registered",
+                provider.provider_name()
+            ));
         }
+        list.push(provider);
+        Ok(())
+    }
+
+    /// Unregister a hardware provider by name (e.g., hot-unplug / module teardown).
+    pub fn unregister_provider(&self, provider_name: &str) -> bool {
+        if let Ok(mut list) = self.providers.write() {
+            let before = list.len();
+            list.retain(|p| p.provider_name() != provider_name);
+            return list.len() < before;
+        }
+        false
     }
 
     pub fn register_shell_provider(&self, provider: Arc<dyn OsShellProvider>) {
@@ -790,7 +812,10 @@ impl HardwareRegistry {
         let mut all = Vec::new();
         if let Ok(list) = self.providers.read() {
             for p in list.iter() {
-                all.extend(p.list_devices());
+                // Panic-isolated discovery: a faulty native driver cannot crash the host or hide other devices
+                if let Ok(devs) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| p.list_devices())) {
+                    all.extend(devs);
+                }
             }
         }
         if let Ok(ui) = self.shell_provider.read() {
@@ -827,6 +852,25 @@ impl HardwareRegistry {
         }
     }
 
+    /// Shared capability + live OS consent + panic-isolated dispatch entrypoint used by BOTH
+    /// low-level `nexus_host` C-ABI imports and typed WIT Component Model host bindings.
+    pub fn dispatch_authorized(
+        &self,
+        caps: &crate::iam::capabilities::CapabilitySet,
+        op: &str,
+        payload: &Value,
+    ) -> HardwareResponse {
+        let req_cap = required_capability_for_op(op);
+        if !caps.has(req_cap) {
+            return HardwareResponse::err(
+                op,
+                HardwareStatus::PermissionDenied,
+                format!("Missing required capability {:?} for '{}'", req_cap, op),
+            );
+        }
+        self.dispatch(op, payload)
+    }
+
     /// Dispatch a hardware or OS shell call after checking live OS consent for sensitive classes.
     /// Callers MUST enforce Nexus IAM / `CapabilitySet` authorization BEFORE calling `dispatch`.
     pub fn dispatch(&self, op: &str, payload: &Value) -> HardwareResponse {
@@ -854,13 +898,35 @@ impl HardwareRegistry {
         }
         if lower.starts_with("ui.") {
             if let Ok(ui) = self.shell_provider.read() {
-                return ui.handle_shell(trimmed, payload);
+                return match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    ui.handle_shell(trimmed, payload)
+                })) {
+                    Ok(resp) => resp,
+                    Err(_) => HardwareResponse::err(
+                        trimmed,
+                        HardwareStatus::Error,
+                        "OS shell provider panicked during dispatch (isolated)",
+                    ),
+                };
             }
         }
         if let Ok(list) = self.providers.read() {
             for p in list.iter().rev() {
                 if p.handles_op(trimmed) {
-                    return p.call(trimmed, payload);
+                    return match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        p.call(trimmed, payload)
+                    })) {
+                        Ok(resp) => resp,
+                        Err(_) => HardwareResponse::err(
+                            trimmed,
+                            HardwareStatus::Error,
+                            format!(
+                                "Hardware provider '{}' panicked during '{}' (isolated)",
+                                p.provider_name(),
+                                trimmed
+                            ),
+                        ),
+                    };
                 }
             }
         }
@@ -880,6 +946,132 @@ impl HardwareRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::iam::capabilities::CapabilitySet;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct DynamicConsent(AtomicBool);
+    impl ConsentProvider for DynamicConsent {
+        fn check_consent(&self, cap: Capability) -> ConsentState {
+            if cap == Capability::HwCamera {
+                if self.0.load(Ordering::Acquire) {
+                    ConsentState::Granted
+                } else {
+                    ConsentState::Denied
+                }
+            } else {
+                ConsentState::Granted
+            }
+        }
+        fn request_consent(&self, _cap: Capability, _reason: &str) -> ConsentRequestResult {
+            ConsentRequestResult::Denied
+        }
+    }
+
+    struct MockCameraProvider(AtomicBool);
+    impl HardwareProvider for MockCameraProvider {
+        fn provider_name(&self) -> &'static str {
+            "mock-camera"
+        }
+        fn list_devices(&self) -> Vec<HardwareDevice> {
+            if !self.0.load(Ordering::Acquire) {
+                return vec![];
+            }
+            vec![HardwareDevice {
+                id: "cam:0".into(),
+                class: HardwareClass::Camera,
+                name: "Mock USB Cam".into(),
+                vendor: "test".into(),
+                os: "test".into(),
+                arch: "test".into(),
+                available: true,
+                capabilities: vec!["camera.capture".into()],
+                metadata: BTreeMap::new(),
+            }]
+        }
+        fn handles_op(&self, op: &str) -> bool {
+            op == "camera.capture"
+        }
+        fn call(&self, op: &str, _payload: &Value) -> HardwareResponse {
+            if !self.0.load(Ordering::Acquire) {
+                return HardwareResponse::err(op, HardwareStatus::DeviceNotFound, "Camera unplugged");
+            }
+            HardwareResponse::ok(op, json!({ "frame_bytes": 1024 }))
+        }
+    }
+
+    struct PanickingProvider;
+    impl HardwareProvider for PanickingProvider {
+        fn provider_name(&self) -> &'static str {
+            "faulty-driver"
+        }
+        fn list_devices(&self) -> Vec<HardwareDevice> {
+            panic!("simulated driver crash during discovery");
+        }
+        fn handles_op(&self, op: &str) -> bool {
+            op == "usb.crash"
+        }
+        fn call(&self, _op: &str, _payload: &Value) -> HardwareResponse {
+            panic!("simulated driver crash during call");
+        }
+    }
+
+    #[test]
+    fn hardware_registry_lifecycle_duplicate_panic_consent_and_unplug() {
+        let reg = Arc::new(HardwareRegistry::new());
+        let consent = Arc::new(DynamicConsent(AtomicBool::new(true)));
+        let cam = Arc::new(MockCameraProvider(AtomicBool::new(true)));
+        reg.register_consent_provider(consent.clone());
+        assert!(reg.register_provider(cam.clone()).is_ok());
+        // Duplicate provider registration MUST be rejected
+        assert!(reg.register_provider(cam.clone()).is_err());
+        assert!(reg.register_provider(Arc::new(PanickingProvider)).is_ok());
+
+        // Panic isolation during discovery & dispatch
+        let devices = reg.list_devices(None);
+        assert!(devices.iter().any(|d| d.id == "cam:0"));
+        assert!(devices.iter().any(|d| d.class == HardwareClass::SystemInfo));
+        let crash_caps = CapabilitySet::from_iter([Capability::HwBus]);
+        let crash_res = reg.dispatch_authorized(&crash_caps, "usb.crash", &json!({}));
+        assert_eq!(crash_res.status, HardwareStatus::Error);
+
+        // Authorized + OS consent granted -> succeeds
+        let cam_caps = CapabilitySet::from_iter([Capability::HwCamera]);
+        assert_eq!(
+            reg.dispatch_authorized(&cam_caps, "camera.capture", &json!({})).status,
+            HardwareStatus::Ok
+        );
+
+        // Dynamic OS consent revocation mid-stream -> fails closed immediately!
+        consent.0.store(false, Ordering::Release);
+        assert_eq!(
+            reg.dispatch_authorized(&cam_caps, "camera.capture", &json!({})).status,
+            HardwareStatus::ConsentRequired
+        );
+
+        // Restore consent, simulate device disappearance (unplug)
+        consent.0.store(true, Ordering::Release);
+        cam.0.store(false, Ordering::Release);
+        assert!(!reg.list_devices(Some(HardwareClass::Camera)).iter().any(|d| d.id == "cam:0"));
+        assert_eq!(
+            reg.dispatch_authorized(&cam_caps, "camera.capture", &json!({})).status,
+            HardwareStatus::DeviceNotFound
+        );
+
+        // Concurrent discovery + dispatch safety
+        let mut threads = Vec::new();
+        for _ in 0..4 {
+            let r = reg.clone();
+            threads.push(std::thread::spawn(move || {
+                for _ in 0..10 {
+                    let _ = r.list_devices(None);
+                    let _ = r.dispatch("system.info", &json!({}));
+                }
+            }));
+        }
+        for t in threads {
+            t.join().unwrap();
+        }
+    }
 
     #[test]
     fn hardware_registry_separates_discovery_consent_and_ui_ops() {
@@ -888,16 +1080,20 @@ mod tests {
         assert!(devices.iter().any(|d| d.class == HardwareClass::SystemInfo));
         assert!(devices.iter().any(|d| d.class == HardwareClass::OsUi));
 
-        // Non-sensitive system info succeeds
         let info = reg.dispatch("system.info", &json!({}));
         assert_eq!(info.status, HardwareStatus::Ok);
         assert!(info.data["cpu_cores"].as_u64().unwrap_or(0) >= 1);
 
-        // Sensitive camera op fails closed with ConsentRequired when OS consent is NotDetermined
         let cam = reg.dispatch("camera.capture", &json!({}));
         assert_eq!(cam.status, HardwareStatus::ConsentRequired);
 
-        // Versioned binary UiOpHeader batch validation
+        // Missing auth context MUST have zero capabilities (default-deny)
+        let unauth_caps = CapabilitySet::from_auth_context(None);
+        assert_eq!(
+            reg.dispatch_authorized(&unauth_caps, "system.info", &json!({})).status,
+            HardwareStatus::PermissionDenied
+        );
+
         let hdr = UiOpHeader {
             version: UI_OP_PROTOCOL_VERSION,
             opcode: UiOpCode::SetText as u16,

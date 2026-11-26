@@ -6,19 +6,22 @@
 //! - Native UI binary operation batches (`UiOp` stream)
 //! - Database / `BlobBridge` payloads and inter-node transfer staging
 //!
-//! Safety & Lifecycle Invariants:
-//! 1. **Generation-Validated Handles:** Every `SharedBufferHandle` and `RingBufferHandle` carries
-//!    a `(slot, generation)` pair so stale/revoked handles fail deterministically with `Revoked`.
-//! 2. **Deterministic Owner Revocation:** Every region/ring is tagged with an `owner_id` (e.g.
-//!    `cell:<app>/<cell_id>`). Calling `revoke_owner(owner_id)` on cell teardown immediately
-//!    invalidates all active handles and reclaims memory.
-//! 3. **Explicit Memory Ordering:** `SpscRingBuffer` uses `Ordering::Acquire` on foreign cursor
-//!    loads and `Ordering::Release` on local cursor stores — safe for concurrent SPSC producers
-//!    and consumers without locking the hot path.
+//! Security & Lifecycle Invariants:
+//! 1. **Globally Unique Execution Owner Identity (`ArenaOwnerId`):** Every cell execution mints a
+//!    unique `(app, cell_id, monotonic_exec_seq)` identity via `mint_owner_id()`, so two concurrent
+//!    invocations of the same cell can NEVER collide or revoke each other's handles.
+//! 2. **Generation-Validated Handles:** Every `SharedBufferHandle` and `RingBufferHandle` carries
+//!    a `(monotonic_id, generation)` pair so stale/revoked handles can never alias a new slot.
+//! 3. **Immediate In-Flight Revocation (`AtomicBool`):** Both `ArenaRegion` and `SpscRingBuffer`
+//!    embed an `AtomicBool` (`revoked`) checked with `Ordering::Acquire` on every read/write and
+//!    set with `Ordering::Release` inside `revoke_owner()` / `revoke_ring()`. Even an already-cloned
+//!    `Arc` fails closed with `ArenaError::Revoked` immediately on revocation.
+//! 4. **Explicit Memory Ordering:** `SpscRingBuffer` uses `Ordering::Acquire` on foreign cursor
+//!    loads and `Ordering::Release` on local cursor stores.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 
 /// Explicit data-plane transport mode behind the same logical arena interface.
@@ -29,6 +32,20 @@ pub enum TransportMode {
     SharedMemory,
     /// Portable single-copy baseline (host copies directly to/from guest linear memory, zero serialization).
     PortableCopy,
+}
+
+/// Globally unique owner identity incorporating `(app, cell_id, monotonic_exec_seq)`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ArenaOwnerId {
+    pub app: String,
+    pub cell_id: String,
+    pub exec_seq: u64,
+}
+
+impl ArenaOwnerId {
+    pub fn as_canonical(&self) -> String {
+        format!("cell:{}/{}#{}", self.app, self.cell_id, self.exec_seq)
+    }
 }
 
 /// Generation-validated handle to a flat `ArenaRegion`.
@@ -99,15 +116,31 @@ impl std::fmt::Display for ArenaError {
 
 impl std::error::Error for ArenaError {}
 
-/// Backing storage for a flat shared buffer region.
+/// Backing storage for a flat shared buffer region with immediate revocation guard.
 pub struct ArenaRegion {
     pub descriptor: BufferDescriptor,
+    revoked: AtomicBool,
     data: RwLock<Vec<u8>>,
 }
 
 impl ArenaRegion {
+    #[inline]
+    pub fn is_revoked(&self) -> bool {
+        self.revoked.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn mark_revoked(&self) {
+        self.revoked.store(true, Ordering::Release);
+    }
+
     pub fn write_at(&self, offset: usize, src: &[u8]) -> Result<usize, ArenaError> {
+        if self.is_revoked() {
+            return Err(ArenaError::Revoked);
+        }
         let mut buf = self.data.write().map_err(|_| ArenaError::Revoked)?;
+        if self.is_revoked() {
+            return Err(ArenaError::Revoked);
+        }
         let end = offset.checked_add(src.len()).ok_or(ArenaError::OutOfBounds)?;
         if end > buf.len() {
             return Err(ArenaError::OutOfBounds);
@@ -117,7 +150,13 @@ impl ArenaRegion {
     }
 
     pub fn read_at(&self, offset: usize, dst: &mut [u8]) -> Result<usize, ArenaError> {
+        if self.is_revoked() {
+            return Err(ArenaError::Revoked);
+        }
         let buf = self.data.read().map_err(|_| ArenaError::Revoked)?;
+        if self.is_revoked() {
+            return Err(ArenaError::Revoked);
+        }
         let end = offset.checked_add(dst.len()).ok_or(ArenaError::OutOfBounds)?;
         if end > buf.len() {
             return Err(ArenaError::OutOfBounds);
@@ -128,12 +167,13 @@ impl ArenaRegion {
 }
 
 /// Lock-free Single-Producer Single-Consumer (SPSC) byte ring buffer with explicit
-/// `Acquire`/`Release` atomic cursor ordering.
+/// `Acquire`/`Release` atomic cursor ordering and immediate revocation guard.
 ///
 /// Capacity is rounded up to a power of two for fast bitmask indexing (`cursor & mask`).
 pub struct SpscRingBuffer {
     pub descriptor: StreamDescriptor,
     mask: usize,
+    revoked: AtomicBool,
     storage: Box<[std::cell::UnsafeCell<u8>]>,
     /// Next byte index to be written by producer (monotonic).
     write_pos: AtomicU64,
@@ -143,8 +183,6 @@ pub struct SpscRingBuffer {
 
 // SAFETY: `SpscRingBuffer` enforces disjoint producer/consumer index ownership via
 // `Acquire`/`Release` atomic operations on `write_pos` and `read_pos`.
-// Concurrent calls to `push` or `pop` from the same side are serialized by the arena entry guard
-// or single-owner contract.
 unsafe impl Send for SpscRingBuffer {}
 unsafe impl Sync for SpscRingBuffer {}
 
@@ -163,10 +201,20 @@ impl SpscRingBuffer {
         Ok(Self {
             descriptor: desc,
             mask: cap - 1,
+            revoked: AtomicBool::new(false),
             storage: storage.into_boxed_slice(),
             write_pos: AtomicU64::new(0),
             read_pos: AtomicU64::new(0),
         })
+    }
+
+    #[inline]
+    pub fn is_revoked(&self) -> bool {
+        self.revoked.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn mark_revoked(&self) {
+        self.revoked.store(true, Ordering::Release);
     }
 
     #[inline]
@@ -176,6 +224,9 @@ impl SpscRingBuffer {
 
     #[inline]
     pub fn available_read(&self) -> usize {
+        if self.is_revoked() {
+            return 0;
+        }
         let w = self.write_pos.load(Ordering::Acquire);
         let r = self.read_pos.load(Ordering::Relaxed);
         w.saturating_sub(r) as usize
@@ -183,20 +234,27 @@ impl SpscRingBuffer {
 
     #[inline]
     pub fn available_write(&self) -> usize {
+        if self.is_revoked() {
+            return 0;
+        }
         let w = self.write_pos.load(Ordering::Relaxed);
         let r = self.read_pos.load(Ordering::Acquire);
         self.capacity().saturating_sub(w.saturating_sub(r) as usize)
     }
 
-    /// Producer write: copies up to `src.len()` bytes and publishes `write_pos` with `Ordering::Release`.
-    pub fn write(&self, src: &[u8]) -> usize {
+    /// Producer write: checks revocation, copies up to `src.len()` bytes, and publishes `write_pos`
+    /// with `Ordering::Release`.
+    pub fn write(&self, src: &[u8]) -> Result<usize, ArenaError> {
+        if self.is_revoked() {
+            return Err(ArenaError::Revoked);
+        }
         let w = self.write_pos.load(Ordering::Relaxed);
         let r = self.read_pos.load(Ordering::Acquire);
         let cap = self.capacity() as u64;
         let free = cap.saturating_sub(w.saturating_sub(r)) as usize;
         let n = src.len().min(free);
         if n == 0 {
-            return 0;
+            return Ok(0);
         }
         for (i, &byte) in src[..n].iter().enumerate() {
             let idx = ((w as usize).wrapping_add(i)) & self.mask;
@@ -205,19 +263,25 @@ impl SpscRingBuffer {
                 *self.storage[idx].get() = byte;
             }
         }
+        if self.is_revoked() {
+            return Err(ArenaError::Revoked);
+        }
         self.write_pos.store(w.wrapping_add(n as u64), Ordering::Release);
-        n
+        Ok(n)
     }
 
-    /// Consumer read: reads up to `dst.len()` bytes after `Ordering::Acquire` on `write_pos`,
-    /// then publishes `read_pos` with `Ordering::Release`.
-    pub fn read(&self, dst: &mut [u8]) -> usize {
+    /// Consumer read: checks revocation, reads up to `dst.len()` bytes after `Ordering::Acquire`
+    /// on `write_pos`, then publishes `read_pos` with `Ordering::Release`.
+    pub fn read(&self, dst: &mut [u8]) -> Result<usize, ArenaError> {
+        if self.is_revoked() {
+            return Err(ArenaError::Revoked);
+        }
         let r = self.read_pos.load(Ordering::Relaxed);
         let w = self.write_pos.load(Ordering::Acquire);
         let avail = w.saturating_sub(r) as usize;
         let n = dst.len().min(avail);
         if n == 0 {
-            return 0;
+            return Ok(0);
         }
         for (i, out) in dst[..n].iter_mut().enumerate() {
             let idx = ((r as usize).wrapping_add(i)) & self.mask;
@@ -226,8 +290,11 @@ impl SpscRingBuffer {
                 *out = *self.storage[idx].get();
             }
         }
+        if self.is_revoked() {
+            return Err(ArenaError::Revoked);
+        }
         self.read_pos.store(r.wrapping_add(n as u64), Ordering::Release);
-        n
+        Ok(n)
     }
 }
 
@@ -244,16 +311,24 @@ struct RingSlot {
 /// Process-wide general-purpose shared memory & SPSC ring buffer arena.
 pub struct NexusSharedArena {
     next_id: AtomicU64,
+    next_exec_seq: AtomicU64,
     buffers: RwLock<HashMap<u64, BufferSlot>>,
     rings: RwLock<HashMap<u64, RingSlot>>,
 }
 
 static GLOBAL_ARENA: OnceLock<Arc<NexusSharedArena>> = OnceLock::new();
 
+impl Default for NexusSharedArena {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl NexusSharedArena {
     pub fn new() -> Self {
         Self {
             next_id: AtomicU64::new(1),
+            next_exec_seq: AtomicU64::new(1),
             buffers: RwLock::new(HashMap::new()),
             rings: RwLock::new(HashMap::new()),
         }
@@ -263,6 +338,15 @@ impl NexusSharedArena {
         GLOBAL_ARENA
             .get_or_init(|| Arc::new(Self::new()))
             .clone()
+    }
+
+    /// Mint a globally unique execution owner identity (`app`, `cell_id`, monotonic `exec_seq`).
+    pub fn mint_owner_id(&self, app: impl Into<String>, cell_id: impl Into<String>) -> ArenaOwnerId {
+        ArenaOwnerId {
+            app: app.into(),
+            cell_id: cell_id.into(),
+            exec_seq: self.next_exec_seq.fetch_add(1, Ordering::Relaxed),
+        }
     }
 
     /// Allocate a flat `ArenaRegion` owned by `owner_id`.
@@ -288,6 +372,7 @@ impl NexusSharedArena {
                 capacity,
                 transport,
             },
+            revoked: AtomicBool::new(false),
             data: RwLock::new(vec![0u8; capacity]),
         });
         let mut map = self.buffers.write().map_err(|_| ArenaError::Revoked)?;
@@ -348,6 +433,9 @@ impl NexusSharedArena {
             return Err(ArenaError::Revoked);
         }
         let region = slot.region.as_ref().ok_or(ArenaError::Revoked)?;
+        if region.is_revoked() {
+            return Err(ArenaError::Revoked);
+        }
         if let Some(caller) = caller_owner {
             if region.descriptor.owner_id != caller {
                 return Err(ArenaError::PermissionDenied);
@@ -368,6 +456,9 @@ impl NexusSharedArena {
             return Err(ArenaError::Revoked);
         }
         let ring = slot.ring.as_ref().ok_or(ArenaError::Revoked)?;
+        if ring.is_revoked() {
+            return Err(ArenaError::Revoked);
+        }
         if let Some(caller) = caller_owner {
             if ring.descriptor.owner_id != caller {
                 return Err(ArenaError::PermissionDenied);
@@ -376,29 +467,37 @@ impl NexusSharedArena {
         Ok(ring.clone())
     }
 
-    /// Revoke a single ring buffer handle, incrementing its generation so stale references fail.
+    /// Revoke a single ring buffer handle, marking it revoked immediately and incrementing generation.
     pub fn revoke_ring(&self, handle: RingBufferHandle) -> bool {
         if let Ok(mut map) = self.rings.write() {
             if let Some(slot) = map.get_mut(&handle.id) {
-                if slot.generation == handle.generation && slot.ring.is_some() {
-                    slot.ring = None;
-                    slot.generation = slot.generation.wrapping_add(1);
-                    return true;
+                if slot.generation == handle.generation {
+                    if let Some(ring) = slot.ring.take() {
+                        ring.mark_revoked();
+                        slot.generation = slot.generation.wrapping_add(1);
+                        return true;
+                    }
                 }
             }
         }
         false
     }
 
-    /// Deterministically revoke ALL buffers and SPSC rings owned by `owner_id`
-    /// (called automatically on Wasm cell termination/hibernation).
+    /// Deterministically revoke ALL buffers and SPSC rings owned by `owner_id`.
+    /// Marks every underlying `ArenaRegion` / `SpscRingBuffer` revoked immediately so even
+    /// already-cloned in-flight `Arc` references fail closed with `ArenaError::Revoked`.
     pub fn revoke_owner(&self, owner_id: &str) -> usize {
         let mut revoked = 0usize;
         if let Ok(mut map) = self.buffers.write() {
             for slot in map.values_mut() {
-                if let Some(ref reg) = slot.region {
-                    if reg.descriptor.owner_id == owner_id {
-                        slot.region = None;
+                let matches = slot
+                    .region
+                    .as_ref()
+                    .map(|r| r.descriptor.owner_id == owner_id)
+                    .unwrap_or(false);
+                if matches {
+                    if let Some(reg) = slot.region.take() {
+                        reg.mark_revoked();
                         slot.generation = slot.generation.wrapping_add(1);
                         revoked += 1;
                     }
@@ -407,9 +506,14 @@ impl NexusSharedArena {
         }
         if let Ok(mut map) = self.rings.write() {
             for slot in map.values_mut() {
-                if let Some(ref r) = slot.ring {
-                    if r.descriptor.owner_id == owner_id {
-                        slot.ring = None;
+                let matches = slot
+                    .ring
+                    .as_ref()
+                    .map(|r| r.descriptor.owner_id == owner_id)
+                    .unwrap_or(false);
+                if matches {
+                    if let Some(r) = slot.ring.take() {
+                        r.mark_revoked();
                         slot.generation = slot.generation.wrapping_add(1);
                         revoked += 1;
                     }
@@ -425,46 +529,60 @@ mod tests {
     use super::*;
 
     #[test]
-    fn spsc_ring_wraparound_ordering_and_generation_revocation() {
+    fn spsc_ring_wraparound_ordering_and_inflight_revocation() {
         let arena = NexusSharedArena::new();
-        let stream = arena
-            .alloc_ring("cell:erp/sensor", "imu.stream", 16, TransportMode::PortableCopy)
-            .unwrap();
-        assert_eq!(stream.capacity, 16);
+        let owner_a = arena.mint_owner_id("erp", "sensor").as_canonical();
+        let owner_b = arena.mint_owner_id("erp", "sensor").as_canonical();
+        assert_ne!(owner_a, owner_b, "Two executions of the same cell MUST have distinct ArenaOwnerIds");
 
-        let ring = arena.get_ring(stream.handle, Some("cell:erp/sensor")).unwrap();
-        // Wrong owner MUST be rejected
+        let stream_a = arena
+            .alloc_ring(&owner_a, "imu.stream", 16, TransportMode::PortableCopy)
+            .unwrap();
+        let stream_b = arena
+            .alloc_ring(&owner_b, "imu.stream", 16, TransportMode::PortableCopy)
+            .unwrap();
+
+        let ring_a = arena.get_ring(stream_a.handle, Some(&owner_a)).unwrap();
+        let ring_b = arena.get_ring(stream_b.handle, Some(&owner_b)).unwrap();
+
+        // Cross-owner access MUST be rejected
         assert_eq!(
-            arena.get_ring(stream.handle, Some("cell:other/attacker")).err(),
+            arena.get_ring(stream_a.handle, Some(&owner_b)).err(),
             Some(ArenaError::PermissionDenied)
         );
 
-        // Write 10 bytes, read 6, write 12 (tests wraparound across boundary)
-        assert_eq!(ring.write(b"0123456789"), 10);
+        // Wraparound test on ring_a
+        assert_eq!(ring_a.write(b"0123456789").unwrap(), 10);
         let mut out = [0u8; 6];
-        assert_eq!(ring.read(&mut out), 6);
+        assert_eq!(ring_a.read(&mut out).unwrap(), 6);
         assert_eq!(&out, b"012345");
-
-        assert_eq!(ring.write(b"ABCDEFGHIJKL"), 12);
+        assert_eq!(ring_a.write(b"ABCDEFGHIJKL").unwrap(), 12);
         let mut out2 = [0u8; 16];
-        assert_eq!(ring.read(&mut out2), 16);
+        assert_eq!(ring_a.read(&mut out2).unwrap(), 16);
         assert_eq!(&out2, b"6789ABCDEFGHIJKL");
 
-        // Owner teardown deterministically revokes handle
-        assert_eq!(arena.revoke_owner("cell:erp/sensor"), 1);
+        // Revoking owner_a MUST invalidate ring_a immediately (even on an already-held Arc!)
+        // and MUST NOT affect owner_b's concurrent stream!
+        assert_eq!(arena.revoke_owner(&owner_a), 1);
+        assert_eq!(ring_a.write(b"x").err(), Some(ArenaError::Revoked));
+        assert_eq!(ring_a.read(&mut out).err(), Some(ArenaError::Revoked));
         assert_eq!(
-            arena.get_ring(stream.handle, Some("cell:erp/sensor")).err(),
+            arena.get_ring(stream_a.handle, Some(&owner_a)).err(),
             Some(ArenaError::Revoked)
         );
+
+        // Owner B remains completely unaffected
+        assert_eq!(ring_b.write(b"still-live").unwrap(), 10);
     }
 
     #[test]
-    fn flat_buffer_bounds_and_owner_isolation() {
+    fn flat_buffer_bounds_and_inflight_revocation() {
         let arena = NexusSharedArena::new();
+        let owner = arena.mint_owner_id("erp", "ui").as_canonical();
         let lease = arena
-            .alloc_buffer("cell:erp/ui", "ui.ops", 64, TransportMode::SharedMemory)
+            .alloc_buffer(&owner, "ui.ops", 64, TransportMode::SharedMemory)
             .unwrap();
-        let reg = arena.get_buffer(lease.handle, Some("cell:erp/ui")).unwrap();
+        let reg = arena.get_buffer(lease.handle, Some(&owner)).unwrap();
         assert_eq!(reg.write_at(0, b"nexus-zczs").unwrap(), 10);
         assert_eq!(reg.write_at(60, b"overflow!").err(), Some(ArenaError::OutOfBounds));
 
@@ -472,10 +590,8 @@ mod tests {
         assert_eq!(reg.read_at(0, &mut dst).unwrap(), 10);
         assert_eq!(&dst, b"nexus-zczs");
 
-        assert_eq!(arena.revoke_owner("cell:erp/ui"), 1);
-        assert_eq!(
-            arena.get_buffer(lease.handle, Some("cell:erp/ui")).err(),
-            Some(ArenaError::Revoked)
-        );
+        assert_eq!(arena.revoke_owner(&owner), 1);
+        assert_eq!(reg.write_at(0, b"nope").err(), Some(ArenaError::Revoked));
+        assert_eq!(reg.read_at(0, &mut dst).err(), Some(ArenaError::Revoked));
     }
 }

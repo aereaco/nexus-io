@@ -170,10 +170,12 @@ impl CapabilitySet {
         }
     }
 
-    /// Derive the maximum capability set permitted by an IAM `AuthContext`.
+    /// Derive the maximum capability set permitted by an external IAM `AuthContext`.
+    /// SECURITY INVARIANT: An absent `AuthContext` (`None`) is strictly default-deny
+    /// (`CapabilitySet::empty()`), never granting implicit DB, blob, hardware, or UI access.
     pub fn from_auth_context(auth: Option<&AuthContext>) -> Self {
         let Some(ctx) = auth else {
-            return Self::standard_cell();
+            return Self::empty();
         };
         if ctx.roles.contains(&Role::Owner) {
             Self::admin_all()
@@ -198,6 +200,16 @@ impl CapabilitySet {
         }
     }
 
+    /// Trusted internal kernel execution helper (used only when no external HTTP caller is present,
+    /// e.g. internal cell reconciliation or unit-level host initialization). Still excludes all
+    /// privileged admin, hardware, and OS UI capabilities unless explicitly granted.
+    pub fn from_trusted_internal_auth(auth: Option<&AuthContext>) -> Self {
+        match auth {
+            Some(ctx) => Self::from_auth_context(Some(ctx)),
+            None => Self::standard_cell(),
+        }
+    }
+
     /// Compute the effective capability set:
     /// `requested ∩ operator_policy ∩ iam_caps ∩ cell_db_caps`.
     pub fn resolve_effective(
@@ -206,7 +218,7 @@ impl CapabilitySet {
         auth: Option<&AuthContext>,
         db_cfg: &CellDbConfig,
     ) -> Self {
-        let iam_caps = Self::from_auth_context(auth);
+        let iam_caps = Self::from_trusted_internal_auth(auth);
         let mut effective = requested.intersect(operator_policy).intersect(&iam_caps);
 
         // Enforce CellDbConfig topology constraints
