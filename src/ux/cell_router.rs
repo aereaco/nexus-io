@@ -295,6 +295,118 @@ impl Handler for CellGatewayHandler {
             return;
         };
 
+        // Transparent Distributed Mesh Dispatch:
+        // If `DeploymentRecord` places this cell on `PlacementTarget::Mesh` and assigns it to a
+        // remote peer (not this local node), forward the authenticated request with bounded hop
+        // & visited-node cycle detection (`508 Loop Detected`) and peer failover.
+        {
+            let local_node_id = self.cells.blobs().node_id().to_string();
+            let prev_hops: u8 = req
+                .headers()
+                .get("x-nexus-mesh-hops")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            let prev_visited = req
+                .headers()
+                .get("x-nexus-mesh-visited")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
+
+            if prev_hops >= crate::storage::mesh::MeshReactor::MAX_MESH_HOPS
+                || prev_visited
+                    .as_deref()
+                    .unwrap_or("")
+                    .split(',')
+                    .any(|n| n.trim() == local_node_id)
+            {
+                res.status_code(StatusCode::LOOP_DETECTED);
+                res.render(Json(serde_json::json!({
+                    "error": "Mesh forwarding loop detected",
+                    "node_id": local_node_id,
+                    "hops": prev_hops
+                })));
+                return;
+            }
+
+            let cas = crate::storage::cas_store::CasStore::new(self.cells.blobs().clone());
+            if let Ok(Some((rec, _))) = cas
+                .read_manifest::<crate::compute::manifest::DeploymentRecord>(
+                    crate::compute::manifest::DEPLOYMENTS_BUCKET,
+                    &crate::compute::manifest::ManifestReconciler::app_record_key(&app),
+                )
+                .await
+            {
+                if let Some(cell_state) = rec.cells.get(&cell_id) {
+                    let is_remote_mesh = cell_state.placement == crate::compute::manifest::PlacementTarget::Mesh
+                        && !cell_state.assigned_nodes.is_empty()
+                        && !cell_state.assigned_nodes.iter().any(|n| n == &local_node_id)
+                        && !cell_state.mesh_endpoints.is_empty();
+                    if is_remote_mesh {
+                        let auth_hdr = req
+                            .headers()
+                            .get("authorization")
+                            .and_then(|v| v.to_str().ok())
+                            .map(|s| s.to_string());
+                        let ct_hdr = req
+                            .headers()
+                            .get("content-type")
+                            .and_then(|v| v.to_str().ok())
+                            .map(|s| s.to_string());
+                        let req_id = depot_request_id(depot);
+                        let method = req.method().as_str().to_string();
+                        let path_and_query = req
+                            .uri()
+                            .path_and_query()
+                            .map(|pq| pq.as_str().to_string())
+                            .unwrap_or_else(|| req.uri().path().to_string());
+                        let body = req.payload().await.map(|b| b.to_vec()).unwrap_or_default();
+
+                        let mut last_err = String::new();
+                        for ep in &cell_state.mesh_endpoints {
+                            match crate::storage::mesh::MeshReactor::forward_cell_http(
+                                ep,
+                                &method,
+                                &path_and_query,
+                                &local_node_id,
+                                auth_hdr.as_deref(),
+                                req_id.as_deref(),
+                                prev_hops,
+                                prev_visited.as_deref(),
+                                ct_hdr.as_deref(),
+                                &body,
+                            )
+                            .await
+                            {
+                                Ok((status_u16, resp_ct, resp_body)) => {
+                                    let status = StatusCode::from_u16(status_u16)
+                                        .unwrap_or(StatusCode::BAD_GATEWAY);
+                                    res.status_code(status);
+                                    if let Ok(hv) = salvo::http::header::HeaderValue::from_str(&resp_ct) {
+                                        res.headers_mut().insert(salvo::http::header::CONTENT_TYPE, hv);
+                                    }
+                                    if let Ok(hv) = salvo::http::header::HeaderValue::from_str(ep) {
+                                        res.headers_mut().insert("x-nexus-mesh-forwarded-to", hv);
+                                    }
+                                    let _ = res.write_body(resp_body);
+                                    return;
+                                }
+                                Err(e) => {
+                                    last_err = e.to_string();
+                                }
+                            }
+                        }
+                        res.status_code(StatusCode::BAD_GATEWAY);
+                        res.render(Json(serde_json::json!({
+                            "error": format!("All assigned mesh peers unreachable for {}/{}: {}", app, cell_id, last_err),
+                            "assigned_nodes": cell_state.assigned_nodes,
+                        })));
+                        return;
+                    }
+                }
+            }
+        }
+
         // WebSocket upgrade for hibernatable / live cell messaging
         let is_ws = req
             .headers()

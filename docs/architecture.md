@@ -78,10 +78,11 @@ Every Nexus-IO node participates in a decentralized, peer-to-peer compute and st
   - `MeshReactor::ingest_gossip()` applies CRDT Last-Write-Wins (LWW) updates into both the `peer_registry` redb table and the `sys::node` SurrealQL system table.
 - **4D Compute + Data-Locality Scheduler (`src/compute/router.rs`):**
   - When a cell targets `PlacementTarget::Mesh`, `InferenceRouter::select_ranked_nodes()` filters and scores all live peers across 4 dimensions (CPU headroom, GPU/VRAM availability, free RAM, free disk storage), adds a **+25.0 BLAKE3 Highest Random Weight (HRW) Rendezvous Hashing data-locality bonus** when a peer already hosts the cell's artifact shard (`select_hrw_replicas`), and applies a **+10.0 green energy bonus**.
-- **P2P Mesh HTTP Endpoints (`src/ux/gateway.rs`):**
+- **P2P Mesh HTTP Endpoints & Authenticated Multi-Node Data Plane (`src/ux/gateway.rs`, `src/storage/mesh.rs`, `src/ux/cell_router.rs`):**
   - `GET /_nexus/mesh/status` — Returns active WireGuard tunnel addresses, UAPI configuration preview, and live 4D peer telemetry snapshot.
-  - `POST /_nexus/mesh/gossip` — Ingests peer WireGuard + 4D telemetry heartbeats and returns deterministic mesh IPv4/IPv6 assignments.
-  - `GET / PUT /_nexus/mesh/blobs/{cid}` — Content-addressed P2P blob transfer with strict end-to-end BLAKE3 verification.
+  - `POST /_nexus/mesh/gossip` — Ingests peer WireGuard + 4D telemetry heartbeats and returns deterministic mesh IPv4/IPv6 assignments; `MeshReactor::push_gossip_to_peer` exchanges 4D cluster state across live nodes.
+  - `GET / PUT /_nexus/mesh/blobs/{cid}` — Content-addressed P2P binary blob transfer with end-to-end BLAKE3 verification; `MeshReactor::hydrate_blob_from_peer` streams, verifies, and atomically acquires `CasStore` ownership.
+  - **Transparent Remote Cell Dispatch (`CellGatewayHandler`):** When a cell targets `PlacementTarget::Mesh` and is assigned to a remote peer, requests are transparently forwarded with caller identity/delegation headers, bounded hop count (`MAX_MESH_HOPS = 3`), visited-node cycle detection (`508 Loop Detected`), and peer failover (`502 Bad Gateway` when all assigned peers are unreachable).
 
 ## 8. Universal Host Foundation: `NexusSharedArena`, Native Hardware HAL & Dual-Mode OS UI (`src/arena.rs`, `src/hardware/mod.rs`, `wit/nexus-host.wit`)
 Nexus-IO acts as a **universal application runtime** shared across all Wasm hosted guests (Rust, Go, Python, PHP, QuickJS/TS) and Nexus-UX frontends across Windows, Linux, macOS, Android, iOS, and headless edge nodes:

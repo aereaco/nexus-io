@@ -355,6 +355,11 @@ impl CellManager {
         }
     }
 
+    /// Access the underlying `BlobBridge` for CAS manifest inspection and node identity.
+    pub fn blobs(&self) -> &Arc<BlobBridge> {
+        &self.blobs
+    }
+
     /// Inspect the current formal lifecycle state of `(app, cell_id)`.
     pub async fn cell_state(&self, app: &str, cell_id: &str) -> CellLifecycleState {
         self.states

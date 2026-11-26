@@ -929,7 +929,7 @@ pub struct DeploymentRecord {
 pub struct ManifestReconciler;
 
 impl ManifestReconciler {
-    fn app_record_key(app_name: &str) -> String {
+    pub fn app_record_key(app_name: &str) -> String {
         format!("apps/{}/deployment.json", app_name)
     }
 

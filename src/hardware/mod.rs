@@ -17,6 +17,8 @@
 //! 4. **Zero-Copy Data Plane:** Streaming hardware and UI batches flow through
 //!    `crate::arena::NexusSharedArena` (`SharedBufferHandle`, `RingBufferHandle`, `SpscRingBuffer`).
 
+pub mod os_native;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -743,7 +745,7 @@ impl HardwareRegistry {
     pub fn new() -> Self {
         Self {
             providers: RwLock::new(vec![Arc::new(NativeSystemProvider)]),
-            shell_provider: RwLock::new(Arc::new(DefaultOsShellProvider::default())),
+            shell_provider: RwLock::new(Arc::new(os_native::NativeDesktopShellProvider::default())),
             consent_provider: RwLock::new(Arc::new(DefaultConsentProvider)),
         }
     }
@@ -1105,7 +1107,7 @@ mod tests {
         batch.extend_from_slice(b"hello");
         let commit_res = reg.commit_ui_ops(&batch);
         assert_eq!(commit_res.status, HardwareStatus::Ok);
-        assert_eq!(commit_res.data["ops_validated"], 1);
+        assert_eq!(commit_res.data["ops_applied"], 1);
     }
 
     #[test]

@@ -237,4 +237,295 @@ impl MeshReactor {
 
         Ok(())
     }
+
+    // =========================================================================
+    // Authenticated P2P Mesh Transport (Zero Extra Crates — Binary Streaming)
+    // =========================================================================
+
+    /// Maximum mesh forwarding hops allowed before failing closed with `508 Loop Detected`.
+    pub const MAX_MESH_HOPS: u8 = 3;
+
+    /// Normalize a peer endpoint (`"http://host:port"`, `"host:port"`) into `(host_port, host_header)`.
+    fn parse_peer_host_port(endpoint: &str) -> Result<String> {
+        let trimmed = endpoint
+            .trim()
+            .strip_prefix("http://")
+            .or_else(|| endpoint.trim().strip_prefix("https://"))
+            .unwrap_or(endpoint.trim())
+            .split('/')
+            .next()
+            .unwrap_or("")
+            .trim();
+        if trimmed.is_empty() || !trimmed.contains(':') {
+            anyhow::bail!("Invalid mesh peer endpoint '{}': expected host:port", endpoint);
+        }
+        Ok(trimmed.to_string())
+    }
+
+    /// Minimal HTTP/1.1 binary request/response over `tokio::net::TcpStream` (reuses node WireGuard/TCP
+    /// endpoints with zero intermediate base64/JSON wrapping on binary payloads).
+    async fn raw_http_exchange(
+        endpoint: &str,
+        method: &str,
+        path_and_query: &str,
+        headers: &[(&str, &str)],
+        body: &[u8],
+    ) -> Result<(u16, Vec<(String, String)>, Vec<u8>)> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpStream;
+
+        let addr = Self::parse_peer_host_port(endpoint)?;
+        let mut stream = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(&addr))
+            .await
+            .context("Mesh peer connection timed out")?
+            .with_context(|| format!("Failed to connect to mesh peer '{}'", addr))?;
+
+        let mut req_buf = Vec::with_capacity(256 + body.len());
+        req_buf.extend_from_slice(format!("{} {} HTTP/1.1\r\n", method, path_and_query).as_bytes());
+        req_buf.extend_from_slice(format!("Host: {}\r\n", addr).as_bytes());
+        req_buf.extend_from_slice(b"Connection: close\r\n");
+        req_buf.extend_from_slice(format!("Content-Length: {}\r\n", body.len()).as_bytes());
+        for (k, v) in headers {
+            req_buf.extend_from_slice(format!("{}: {}\r\n", k, v).as_bytes());
+        }
+        req_buf.extend_from_slice(b"\r\n");
+        req_buf.extend_from_slice(body);
+
+        stream.write_all(&req_buf).await.context("Failed writing mesh HTTP request")?;
+        stream.flush().await?;
+
+        let mut raw = Vec::new();
+        tokio::time::timeout(Duration::from_secs(10), stream.read_to_end(&mut raw))
+            .await
+            .context("Mesh peer response timed out")?
+            .context("Failed reading mesh HTTP response")?;
+
+        let header_end = raw
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .ok_or_else(|| anyhow::anyhow!("Malformed HTTP response from mesh peer '{}'", addr))?;
+
+        let head_str = String::from_utf8_lossy(&raw[..header_end]);
+        let mut lines = head_str.lines();
+        let status_line = lines.next().unwrap_or("");
+        let status: u16 = status_line
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse().ok())
+            .ok_or_else(|| anyhow::anyhow!("Invalid HTTP status line from peer: {}", status_line))?;
+
+        let mut resp_headers = Vec::new();
+        let mut is_chunked = false;
+        for line in lines {
+            if let Some((k, v)) = line.split_once(':') {
+                let key = k.trim().to_string();
+                let val = v.trim().to_string();
+                if key.eq_ignore_ascii_case("transfer-encoding") && val.to_ascii_lowercase().contains("chunked") {
+                    is_chunked = true;
+                }
+                resp_headers.push((key, val));
+            }
+        }
+
+        let raw_body = &raw[header_end + 4..];
+        let body_bytes = if is_chunked {
+            decode_chunked_body(raw_body)?
+        } else {
+            raw_body.to_vec()
+        };
+
+        Ok((status, resp_headers, body_bytes))
+    }
+
+    /// Push local 4D telemetry + WireGuard peer announcement to a remote peer's `POST /_nexus/mesh/gossip`
+    /// and CRDT-LWW merge the peer's returned peer list into local `peer_registry`.
+    pub async fn push_gossip_to_peer(
+        db: &Arc<Database>,
+        bridge: &Arc<BlobBridge>,
+        peer_endpoint: &str,
+        bearer_token: &str,
+        payload: &MeshGossipPayload,
+    ) -> Result<serde_json::Value> {
+        let body = serde_json::to_vec(payload)?;
+        let auth_hdr = format!("Bearer {}", bearer_token);
+        let (status, _hdrs, resp_body) = Self::raw_http_exchange(
+            peer_endpoint,
+            "POST",
+            "/_nexus/mesh/gossip",
+            &[("Authorization", &auth_hdr), ("Content-Type", "application/json")],
+            &body,
+        )
+        .await?;
+        if status < 200 || status >= 300 {
+            anyhow::bail!(
+                "Peer gossip rejected by '{}' (HTTP {}): {}",
+                peer_endpoint,
+                status,
+                String::from_utf8_lossy(&resp_body)
+            );
+        }
+        let val: serde_json::Value = serde_json::from_slice(&resp_body)
+            .context("Failed to parse peer gossip response JSON")?;
+        // Merge peer's returned topology back into our local registry if present
+        if let Some(peer_node_id) = val.get("node_id").and_then(|v| v.as_str()) {
+            if let Ok(peer_res) = serde_json::from_value::<NodeResources>(
+                val.get("resources").cloned().unwrap_or(serde_json::Value::Null),
+            ) {
+                let peers: Vec<PeerRecord> = val
+                    .get("peers")
+                    .and_then(|v| serde_json::from_value(v.clone()).ok())
+                    .unwrap_or_default();
+                let incoming = MeshGossipPayload {
+                    pubkey: peer_node_id.to_string(),
+                    endpoint: Some(peer_endpoint.to_string()),
+                    wg_ipv4: derive_mesh_ipv4(peer_node_id),
+                    wg_ipv6: derive_mesh_ipv6(peer_node_id),
+                    resources: peer_res,
+                    peers,
+                };
+                let _ = Self::ingest_gossip(db, bridge, incoming).await;
+            }
+        }
+        Ok(val)
+    }
+
+    /// Stream a content-addressed blob from a remote peer (`GET /_nexus/mesh/blobs/{cid}`),
+    /// verify the complete BLAKE3 digest locally, and atomically store + acquire ownership in `CasStore`.
+    pub async fn hydrate_blob_from_peer(
+        bridge: &Arc<BlobBridge>,
+        peer_endpoint: &str,
+        bearer_token: &str,
+        bucket: &str,
+        owner_id: &str,
+        expected_cid: &str,
+    ) -> Result<bytes::Bytes> {
+        let hex_cid = expected_cid
+            .strip_prefix("blake3:")
+            .unwrap_or(expected_cid)
+            .to_ascii_lowercase();
+        if hex_cid.len() != 64 || !hex_cid.chars().all(|c| c.is_ascii_hexdigit()) {
+            anyhow::bail!("Invalid BLAKE3 CID '{}'", expected_cid);
+        }
+        let auth_hdr = format!("Bearer {}", bearer_token);
+        let path = format!("/_nexus/mesh/blobs/{}", hex_cid);
+        let (status, _hdrs, raw_bytes) = Self::raw_http_exchange(
+            peer_endpoint,
+            "GET",
+            &path,
+            &[("Authorization", &auth_hdr)],
+            &[],
+        )
+        .await?;
+        if status != 200 {
+            anyhow::bail!(
+                "Failed to hydrate blob '{}' from '{}' (HTTP {})",
+                hex_cid,
+                peer_endpoint,
+                status
+            );
+        }
+        let actual_cid = blake3::hash(&raw_bytes).to_hex().to_string();
+        if actual_cid != hex_cid {
+            anyhow::bail!(
+                "BLAKE3 verification failed while hydrating from '{}': expected {}, got {}",
+                peer_endpoint,
+                hex_cid,
+                actual_cid
+            );
+        }
+        let bytes = bytes::Bytes::from(raw_bytes);
+        let cas = crate::storage::cas_store::CasStore::new(bridge.clone());
+        let stored = cas.put_verified_blob(bucket, "blobs/", bytes.clone()).await?;
+        cas.acquire_owners_batch(bucket, owner_id, &[stored]).await?;
+        Ok(bytes)
+    }
+
+    /// Forward an authenticated `/cells/{app}/{cell_id}` HTTP request to a remote mesh peer,
+    /// propagating caller identity, delegation metadata, bounded hop count, and cycle detection.
+    pub async fn forward_cell_http(
+        peer_endpoint: &str,
+        method: &str,
+        path_and_query: &str,
+        local_node_id: &str,
+        auth_header: Option<&str>,
+        request_id: Option<&str>,
+        prev_hops: u8,
+        prev_visited: Option<&str>,
+        content_type: Option<&str>,
+        body: &[u8],
+    ) -> Result<(u16, String, Vec<u8>)> {
+        if prev_hops >= Self::MAX_MESH_HOPS {
+            anyhow::bail!("LOOP_DETECTED: Mesh hop limit ({}) exceeded", Self::MAX_MESH_HOPS);
+        }
+        let visited_list: Vec<&str> = prev_visited
+            .unwrap_or("")
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if visited_list.iter().any(|&n| n == local_node_id) {
+            anyhow::bail!("LOOP_DETECTED: Node '{}' already visited in mesh forwarding chain", local_node_id);
+        }
+        let next_hops = (prev_hops + 1).to_string();
+        let next_visited = if visited_list.is_empty() {
+            local_node_id.to_string()
+        } else {
+            format!("{},{}", visited_list.join(","), local_node_id)
+        };
+        let req_id_owned = request_id
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
+
+        let mut hdrs: Vec<(&str, &str)> = vec![
+            ("X-Nexus-Mesh-Hops", &next_hops),
+            ("X-Nexus-Mesh-Visited", &next_visited),
+            ("X-Nexus-Delegated-By", local_node_id),
+            ("X-Nexus-Request-Id", &req_id_owned),
+        ];
+        if let Some(auth) = auth_header {
+            hdrs.push(("Authorization", auth));
+        }
+        if let Some(ct) = content_type {
+            hdrs.push(("Content-Type", ct));
+        }
+
+        let (status, resp_hdrs, resp_body) =
+            Self::raw_http_exchange(peer_endpoint, method, path_and_query, &hdrs, body).await?;
+        let resp_ct = resp_hdrs
+            .into_iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+            .map(|(_, v)| v)
+            .unwrap_or_else(|| "application/octet-stream".to_string());
+        Ok((status, resp_ct, resp_body))
+    }
+}
+
+fn decode_chunked_body(mut input: &[u8]) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    loop {
+        let Some(crlf) = input.windows(2).position(|w| w == b"\r\n") else {
+            break;
+        };
+        let size_str = std::str::from_utf8(&input[..crlf])
+            .unwrap_or("0")
+            .split(';')
+            .next()
+            .unwrap_or("0")
+            .trim();
+        let chunk_size = usize::from_str_radix(size_str, 16)
+            .map_err(|e| anyhow::anyhow!("Invalid HTTP chunk size '{}': {}", size_str, e))?;
+        input = &input[crlf + 2..];
+        if chunk_size == 0 {
+            break;
+        }
+        if input.len() < chunk_size {
+            anyhow::bail!("Truncated HTTP chunked body");
+        }
+        out.extend_from_slice(&input[..chunk_size]);
+        input = &input[chunk_size..];
+        if input.starts_with(b"\r\n") {
+            input = &input[2..];
+        }
+    }
+    Ok(out)
 }
