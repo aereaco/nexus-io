@@ -51,17 +51,48 @@ static REFRESH_STRIPES: Lazy<Vec<Mutex<()>>> =
 static HIERARCHY_STRIPES: Lazy<Vec<Mutex<()>>> =
     Lazy::new(|| (0..LOCK_STRIPE_COUNT).map(|_| Mutex::new(())).collect());
 
+const MAX_TOKEN_CACHE_ENTRIES: usize = 16_384;
+const TOKEN_CACHE_TTL_MS: u64 = 15_000;
+
 /// Zero-copy, zero-serialization live token entry with atomic revocation/rotation flags.
 struct LiveTokenEntry {
     record: IssuedTokenRecord,
     revoked: AtomicBool,
     rotated: AtomicBool,
     family_revoked: Arc<AtomicBool>,
+    cached_at_ms: u64,
 }
 
 /// Process-local ZCZS hot token cache keyed by `(db_ptr_addr, token_hash)`.
 static TOKEN_CACHE: Lazy<RwLock<HashMap<(usize, String), Arc<LiveTokenEntry>>>> =
     Lazy::new(|| RwLock::new(HashMap::new()));
+
+fn insert_token_cache_bounded(dbk: usize, token_hash: String, entry: Arc<LiveTokenEntry>) {
+    if let Ok(mut cache) = TOKEN_CACHE.write() {
+        if cache.len() >= MAX_TOKEN_CACHE_ENTRIES {
+            let now = now_ms();
+            cache.retain(|_, v| {
+                !v.revoked.load(Ordering::Acquire)
+                    && !v.rotated.load(Ordering::Acquire)
+                    && !v.family_revoked.load(Ordering::Acquire)
+                    && now <= v.record.expires_at_ms
+                    && now.saturating_sub(v.cached_at_ms) <= TOKEN_CACHE_TTL_MS
+            });
+            if cache.len() >= MAX_TOKEN_CACHE_ENTRIES {
+                let mut by_age: Vec<((usize, String), u64)> = cache
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.cached_at_ms))
+                    .collect();
+                by_age.sort_by_key(|(_, ts)| *ts);
+                let to_drop = (MAX_TOKEN_CACHE_ENTRIES / 4).max(1);
+                for (k, _) in by_age.into_iter().take(to_drop) {
+                    cache.remove(&k);
+                }
+            }
+        }
+        cache.insert((dbk, token_hash), entry);
+    }
+}
 
 /// Shared atomic family-revocation flags keyed by `(db_ptr_addr, family_id)`.
 static FAMILY_REVOKED: Lazy<RwLock<HashMap<(usize, String), Arc<AtomicBool>>>> =
@@ -2131,20 +2162,10 @@ impl NexusIdp {
         Arc::as_ptr(&self.db) as usize
     }
 
+    /// Persist-before-publish guarantee: durable write to `nexus-db` MUST succeed
+    /// before publishing into the ZCZS in-memory `TOKEN_CACHE`.
     async fn persist_token(&self, rec: &IssuedTokenRecord) -> Result<()> {
-        // 1. Update ZCZS in-memory atomic cache immediately (zero-copy hot path)
-        let dbk = self.db_key();
-        let fflag = family_flag(dbk, &rec.family_id);
-        let entry = Arc::new(LiveTokenEntry {
-            record: rec.clone(),
-            revoked: AtomicBool::new(rec.revoked),
-            rotated: AtomicBool::new(rec.rotated),
-            family_revoked: fflag,
-        });
-        if let Ok(mut cache) = TOKEN_CACHE.write() {
-            cache.insert((dbk, rec.token_hash.clone()), entry);
-        }
-        // 2. Write-through durability to nexus-db
+        // 1. Write-through durability to nexus-db FIRST
         let val = serde_json::to_value(rec)?;
         self.db
             .client
@@ -2153,6 +2174,17 @@ impl NexusIdp {
             .bind(("t", val))
             .await?
             .check()?;
+        // 2. Publish into bounded ZCZS in-memory atomic cache only after persistence succeeds
+        let dbk = self.db_key();
+        let fflag = family_flag(dbk, &rec.family_id);
+        let entry = Arc::new(LiveTokenEntry {
+            record: rec.clone(),
+            revoked: AtomicBool::new(rec.revoked),
+            rotated: AtomicBool::new(rec.rotated),
+            family_revoked: fflag,
+            cached_at_ms: now_ms(),
+        });
+        insert_token_cache_bounded(dbk, rec.token_hash.clone(), entry);
         Ok(())
     }
 
@@ -2462,21 +2494,31 @@ impl NexusIdp {
     }
 
     /// ZCZS hot-path token introspection: checks the typed `Arc<LiveTokenEntry>` + `AtomicBool`
-    /// cache first (zero JSON, zero SurrealQL), falling back to `nexus-db` only on cold miss.
+    /// cache first (zero JSON, zero SurrealQL) within the bounded freshness TTL, falling back to
+    /// indexed `nexus-db` lookup on miss or TTL expiry for cross-instance revocation coherence.
     pub async fn introspect_token(&self, raw_token: &str) -> Result<Option<IssuedTokenRecord>> {
         let thash = hash_lookup_key(raw_token);
         let dbk = self.db_key();
+        let now = now_ms();
+        let mut stale_evict = false;
         if let Ok(cache) = TOKEN_CACHE.read() {
             if let Some(entry) = cache.get(&(dbk, thash.clone())) {
                 if entry.revoked.load(Ordering::Acquire)
                     || entry.rotated.load(Ordering::Acquire)
                     || entry.family_revoked.load(Ordering::Acquire)
-                    || now_ms() > entry.record.expires_at_ms
+                    || now > entry.record.expires_at_ms
                 {
-                    return Ok(None);
+                    stale_evict = true;
+                } else if now.saturating_sub(entry.cached_at_ms) <= TOKEN_CACHE_TTL_MS {
+                    return Ok(Some(entry.record.clone()));
                 }
-                return Ok(Some(entry.record.clone()));
             }
+        }
+        if stale_evict {
+            if let Ok(mut cache) = TOKEN_CACHE.write() {
+                cache.remove(&(dbk, thash));
+            }
+            return Ok(None);
         }
 
         self.ensure_tables().await?;
@@ -2494,18 +2536,20 @@ impl NexusIdp {
             return Ok(None);
         };
         let fflag = family_flag(dbk, &rec.family_id);
-        let entry = Arc::new(LiveTokenEntry {
-            record: rec.clone(),
-            revoked: AtomicBool::new(rec.revoked),
-            rotated: AtomicBool::new(rec.rotated),
-            family_revoked: Arc::clone(&fflag),
-        });
-        if let Ok(mut cache) = TOKEN_CACHE.write() {
-            cache.insert((dbk, thash), entry);
-        }
         if rec.revoked || rec.rotated || fflag.load(Ordering::Acquire) || now_ms() > rec.expires_at_ms {
+            if let Ok(mut cache) = TOKEN_CACHE.write() {
+                cache.remove(&(dbk, thash));
+            }
             return Ok(None);
         }
+        let entry = Arc::new(LiveTokenEntry {
+            record: rec.clone(),
+            revoked: AtomicBool::new(false),
+            rotated: AtomicBool::new(false),
+            family_revoked: Arc::clone(&fflag),
+            cached_at_ms: now_ms(),
+        });
+        insert_token_cache_bounded(dbk, thash, entry);
         Ok(Some(rec))
     }
 

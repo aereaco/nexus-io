@@ -211,9 +211,15 @@ pub struct StageSubmission {
     /// Optional policy decision returned by a sandboxed Wasm stage host runner.
     #[serde(default)]
     pub wasm_decision: Option<PolicyStageDecision>,
-    /// Optional verified federated subject/provider assertion (Phase 2C).
+    /// Optional upstream OIDC ID token (cryptographically verified against provider JWKS).
     #[serde(default)]
-    pub federated_subject: Option<String>,
+    pub federated_id_token: Option<String>,
+    /// Optional base64-encoded SAML 2.0 Response XML (verified against provider cert/audience/window).
+    #[serde(default)]
+    pub saml_response: Option<String>,
+    /// Optional expected SAML SP EntityID / Audience when verifying `saml_response`.
+    #[serde(default)]
+    pub saml_audience: Option<String>,
     /// Optional W3C WebAuthn assertion response (Phase 2B).
     #[serde(default)]
     pub webauthn_response: Option<crate::iam::webauthn::AuthenticationResponse>,
@@ -615,13 +621,64 @@ impl AuthFlowEngine {
                 Ok(format!("webauthn cred={} uv={}", res.credential_id, res.user_verified))
             }
             AuthStageKind::ExternalProvider { provider_id } => {
-                let fed_sub = sub
-                    .federated_subject
-                    .as_deref()
-                    .filter(|s| !s.is_empty())
-                    .ok_or_else(|| anyhow!("federated_subject required for provider '{}'", provider_id))?;
                 let fed = crate::iam::federation::FederationService::new(self.db.clone());
-                match fed.resolve_federated_login(provider_id, fed_sub, None).await? {
+                let prov = fed
+                    .get_provider(provider_id)
+                    .await?
+                    .ok_or_else(|| anyhow!("Federated provider '{}' not found", provider_id))?;
+
+                // Cryptographically verify the upstream assertion before resolving any identity link.
+                // NEVER accept an unverified client-supplied subject string!
+                let (verified_sub, verified_email): (String, Option<String>) = match prov.protocol {
+                    crate::iam::federation::FederationProtocol::Oidc => {
+                        let raw_tok = sub
+                            .federated_id_token
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .ok_or_else(|| {
+                                anyhow!(
+                                    "Cryptographically signed federated_id_token required for OIDC provider '{}'",
+                                    provider_id
+                                )
+                            })?;
+                        let claims = fed.verify_upstream_oidc_id_token(provider_id, raw_tok).await?;
+                        let sub_claim = claims["sub"]
+                            .as_str()
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .ok_or_else(|| anyhow!("Verified OIDC ID token missing 'sub' claim"))?
+                            .to_string();
+                        let email_claim = claims["email"].as_str().map(|s| s.trim().to_string());
+                        (sub_claim, email_claim)
+                    }
+                    crate::iam::federation::FederationProtocol::Saml2 => {
+                        let saml_b64 = sub
+                            .saml_response
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .ok_or_else(|| {
+                                anyhow!(
+                                    "Signed saml_response required for SAML provider '{}'",
+                                    provider_id
+                                )
+                            })?;
+                        let aud = sub
+                            .saml_audience
+                            .as_deref()
+                            .filter(|s| !s.is_empty())
+                            .or(prov.client_id.as_deref())
+                            .ok_or_else(|| anyhow!("saml_audience required for SAML provider '{}'", provider_id))?;
+                        let assertion = fed.verify_saml_response(provider_id, saml_b64, aud).await?;
+                        (assertion.name_id, assertion.email)
+                    }
+                };
+
+                match fed
+                    .resolve_federated_login(provider_id, &verified_sub, verified_email.as_deref())
+                    .await?
+                {
                     crate::iam::federation::FederatedLoginResolution::Linked { identity_id, link_id } => {
                         if let Some(ref existing) = exec.identity_id {
                             if existing != &identity_id {
@@ -636,13 +693,19 @@ impl AuthFlowEngine {
                         if !exec.authorities.contains(&AuthAuthority::Federated) {
                             exec.authorities.push(AuthAuthority::Federated);
                         }
-                        Ok(format!("federated={} link={} provider={}", fed_sub, link_id, provider_id))
+                        Ok(format!(
+                            "federated={} link={} provider={}",
+                            verified_sub, link_id, provider_id
+                        ))
                     }
                     crate::iam::federation::FederatedLoginResolution::ExplicitLinkRequired { reason } => {
                         Err(anyhow!("{}", reason))
                     }
                     crate::iam::federation::FederatedLoginResolution::Unlinked => {
-                        Err(anyhow!("External subject '{}' is not explicitly linked to a Nexus identity", fed_sub))
+                        Err(anyhow!(
+                            "External subject '{}' is not explicitly linked to a Nexus identity",
+                            verified_sub
+                        ))
                     }
                 }
             }
@@ -941,5 +1004,109 @@ mod tests {
         assert!(engine.submit_stage(&ex2.execution_id, StageSubmission { password: Some("wrong2".into()), ..Default::default() }).await.is_err());
         let locked = engine.get_execution(&ex2.execution_id).await.unwrap().unwrap();
         assert_eq!(locked.status, FlowExecStatus::LockedOut);
+    }
+
+    #[tokio::test]
+    async fn external_provider_stage_requires_cryptographically_verified_oidc_id_token() {
+        let db = Arc::new(Database::open_mem());
+        let idp = NexusIdp::new(db.clone());
+        let fed = crate::iam::federation::FederationService::new(db.clone());
+        let engine = AuthFlowEngine::new(db);
+
+        let org = idp
+            .create_org(
+                "root",
+                "fed-org",
+                "Fed Org",
+                None,
+                None,
+                OrgPolicyPatch {
+                    allowed_external_idps: Some(vec!["oidc".into()]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let (up_sk, up_pk) = nexus_db::auth::ed25519_generate_keypair();
+        let up_jwks = serde_json::json!({ "keys": [nexus_db::auth::ed25519_jwk("k1", &up_pk)] });
+        let prov = fed
+            .register_provider(
+                "root",
+                &org.org_id,
+                "Okta",
+                crate::iam::federation::FederationProtocol::Oidc,
+                "https://fed.okta.example",
+                "https://fed.okta.example/authorize",
+                None,
+                Some("nexus-client".into()),
+                None,
+                Some(up_jwks),
+                None,
+                vec!["fed.example".into()],
+            )
+            .await
+            .unwrap();
+
+        let (alice, _) = idp.create_identity("Alice", Some("alice@fed.example".into())).await.unwrap();
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let valid_tok = nexus_db::auth::sign_eddsa_jwt(
+            "k1",
+            &up_sk,
+            &serde_json::json!({
+                "iss": "https://fed.okta.example",
+                "sub": "okta-alice-1",
+                "email": "alice@fed.example",
+                "aud": "nexus-client",
+                "iat": now,
+                "exp": now + 300,
+            }),
+        )
+        .unwrap();
+        fed.link_identity_with_oidc_token(&alice.identity_id, &prov.provider_id, &valid_tok)
+            .await
+            .unwrap();
+
+        engine
+            .create_flow(
+                "root",
+                "fed-login",
+                "Federated Login",
+                Some(org.org_id.clone()),
+                vec![AuthStage {
+                    stage_id: "ext".into(),
+                    kind: AuthStageKind::ExternalProvider { provider_id: prov.provider_id.clone() },
+                    max_retries: 3,
+                }],
+                300,
+                3,
+            )
+            .await
+            .unwrap();
+
+        // 1. Missing token or forged token MUST fail closed
+        let ex1 = engine.start_flow("fed-login", Some(org.org_id.clone())).await.unwrap();
+        assert!(engine.submit_stage(&ex1.execution_id, StageSubmission::default()).await.is_err());
+        assert!(engine
+            .submit_stage(
+                &ex1.execution_id,
+                StageSubmission { federated_id_token: Some("forged.jwt.token".into()), ..Default::default() },
+            )
+            .await
+            .is_err());
+
+        // 2. Cryptographically signed upstream OIDC ID token succeeds and binds verified identity_id
+        let ex2 = engine.start_flow("fed-login", Some(org.org_id.clone())).await.unwrap();
+        let done = engine
+            .submit_stage(
+                &ex2.execution_id,
+                StageSubmission { federated_id_token: Some(valid_tok), ..Default::default() },
+            )
+            .await
+            .unwrap();
+        assert_eq!(done.status, FlowExecStatus::Completed);
+        let res = done.result.unwrap();
+        assert_eq!(res.identity_id, alice.identity_id);
+        assert!(res.amr.contains(&"fed".to_string()));
+        assert!(res.authorities.contains(&AuthAuthority::Federated));
     }
 }

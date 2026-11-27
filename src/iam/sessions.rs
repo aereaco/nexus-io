@@ -114,13 +114,50 @@ pub struct ClusterTrustDecision {
     pub reason: String,
 }
 
+const MAX_SESSION_CACHE_ENTRIES: usize = 16_384;
+/// Bounded local cache freshness window so cross-process/cross-cluster revocations propagate promptly.
+const SESSION_CACHE_TTL_MS: u64 = 15_000;
+
 struct LiveSessionEntry {
     record: SessionRecord,
     revoked: AtomicBool,
+    cached_at_ms: u64,
 }
 
 static SESSION_CACHE: Lazy<RwLock<HashMap<(usize, String), Arc<LiveSessionEntry>>>> =
     Lazy::new(|| RwLock::new(HashMap::new()));
+
+fn insert_session_cache_bounded(dbk: usize, token_hash: String, entry: Arc<LiveSessionEntry>) {
+    if let Ok(mut cache) = SESSION_CACHE.write() {
+        if cache.len() >= MAX_SESSION_CACHE_ENTRIES {
+            let now = now_ms();
+            cache.retain(|_, v| {
+                !v.revoked.load(Ordering::Acquire)
+                    && now <= v.record.expires_at_ms
+                    && now.saturating_sub(v.cached_at_ms) <= SESSION_CACHE_TTL_MS
+            });
+            if cache.len() >= MAX_SESSION_CACHE_ENTRIES {
+                // Evict oldest quarter deterministically to bound memory under high load
+                let mut by_age: Vec<((usize, String), u64)> = cache
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.cached_at_ms))
+                    .collect();
+                by_age.sort_by_key(|(_, ts)| *ts);
+                let to_drop = (MAX_SESSION_CACHE_ENTRIES / 4).max(1);
+                for (k, _) in by_age.into_iter().take(to_drop) {
+                    cache.remove(&k);
+                }
+            }
+        }
+        cache.insert((dbk, token_hash), entry);
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SessionTokenIndex {
+    session_id: String,
+    token_hash: String,
+}
 
 #[derive(Clone)]
 pub struct SessionService {
@@ -142,21 +179,16 @@ impl SessionService {
         self.idp.ensure_tables().await?;
         let ddl = "\
             DEFINE TABLE IF NOT EXISTS sys_iam_session SCHEMALESS;\
+            DEFINE TABLE IF NOT EXISTS sys_iam_session_tok SCHEMALESS;\
             DEFINE TABLE IF NOT EXISTS sys_iam_device SCHEMALESS;\
             DEFINE TABLE IF NOT EXISTS sys_iam_cluster_trust SCHEMALESS;";
         let _ = self.db.client.query(ddl).await;
         Ok(())
     }
 
+    /// Persist-before-publish guarantee: durable `nexus-db` write + token index MUST succeed
+    /// before publishing into the ZCZS in-memory `SESSION_CACHE`.
     async fn persist_session(&self, rec: &SessionRecord) -> Result<()> {
-        let dbk = self.db_key();
-        let entry = Arc::new(LiveSessionEntry {
-            record: rec.clone(),
-            revoked: AtomicBool::new(rec.revoked),
-        });
-        if let Ok(mut cache) = SESSION_CACHE.write() {
-            cache.insert((dbk, rec.token_hash.clone()), entry);
-        }
         let val = serde_json::to_value(rec)?;
         self.db
             .client
@@ -165,6 +197,25 @@ impl SessionService {
             .bind(("s", val))
             .await?
             .check()?;
+        let idx = serde_json::to_value(&SessionTokenIndex {
+            session_id: rec.session_id.clone(),
+            token_hash: rec.token_hash.clone(),
+        })?;
+        self.db
+            .client
+            .query("UPSERT type::record('sys_iam_session_tok', $th) CONTENT $idx;")
+            .bind(("th", rec.token_hash.clone()))
+            .bind(("idx", idx))
+            .await?
+            .check()?;
+
+        let dbk = self.db_key();
+        let entry = Arc::new(LiveSessionEntry {
+            record: rec.clone(),
+            revoked: AtomicBool::new(rec.revoked),
+            cached_at_ms: now_ms(),
+        });
+        insert_session_cache_bounded(dbk, rec.token_hash.clone(), entry);
         Ok(())
     }
 
@@ -233,39 +284,69 @@ impl SessionService {
         Ok((rec, raw_token))
     }
 
-    /// ZCZS hot-path session validation (zero JSON/SurrealQL on cache hit).
+    /// ZCZS hot-path session validation with bounded freshness TTL and O(1) indexed DB fallback.
     pub async fn validate_session(&self, raw_token: &str) -> Result<Option<SessionRecord>> {
         let thash = hash_token(raw_token);
         let dbk = self.db_key();
+        let now = now_ms();
+        let mut stale_evict = false;
         if let Ok(cache) = SESSION_CACHE.read() {
             if let Some(entry) = cache.get(&(dbk, thash.clone())) {
-                if entry.revoked.load(Ordering::Acquire) || now_ms() > entry.record.expires_at_ms {
-                    return Ok(None);
+                if entry.revoked.load(Ordering::Acquire) || now > entry.record.expires_at_ms {
+                    stale_evict = true;
+                } else if now.saturating_sub(entry.cached_at_ms) <= SESSION_CACHE_TTL_MS {
+                    return Ok(Some(entry.record.clone()));
                 }
-                return Ok(Some(entry.record.clone()));
             }
         }
+        if stale_evict {
+            if let Ok(mut cache) = SESSION_CACHE.write() {
+                cache.remove(&(dbk, thash));
+            }
+            return Ok(None);
+        }
+
         self.ensure_tables().await?;
-        let mut resp = self.db.client.query("SELECT * FROM sys_iam_session").await?;
-        let rows: Vec<serde_json::Value> = resp.take(0).unwrap_or_default();
-        for v in rows {
-            if let Ok(rec) = serde_json::from_value::<SessionRecord>(v) {
-                if rec.token_hash == thash {
-                    let entry = Arc::new(LiveSessionEntry {
-                        record: rec.clone(),
-                        revoked: AtomicBool::new(rec.revoked),
-                    });
-                    if let Ok(mut cache) = SESSION_CACHE.write() {
-                        cache.insert((dbk, thash), entry);
-                    }
-                    if rec.revoked || now_ms() > rec.expires_at_ms {
-                        return Ok(None);
-                    }
-                    return Ok(Some(rec));
-                }
+        // O(1) indexed lookup via `sys_iam_session_tok` (never full-scans `sys_iam_session`)
+        let mut idx_resp = self
+            .db
+            .client
+            .query("SELECT * FROM type::record('sys_iam_session_tok', $th)")
+            .bind(("th", thash.clone()))
+            .await?;
+        let idx_rows: Vec<serde_json::Value> = idx_resp.take(0).unwrap_or_default();
+        let Some(idx) = idx_rows
+            .first()
+            .and_then(|v| serde_json::from_value::<SessionTokenIndex>(v.clone()).ok())
+        else {
+            return Ok(None);
+        };
+        let mut ses_resp = self
+            .db
+            .client
+            .query("SELECT * FROM type::record('sys_iam_session', $id)")
+            .bind(("id", idx.session_id))
+            .await?;
+        let ses_rows: Vec<serde_json::Value> = ses_resp.take(0).unwrap_or_default();
+        let Some(rec) = ses_rows
+            .first()
+            .and_then(|v| serde_json::from_value::<SessionRecord>(v.clone()).ok())
+        else {
+            return Ok(None);
+        };
+        if rec.revoked || now_ms() > rec.expires_at_ms {
+            if let Ok(mut cache) = SESSION_CACHE.write() {
+                cache.remove(&(dbk, thash));
             }
+            return Ok(None);
         }
-        Ok(None)
+        let entry = Arc::new(LiveSessionEntry {
+            record: rec.clone(),
+            revoked: AtomicBool::new(false),
+            cached_at_ms: now_ms(),
+        });
+        insert_session_cache_bounded(dbk, thash, entry);
+        Ok(Some(rec))
     }
 
     pub async fn list_sessions(&self, identity_id: &str) -> Result<Vec<SessionRecord>> {
@@ -279,7 +360,13 @@ impl SessionService {
             .collect())
     }
 
-    pub async fn revoke_session(&self, actor: &str, session_id: &str) -> Result<bool> {
+    /// Revoke a session, strictly enforcing ownership (`rec.identity_id == actor || is_platform_admin`).
+    pub async fn revoke_session(
+        &self,
+        actor: &str,
+        is_platform_admin: bool,
+        session_id: &str,
+    ) -> Result<bool> {
         self.ensure_tables().await?;
         let mut resp = self
             .db
@@ -292,6 +379,9 @@ impl SessionService {
             .first()
             .and_then(|v| serde_json::from_value::<SessionRecord>(v.clone()).ok())
         {
+            if !is_platform_admin && rec.identity_id != actor {
+                anyhow::bail!("Forbidden: cannot revoke another identity's session");
+            }
             rec.revoked = true;
             self.persist_session(&rec).await?;
             let _ = self
@@ -388,24 +478,29 @@ impl SessionService {
     }
 
     // -------------------------------------------------------------------------
-    // Device Registration & Trust
+    // Device Registration & Evidence-Based Trust Transitions
     // -------------------------------------------------------------------------
 
+    /// Register a new device owned strictly by `authenticated_identity_id`.
+    /// Newly registered devices ALWAYS start as `DeviceTrustLevel::Untrusted` — callers
+    /// can NEVER self-assign `Verified` or `Managed` trust!
     pub async fn register_device(
         &self,
-        identity_id: &str,
+        authenticated_identity_id: &str,
         label: &str,
         fingerprint: &str,
-        trust_level: DeviceTrustLevel,
     ) -> Result<DeviceRecord> {
         self.ensure_tables().await?;
+        if authenticated_identity_id.trim().is_empty() {
+            anyhow::bail!("Authenticated identity_id is required to register a device");
+        }
         let now = now_ms();
         let dev = DeviceRecord {
             device_id: format!("dev_{}", &uuid::Uuid::new_v4().simple().to_string()[..12]),
-            identity_id: identity_id.to_string(),
+            identity_id: authenticated_identity_id.to_string(),
             label: label.trim().to_string(),
             fingerprint_hash: hash_token(fingerprint),
-            trust_level,
+            trust_level: DeviceTrustLevel::Untrusted,
             revoked: false,
             registered_at_ms: now,
             last_seen_ms: now,
@@ -420,7 +515,113 @@ impl SessionService {
             .check()?;
         let _ = self
             .idp
-            .append_audit("instance", identity_id, "device.register", &dev.device_id, "ok", &dev.label)
+            .append_audit(
+                "instance",
+                authenticated_identity_id,
+                "device.register",
+                &dev.device_id,
+                "ok",
+                &format!("{} (untrusted)", dev.label),
+            )
+            .await;
+        Ok(dev)
+    }
+
+    /// Evidence-backed transition `Untrusted -> Verified`: requires cryptographic MFA/WebAuthn
+    /// assurance (`hwk` or `otp`) and strict device ownership by `actor_identity_id`.
+    pub async fn verify_device(
+        &self,
+        actor_identity_id: &str,
+        device_id: &str,
+        verified_amr: &[String],
+    ) -> Result<DeviceRecord> {
+        self.ensure_tables().await?;
+        let has_strong_evidence = verified_amr
+            .iter()
+            .any(|m| matches!(m.as_str(), "hwk" | "otp"));
+        if !has_strong_evidence {
+            anyhow::bail!("Device verification requires verified MFA or WebAuthn evidence (hwk/otp)");
+        }
+        let mut resp = self
+            .db
+            .client
+            .query("SELECT * FROM type::record('sys_iam_device', $id)")
+            .bind(("id", device_id.to_string()))
+            .await?;
+        let rows: Vec<serde_json::Value> = resp.take(0).unwrap_or_default();
+        let mut dev: DeviceRecord = rows
+            .first()
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .ok_or_else(|| anyhow!("Device '{}' not found", device_id))?;
+        if dev.revoked {
+            anyhow::bail!("Cannot verify a revoked device");
+        }
+        if dev.identity_id != actor_identity_id {
+            anyhow::bail!("Forbidden: device does not belong to actor '{}'", actor_identity_id);
+        }
+        if dev.trust_level == DeviceTrustLevel::Untrusted {
+            dev.trust_level = DeviceTrustLevel::Verified;
+        }
+        dev.last_seen_ms = now_ms();
+        let val = serde_json::to_value(&dev)?;
+        self.db
+            .client
+            .query("UPSERT type::record('sys_iam_device', $id) CONTENT $d;")
+            .bind(("id", dev.device_id.clone()))
+            .bind(("d", val))
+            .await?
+            .check()?;
+        let _ = self
+            .idp
+            .append_audit("instance", actor_identity_id, "device.verify", device_id, "ok", "verified")
+            .await;
+        Ok(dev)
+    }
+
+    /// Authorized MDM/admin transition `-> Managed`: requires platform admin authority and
+    /// a non-empty attestation reference (never self-assignable by end users).
+    pub async fn mark_device_managed(
+        &self,
+        admin_actor: &str,
+        is_platform_admin: bool,
+        device_id: &str,
+        attestation_ref: &str,
+    ) -> Result<DeviceRecord> {
+        if !is_platform_admin {
+            anyhow::bail!("Forbidden: Managed device trust requires authorized MDM/platform admin authority");
+        }
+        let att = attestation_ref.trim();
+        if att.is_empty() {
+            anyhow::bail!("attestation_ref is required to mark a device Managed");
+        }
+        self.ensure_tables().await?;
+        let mut resp = self
+            .db
+            .client
+            .query("SELECT * FROM type::record('sys_iam_device', $id)")
+            .bind(("id", device_id.to_string()))
+            .await?;
+        let rows: Vec<serde_json::Value> = resp.take(0).unwrap_or_default();
+        let mut dev: DeviceRecord = rows
+            .first()
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .ok_or_else(|| anyhow!("Device '{}' not found", device_id))?;
+        if dev.revoked {
+            anyhow::bail!("Cannot mark a revoked device as Managed");
+        }
+        dev.trust_level = DeviceTrustLevel::Managed;
+        dev.last_seen_ms = now_ms();
+        let val = serde_json::to_value(&dev)?;
+        self.db
+            .client
+            .query("UPSERT type::record('sys_iam_device', $id) CONTENT $d;")
+            .bind(("id", dev.device_id.clone()))
+            .bind(("d", val))
+            .await?
+            .check()?;
+        let _ = self
+            .idp
+            .append_audit("instance", admin_actor, "device.manage", device_id, "ok", att)
             .await;
         Ok(dev)
     }
@@ -437,7 +638,13 @@ impl SessionService {
     }
 
     /// Revoke a device AND immediately revoke all active sessions bound to that device.
-    pub async fn revoke_device(&self, actor: &str, identity_id: &str, device_id: &str) -> Result<bool> {
+    /// Enforces ownership (`dev.identity_id == actor || is_platform_admin`).
+    pub async fn revoke_device(
+        &self,
+        actor: &str,
+        is_platform_admin: bool,
+        device_id: &str,
+    ) -> Result<bool> {
         self.ensure_tables().await?;
         let mut resp = self
             .db
@@ -452,9 +659,10 @@ impl SessionService {
         else {
             return Ok(false);
         };
-        if dev.identity_id != identity_id {
-            anyhow::bail!("Device does not belong to identity '{}'", identity_id);
+        if !is_platform_admin && dev.identity_id != actor {
+            anyhow::bail!("Forbidden: device does not belong to actor '{}'", actor);
         }
+        let owner_id = dev.identity_id.clone();
         dev.revoked = true;
         let val = serde_json::to_value(&dev)?;
         self.db
@@ -466,7 +674,7 @@ impl SessionService {
             .check()?;
 
         // Revoke all active sessions bound to this device
-        for mut ses in self.list_sessions(identity_id).await? {
+        for mut ses in self.list_sessions(&owner_id).await? {
             if ses.device_id.as_deref() == Some(device_id) {
                 ses.revoked = true;
                 self.persist_session(&ses).await?;
@@ -474,7 +682,7 @@ impl SessionService {
         }
         let _ = self
             .idp
-            .append_audit("instance", actor, "device.revoke", device_id, "ok", identity_id)
+            .append_audit("instance", actor, "device.revoke", device_id, "ok", &owner_id)
             .await;
         Ok(true)
     }
@@ -600,10 +808,25 @@ mod tests {
             .await
             .unwrap();
 
+        // Newly registered device MUST start as Untrusted (never self-assigned Verified/Managed!)
         let dev = svc
-            .register_device(&alice.identity_id, "MacBook Pro", "fp-mbp-1", DeviceTrustLevel::Verified)
+            .register_device(&alice.identity_id, "MacBook Pro", "fp-mbp-1")
             .await
             .unwrap();
+        assert_eq!(dev.trust_level, DeviceTrustLevel::Untrusted);
+
+        // Verification without MFA/WebAuthn evidence MUST fail
+        assert!(svc.verify_device(&alice.identity_id, &dev.device_id, &["pwd".into()]).await.is_err());
+        // Cross-identity verification by Bob MUST fail
+        let (bob, _) = idp.create_identity("Bob", None).await.unwrap();
+        assert!(svc.verify_device(&bob.identity_id, &dev.device_id, &["hwk".into()]).await.is_err());
+        // Evidence-backed verification by owner succeeds
+        let dev = svc.verify_device(&alice.identity_id, &dev.device_id, &["hwk".into()]).await.unwrap();
+        assert_eq!(dev.trust_level, DeviceTrustLevel::Verified);
+        // Non-admin CANNOT mark Managed; admin with attestation CAN
+        assert!(svc.mark_device_managed(&alice.identity_id, false, &dev.device_id, "mdm-cert-1").await.is_err());
+        let dev = svc.mark_device_managed("root", true, &dev.device_id, "mdm-cert-1").await.unwrap();
+        assert_eq!(dev.trust_level, DeviceTrustLevel::Managed);
 
         let aal1_auth = AuthResult {
             execution_id: "fex_1".into(),
@@ -663,8 +886,10 @@ mod tests {
         assert!(svc.validate_session(&org_tok).await.unwrap().is_none());
         assert!(svc.validate_session(&personal_tok).await.unwrap().is_some());
 
-        // 4. Revoking the device revokes the remaining personal session bound to it!
-        assert!(svc.revoke_device(&alice.identity_id, &alice.identity_id, &dev.device_id).await.unwrap());
+        // 4. Cross-identity revocation by Bob MUST be rejected; owner revoking the device revokes bound sessions!
+        assert!(svc.revoke_session(&bob.identity_id, false, &personal_ses.session_id).await.is_err());
+        assert!(svc.revoke_device(&bob.identity_id, false, &dev.device_id).await.is_err());
+        assert!(svc.revoke_device(&alice.identity_id, false, &dev.device_id).await.unwrap());
         assert!(svc.validate_session(&personal_tok).await.unwrap().is_none());
 
         // 5. Cross-cluster trust: authentic portable package is NOT trusted until source cluster is allowlisted!

@@ -993,6 +993,11 @@ impl UxGateway {
                         .get(IamSamlMetadataHandler),
                 )
                 .push(
+                    Router::with_path("/_nexus/iam/saml/acs")
+                        .hoop(gate.clone())
+                        .post(IamSamlAcsHandler { db: self.db.clone() }),
+                )
+                .push(
                     Router::with_path("/_nexus/iam/sessions")
                         .hoop(gate.clone())
                         .hoop(crate::ux::iam::IamMiddleware::authenticated(self.db.clone()))
@@ -1016,6 +1021,12 @@ impl UxGateway {
                         .hoop(gate.clone())
                         .hoop(crate::ux::iam::IamMiddleware::authenticated(self.db.clone()))
                         .delete(IamDevicesHandler { db: self.db.clone() }),
+                )
+                .push(
+                    Router::with_path("/_nexus/iam/devices/{device_id}/manage")
+                        .hoop(gate.clone())
+                        .hoop(crate::ux::iam::IamMiddleware::admin(self.db.clone()))
+                        .post(IamDeviceManageHandler { db: self.db.clone() }),
                 )
                 .push(
                     Router::with_path("/_nexus/iam/trust/clusters")
@@ -3052,11 +3063,25 @@ impl Handler for IamFedLinksHandler {
     async fn handle(&self, req: &mut Request, depot: &mut Depot, res: &mut Response, _ctrl: &mut FlowCtrl) {
         let auth = crate::ux::iam::depot_auth_context(depot);
         let actor = auth.as_ref().and_then(|a| a.actor.clone()).unwrap_or_default();
+        let is_admin = auth
+            .as_ref()
+            .map(|a| a.roles.contains(&nexus_db::auth::Role::Owner))
+            .unwrap_or(false);
+        if actor.is_empty() {
+            res.status_code(StatusCode::UNAUTHORIZED);
+            res.render(Json(serde_json::json!({ "error": "Authentication required" })));
+            return;
+        }
         let fed = crate::iam::federation::FederationService::new(self.db.clone());
         match *req.method() {
             salvo::http::Method::GET => {
-                let ident = req.query::<String>("identity_id").unwrap_or_else(|| actor.clone());
-                match fed.list_links_for_identity(&ident).await {
+                let requested = req.query::<String>("identity_id").unwrap_or_else(|| actor.clone());
+                if !is_admin && requested != actor {
+                    res.status_code(StatusCode::FORBIDDEN);
+                    res.render(Json(serde_json::json!({ "error": "Forbidden" })));
+                    return;
+                }
+                match fed.list_links_for_identity(&requested).await {
                     Ok(links) => {
                         res.status_code(StatusCode::OK);
                         res.render(Json(serde_json::json!({ "links": links })));
@@ -3068,22 +3093,34 @@ impl Handler for IamFedLinksHandler {
                 }
             }
             salvo::http::Method::POST => {
+                // Verified linking ceremony ONLY: identity_id is strictly derived from server AuthContext,
+                // and external_subject is strictly extracted from a server-verified OIDC ID token or SAML assertion!
                 #[derive(serde::Deserialize)]
-                struct LinkReq {
-                    identity_id: String,
+                struct VerifiedLinkReq {
                     provider_id: String,
-                    external_subject: String,
                     #[serde(default)]
-                    linked_email: Option<String>,
+                    oidc_id_token: Option<String>,
+                    #[serde(default)]
+                    saml_response: Option<String>,
                 }
-                let Ok(body) = req.parse_json::<LinkReq>().await else {
+                let Ok(body) = req.parse_json::<VerifiedLinkReq>().await else {
                     res.status_code(StatusCode::BAD_REQUEST);
+                    res.render(Json(serde_json::json!({
+                        "error": "Expected { provider_id, oidc_id_token | saml_response }"
+                    })));
                     return;
                 };
-                match fed
-                    .link_identity(&actor, &body.identity_id, &body.provider_id, &body.external_subject, body.linked_email)
-                    .await
-                {
+                let link_res = if let Some(tok) = body.oidc_id_token.as_deref().filter(|s| !s.trim().is_empty()) {
+                    fed.link_identity_with_oidc_token(&actor, &body.provider_id, tok).await
+                } else if let Some(saml) = body.saml_response.as_deref().filter(|s| !s.trim().is_empty()) {
+                    let host = req.headers().get("host").and_then(|v| v.to_str().ok()).unwrap_or("127.0.0.1:8443");
+                    let scheme = if req.headers().get("x-forwarded-proto").and_then(|v| v.to_str().ok()) == Some("https") { "https" } else { "http" };
+                    let entity_id = format!("{}://{}/_nexus/iam/saml/metadata", scheme, host);
+                    fed.link_identity_with_saml_response(&actor, &body.provider_id, saml, &entity_id).await
+                } else {
+                    Err(anyhow::anyhow!("Upstream cryptographic proof (oidc_id_token or saml_response) is required"))
+                };
+                match link_res {
                     Ok(link) => {
                         res.status_code(StatusCode::CREATED);
                         res.render(Json(link));
@@ -3158,6 +3195,60 @@ impl Handler for IamSamlMetadataHandler {
 }
 
 #[derive(Clone)]
+struct IamSamlAcsHandler {
+    db: Arc<Database>,
+}
+
+#[async_trait]
+impl Handler for IamSamlAcsHandler {
+    async fn handle(&self, req: &mut Request, _depot: &mut Depot, res: &mut Response, _ctrl: &mut FlowCtrl) {
+        #[derive(serde::Deserialize)]
+        struct SamlAcsReq {
+            #[serde(alias = "RelayState")]
+            provider_id: String,
+            #[serde(alias = "SAMLResponse")]
+            saml_response: String,
+        }
+        let parsed = match req.parse_json::<SamlAcsReq>().await {
+            Ok(v) => Some(v),
+            Err(_) => req.parse_form::<SamlAcsReq>().await.ok(),
+        };
+        let Some(body) = parsed else {
+            res.status_code(StatusCode::BAD_REQUEST);
+            res.render(Json(serde_json::json!({ "error": "Expected SAMLResponse and RelayState/provider_id" })));
+            return;
+        };
+        let host = req.headers().get("host").and_then(|v| v.to_str().ok()).unwrap_or("127.0.0.1:8443");
+        let scheme = if req.headers().get("x-forwarded-proto").and_then(|v| v.to_str().ok()) == Some("https") { "https" } else { "http" };
+        let entity_id = format!("{}://{}/_nexus/iam/saml/metadata", scheme, host);
+        let fed = crate::iam::federation::FederationService::new(self.db.clone());
+        match fed.verify_saml_response(&body.provider_id, &body.saml_response, &entity_id).await {
+            Ok(assertion) => match fed
+                .resolve_federated_login(&body.provider_id, &assertion.name_id, assertion.email.as_deref())
+                .await
+            {
+                Ok(resolution) => {
+                    res.status_code(StatusCode::OK);
+                    res.render(Json(serde_json::json!({
+                        "verified": true,
+                        "assertion": assertion,
+                        "resolution": resolution,
+                    })));
+                }
+                Err(e) => {
+                    res.status_code(StatusCode::FORBIDDEN);
+                    res.render(Json(serde_json::json!({ "error": e.to_string() })));
+                }
+            },
+            Err(e) => {
+                res.status_code(StatusCode::BAD_REQUEST);
+                res.render(Json(serde_json::json!({ "error": e.to_string() })));
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
 struct IamSessionsHandler {
     db: Arc<Database>,
 }
@@ -3167,10 +3258,19 @@ impl Handler for IamSessionsHandler {
     async fn handle(&self, req: &mut Request, depot: &mut Depot, res: &mut Response, _ctrl: &mut FlowCtrl) {
         let auth = crate::ux::iam::depot_auth_context(depot);
         let actor = auth.as_ref().and_then(|a| a.actor.clone()).unwrap_or_default();
+        let is_admin = auth
+            .as_ref()
+            .map(|a| a.roles.contains(&nexus_db::auth::Role::Owner))
+            .unwrap_or(false);
         let svc = crate::iam::sessions::SessionService::new(self.db.clone());
         match *req.method() {
             salvo::http::Method::GET => {
                 let ident = req.query::<String>("identity_id").unwrap_or_else(|| actor.clone());
+                if !is_admin && ident != actor {
+                    res.status_code(StatusCode::FORBIDDEN);
+                    res.render(Json(serde_json::json!({ "error": "Forbidden" })));
+                    return;
+                }
                 match svc.list_sessions(&ident).await {
                     Ok(sessions) => {
                         res.status_code(StatusCode::OK);
@@ -3184,13 +3284,18 @@ impl Handler for IamSessionsHandler {
             }
             salvo::http::Method::DELETE => {
                 let session_id = req.param::<String>("session_id").unwrap_or_default();
-                match svc.revoke_session(&actor, &session_id).await {
+                match svc.revoke_session(&actor, is_admin, &session_id).await {
                     Ok(revoked) => {
                         res.status_code(StatusCode::OK);
                         res.render(Json(serde_json::json!({ "revoked": revoked })));
                     }
                     Err(e) => {
-                        res.status_code(StatusCode::BAD_REQUEST);
+                        let code = if e.to_string().contains("Forbidden") {
+                            StatusCode::FORBIDDEN
+                        } else {
+                            StatusCode::BAD_REQUEST
+                        };
+                        res.status_code(code);
                         res.render(Json(serde_json::json!({ "error": e.to_string() })));
                     }
                 }
@@ -3210,10 +3315,19 @@ impl Handler for IamDevicesHandler {
     async fn handle(&self, req: &mut Request, depot: &mut Depot, res: &mut Response, _ctrl: &mut FlowCtrl) {
         let auth = crate::ux::iam::depot_auth_context(depot);
         let actor = auth.as_ref().and_then(|a| a.actor.clone()).unwrap_or_default();
+        let is_admin = auth
+            .as_ref()
+            .map(|a| a.roles.contains(&nexus_db::auth::Role::Owner))
+            .unwrap_or(false);
         let svc = crate::iam::sessions::SessionService::new(self.db.clone());
         match *req.method() {
             salvo::http::Method::GET => {
                 let ident = req.query::<String>("identity_id").unwrap_or_else(|| actor.clone());
+                if !is_admin && ident != actor {
+                    res.status_code(StatusCode::FORBIDDEN);
+                    res.render(Json(serde_json::json!({ "error": "Forbidden" })));
+                    return;
+                }
                 match svc.list_devices(&ident).await {
                     Ok(devices) => {
                         res.status_code(StatusCode::OK);
@@ -3226,29 +3340,18 @@ impl Handler for IamDevicesHandler {
                 }
             }
             salvo::http::Method::POST => {
+                // Device ownership ALWAYS derives from authenticated server context,
+                // and trust_level ALWAYS starts at Untrusted (never caller-supplied!).
                 #[derive(serde::Deserialize)]
                 struct RegDevReq {
-                    #[serde(default)]
-                    identity_id: Option<String>,
                     label: String,
                     fingerprint: String,
-                    #[serde(default)]
-                    trust_level: Option<crate::iam::sessions::DeviceTrustLevel>,
                 }
                 let Ok(body) = req.parse_json::<RegDevReq>().await else {
                     res.status_code(StatusCode::BAD_REQUEST);
                     return;
                 };
-                let ident = body.identity_id.unwrap_or_else(|| actor.clone());
-                match svc
-                    .register_device(
-                        &ident,
-                        &body.label,
-                        &body.fingerprint,
-                        body.trust_level.unwrap_or(crate::iam::sessions::DeviceTrustLevel::Verified),
-                    )
-                    .await
-                {
+                match svc.register_device(&actor, &body.label, &body.fingerprint).await {
                     Ok(dev) => {
                         res.status_code(StatusCode::CREATED);
                         res.render(Json(dev));
@@ -3261,19 +3364,65 @@ impl Handler for IamDevicesHandler {
             }
             salvo::http::Method::DELETE => {
                 let device_id = req.param::<String>("device_id").unwrap_or_default();
-                let ident = req.query::<String>("identity_id").unwrap_or_else(|| actor.clone());
-                match svc.revoke_device(&actor, &ident, &device_id).await {
+                match svc.revoke_device(&actor, is_admin, &device_id).await {
                     Ok(revoked) => {
                         res.status_code(StatusCode::OK);
                         res.render(Json(serde_json::json!({ "revoked": revoked })));
                     }
                     Err(e) => {
-                        res.status_code(StatusCode::BAD_REQUEST);
+                        let code = if e.to_string().contains("Forbidden") {
+                            StatusCode::FORBIDDEN
+                        } else {
+                            StatusCode::BAD_REQUEST
+                        };
+                        res.status_code(code);
                         res.render(Json(serde_json::json!({ "error": e.to_string() })));
                     }
                 }
             }
             _ => { res.status_code(StatusCode::METHOD_NOT_ALLOWED); }
+        }
+    }
+}
+
+#[derive(Clone)]
+struct IamDeviceManageHandler {
+    db: Arc<Database>,
+}
+
+#[async_trait]
+impl Handler for IamDeviceManageHandler {
+    async fn handle(&self, req: &mut Request, depot: &mut Depot, res: &mut Response, _ctrl: &mut FlowCtrl) {
+        let auth = crate::ux::iam::depot_auth_context(depot);
+        let actor = auth.as_ref().and_then(|a| a.actor.clone()).unwrap_or_default();
+        let is_admin = auth
+            .as_ref()
+            .map(|a| a.roles.contains(&nexus_db::auth::Role::Owner))
+            .unwrap_or(false);
+        let device_id = req.param::<String>("device_id").unwrap_or_default();
+        #[derive(serde::Deserialize)]
+        struct ManageReq {
+            attestation_ref: String,
+        }
+        let Ok(body) = req.parse_json::<ManageReq>().await else {
+            res.status_code(StatusCode::BAD_REQUEST);
+            return;
+        };
+        let svc = crate::iam::sessions::SessionService::new(self.db.clone());
+        match svc.mark_device_managed(&actor, is_admin, &device_id, &body.attestation_ref).await {
+            Ok(dev) => {
+                res.status_code(StatusCode::OK);
+                res.render(Json(dev));
+            }
+            Err(e) => {
+                let code = if e.to_string().contains("Forbidden") {
+                    StatusCode::FORBIDDEN
+                } else {
+                    StatusCode::BAD_REQUEST
+                };
+                res.status_code(code);
+                res.render(Json(serde_json::json!({ "error": e.to_string() })));
+            }
         }
     }
 }

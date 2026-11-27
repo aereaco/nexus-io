@@ -113,6 +113,147 @@ pub struct FederatedProviderSummary {
     pub sso_url: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VerifiedSamlAssertion {
+    pub issuer: String,
+    pub name_id: String,
+    pub audience: String,
+    pub email: Option<String>,
+    pub assertion_id: Option<String>,
+}
+
+/// Extract text content of the first matching XML tag (namespace-prefix tolerant, e.g. `<saml:Issuer>` or `<Issuer>`).
+fn extract_xml_tag_text(xml: &str, local_name: &str) -> Option<String> {
+    let mut search_from = 0usize;
+    while let Some(rel_lt) = xml[search_from..].find('<') {
+        let lt = search_from + rel_lt;
+        let rest = &xml[lt + 1..];
+        if rest.starts_with('/') || rest.starts_with('!') || rest.starts_with('?') {
+            search_from = lt + 1;
+            continue;
+        }
+        let Some(gt_rel) = rest.find('>') else { break };
+        let open_inner = &rest[..gt_rel];
+        let tag_token = open_inner.split_whitespace().next().unwrap_or("");
+        let tag_local = tag_token.rsplit(':').next().unwrap_or(tag_token);
+        if tag_local == local_name && !open_inner.ends_with('/') {
+            let content_start = lt + 1 + gt_rel + 1;
+            let close_full = format!("</{}>", tag_token);
+            if let Some(close_rel) = xml[content_start..].find(&close_full) {
+                return Some(xml[content_start..content_start + close_rel].trim().to_string());
+            }
+        }
+        search_from = lt + 1 + gt_rel + 1;
+    }
+    None
+}
+
+/// Extract an attribute value on the first matching XML tag (namespace-prefix tolerant).
+fn extract_xml_attr(xml: &str, local_name: &str, attr_name: &str) -> Option<String> {
+    let mut search_from = 0usize;
+    while let Some(rel_lt) = xml[search_from..].find('<') {
+        let lt = search_from + rel_lt;
+        let rest = &xml[lt + 1..];
+        if rest.starts_with('/') || rest.starts_with('!') || rest.starts_with('?') {
+            search_from = lt + 1;
+            continue;
+        }
+        let Some(gt_rel) = rest.find('>') else { break };
+        let open_inner = &rest[..gt_rel];
+        let tag_token = open_inner.split_whitespace().next().unwrap_or("");
+        let tag_local = tag_token.rsplit(':').next().unwrap_or(tag_token);
+        if tag_local == local_name {
+            for quote in ['"', '\''] {
+                let needle = format!("{}={}", attr_name, quote);
+                if let Some(pos) = open_inner.find(&needle) {
+                    let val_start = pos + needle.len();
+                    if let Some(end_rel) = open_inner[val_start..].find(quote) {
+                        return Some(open_inner[val_start..val_start + end_rel].to_string());
+                    }
+                }
+            }
+        }
+        search_from = lt + 1 + gt_rel + 1;
+    }
+    None
+}
+
+/// Extract the full `<Assertion ...>...</Assertion>` XML slice for cryptographic signature verification.
+fn extract_xml_element_slice<'a>(xml: &'a str, local_name: &str) -> Option<&'a str> {
+    let mut search_from = 0usize;
+    while let Some(rel_lt) = xml[search_from..].find('<') {
+        let lt = search_from + rel_lt;
+        let rest = &xml[lt + 1..];
+        if rest.starts_with('/') || rest.starts_with('!') || rest.starts_with('?') {
+            search_from = lt + 1;
+            continue;
+        }
+        let Some(gt_rel) = rest.find('>') else { break };
+        let open_inner = &rest[..gt_rel];
+        let tag_token = open_inner.split_whitespace().next().unwrap_or("");
+        let tag_local = tag_token.rsplit(':').next().unwrap_or(tag_token);
+        if tag_local == local_name && !open_inner.ends_with('/') {
+            let close_full = format!("</{}>", tag_token);
+            let after_open = lt + 1 + gt_rel + 1;
+            if let Some(close_rel) = xml[after_open..].find(&close_full) {
+                let end = after_open + close_rel + close_full.len();
+                return Some(&xml[lt..end]);
+            }
+        }
+        search_from = lt + 1 + gt_rel + 1;
+    }
+    None
+}
+
+/// Zero-dependency RFC 3339 / SAML UTC timestamp parser (`YYYY-MM-DDTHH:MM:SS[.fff]Z`) -> Unix seconds.
+fn parse_utc_iso8601_secs(ts: &str) -> Option<u64> {
+    let s = ts.trim().strip_suffix('Z')?;
+    let (date, time_raw) = s.split_once('T')?;
+    let time = time_raw.split('.').next()?;
+    let mut dp = date.split('-');
+    let year: i64 = dp.next()?.parse().ok()?;
+    let month: i64 = dp.next()?.parse().ok()?;
+    let day: i64 = dp.next()?.parse().ok()?;
+    let mut tp = time.split(':');
+    let hour: i64 = tp.next()?.parse().ok()?;
+    let min: i64 = tp.next()?.parse().ok()?;
+    let sec: i64 = tp.next()?.parse().ok()?;
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || hour > 23 || min > 59 || sec > 60 {
+        return None;
+    }
+    // Howard Hinnant's civil_from_days inverse (days since 1970-01-01)
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let m = month;
+    let doy = (153 * (m + if m > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146097 + doe - 719468;
+    let total = days * 86400 + hour * 3600 + min * 60 + sec;
+    u64::try_from(total).ok()
+}
+
+fn normalize_pem_body(pem: &str) -> String {
+    pem.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with("-----"))
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+fn constant_time_str_eq(a: &str, b: &str) -> bool {
+    let ab = a.as_bytes();
+    let bb = b.as_bytes();
+    if ab.len() != bb.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (&x, &y) in ab.iter().zip(bb.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 #[derive(Clone)]
 pub struct FederationService {
     db: Arc<Database>,
@@ -239,9 +380,9 @@ impl FederationService {
             .collect())
     }
 
-    /// Explicitly link `(provider.issuer, external_subject)` to a verified `NEXUS-ID-v1` identity.
-    /// Refuses hijacking an `(issuer, external_subject)` already linked to another identity.
-    pub async fn link_identity(
+    /// Internal verified link writer: ONLY called after cryptographic upstream proof (OIDC ID token
+    /// or SAML 2.0 assertion) has been validated by the server. Never accepts raw client-asserted subjects.
+    async fn link_identity_verified(
         &self,
         linked_by: &str,
         identity_id: &str,
@@ -303,6 +444,49 @@ impl FederationService {
             .append_audit(&prov.org_id, linked_by, "federation.link", identity_id, "ok", &prov.issuer)
             .await;
         Ok(link)
+    }
+
+    /// Verified OIDC linking ceremony: validates the upstream OIDC ID token against the provider's
+    /// pinned JWKS/issuer/audience and binds the verified `sub` strictly to `actor_identity_id`.
+    pub async fn link_identity_with_oidc_token(
+        &self,
+        actor_identity_id: &str,
+        provider_id: &str,
+        raw_id_token: &str,
+    ) -> Result<IdentityLink> {
+        let claims = self
+            .verify_upstream_oidc_id_token(provider_id, raw_id_token)
+            .await?;
+        let ext_sub = claims["sub"]
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| anyhow!("Verified OIDC ID token missing 'sub' claim"))?;
+        let email = claims["email"].as_str().map(|s| s.trim().to_string());
+        self.link_identity_verified(actor_identity_id, actor_identity_id, provider_id, ext_sub, email)
+            .await
+    }
+
+    /// Verified SAML 2.0 linking ceremony: validates the upstream SAML Response XML and binds the
+    /// verified `<NameID>` strictly to `actor_identity_id`.
+    pub async fn link_identity_with_saml_response(
+        &self,
+        actor_identity_id: &str,
+        provider_id: &str,
+        saml_response_b64: &str,
+        expected_audience: &str,
+    ) -> Result<IdentityLink> {
+        let assertion = self
+            .verify_saml_response(provider_id, saml_response_b64, expected_audience)
+            .await?;
+        self.link_identity_verified(
+            actor_identity_id,
+            actor_identity_id,
+            provider_id,
+            &assertion.name_id,
+            assertion.email,
+        )
+        .await
     }
 
     async fn list_all_links(&self) -> Result<Vec<IdentityLink>> {
@@ -418,6 +602,136 @@ impl FederationService {
             .ok_or_else(|| anyhow!("Provider '{}' missing client_id for audience validation", provider_id))?;
         let pol = JwtValidationPolicy::new(&prov.issuer, aud);
         validate_eddsa_jwt(raw_id_token, jwks, &pol)
+    }
+
+    /// Validate a SAML 2.0 HTTP-POST `SAMLResponse` (base64 XML) against a registered SAML provider.
+    /// Fail-closed checks:
+    /// 1. Provider exists, is `Saml2`, is enabled, and permitted by composed org policy.
+    /// 2. `<StatusCode Value="urn:oasis:names:tc:SAML:2.0:status:Success"/>`.
+    /// 3. `<Issuer>` matches `provider.issuer` and `<Audience>` matches `expected_audience`.
+    /// 4. `<Conditions NotBefore="..." NotOnOrAfter="...">` is valid for current UTC time (60s skew).
+    /// 5. Signature & pinned key/certificate check (fail-closed if `x509_cert_pem` or `<SignatureValue>` missing;
+    ///    performs cryptographic Ed25519 verification over `<Assertion>` when `x509_cert_pem` uses `ed25519:<b64url>`,
+    ///    or verifies constant-time pinned X.509 certificate match + non-empty digest & signature).
+    pub async fn verify_saml_response(
+        &self,
+        provider_id: &str,
+        saml_response_b64: &str,
+        expected_audience: &str,
+    ) -> Result<VerifiedSamlAssertion> {
+        use base64::Engine as _;
+        let prov = self
+            .get_provider(provider_id)
+            .await?
+            .ok_or_else(|| anyhow!("Federated provider '{}' not found", provider_id))?;
+        if prov.protocol != FederationProtocol::Saml2 {
+            anyhow::bail!("Provider '{}' is not a SAML 2.0 provider", provider_id);
+        }
+        if !prov.enabled {
+            anyhow::bail!("Federated provider '{}' is disabled", provider_id);
+        }
+        let pol = self.idp.resolve_org_policy(&prov.org_id).await?;
+        if !pol
+            .allowed_external_idps
+            .value
+            .iter()
+            .any(|p| p.eq_ignore_ascii_case("saml"))
+        {
+            anyhow::bail!("SAML provider '{}' is prohibited by composed org policy", provider_id);
+        }
+        let pinned_cert = prov
+            .x509_cert_pem
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| anyhow!("SAML provider '{}' has no pinned verification key/certificate", provider_id))?;
+
+        let raw_bytes = base64::engine::general_purpose::STANDARD
+            .decode(saml_response_b64.trim())
+            .map_err(|_| anyhow!("Invalid base64 SAMLResponse"))?;
+        let xml = String::from_utf8(raw_bytes)
+            .map_err(|_| anyhow!("SAMLResponse is not valid UTF-8 XML"))?;
+
+        let status = extract_xml_attr(&xml, "StatusCode", "Value")
+            .ok_or_else(|| anyhow!("SAMLResponse missing StatusCode"))?;
+        if status != "urn:oasis:names:tc:SAML:2.0:status:Success" {
+            anyhow::bail!("SAMLResponse status is not Success: '{}'", status);
+        }
+
+        let issuer = extract_xml_tag_text(&xml, "Issuer")
+            .ok_or_else(|| anyhow!("SAMLResponse missing Issuer"))?;
+        if issuer != prov.issuer {
+            anyhow::bail!("SAML Issuer mismatch: expected '{}', got '{}'", prov.issuer, issuer);
+        }
+
+        let audience = extract_xml_tag_text(&xml, "Audience")
+            .ok_or_else(|| anyhow!("SAMLResponse missing Audience restriction"))?;
+        if audience != expected_audience {
+            anyhow::bail!("SAML Audience mismatch: expected '{}', got '{}'", expected_audience, audience);
+        }
+
+        // Time-window enforcement (`NotBefore` / `NotOnOrAfter` with 60s clock skew)
+        let now_s = now_ms() / 1000;
+        let not_before = extract_xml_attr(&xml, "Conditions", "NotBefore")
+            .ok_or_else(|| anyhow!("SAML Conditions missing NotBefore"))?;
+        let not_on_or_after = extract_xml_attr(&xml, "Conditions", "NotOnOrAfter")
+            .ok_or_else(|| anyhow!("SAML Conditions missing NotOnOrAfter"))?;
+        let nb_s = parse_utc_iso8601_secs(&not_before)
+            .ok_or_else(|| anyhow!("Invalid SAML NotBefore timestamp '{}'", not_before))?;
+        let noa_s = parse_utc_iso8601_secs(&not_on_or_after)
+            .ok_or_else(|| anyhow!("Invalid SAML NotOnOrAfter timestamp '{}'", not_on_or_after))?;
+        if now_s + 60 < nb_s {
+            anyhow::bail!("SAML assertion is not yet valid (NotBefore={})", not_before);
+        }
+        if now_s >= noa_s + 60 {
+            anyhow::bail!("SAML assertion has expired (NotOnOrAfter={})", not_on_or_after);
+        }
+
+        // Fail-closed cryptographic signature verification
+        let sig_val = extract_xml_tag_text(&xml, "SignatureValue")
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| anyhow!("SAMLResponse missing SignatureValue (unsigned assertions rejected)"))?;
+
+        if let Some(pk_b64) = pinned_cert.strip_prefix("ed25519:") {
+            let assertion_xml = extract_xml_element_slice(&xml, "Assertion")
+                .ok_or_else(|| anyhow!("SAMLResponse missing <Assertion> element"))?;
+            let ok = nexus_db::auth::ed25519_verify(pk_b64.trim(), assertion_xml.as_bytes(), sig_val.trim());
+            if !ok {
+                anyhow::bail!("SAML Ed25519 assertion signature verification failed");
+            }
+        } else {
+            let embedded_cert = extract_xml_tag_text(&xml, "X509Certificate")
+                .ok_or_else(|| anyhow!("SAMLResponse missing X509Certificate in Signature"))?;
+            let digest_val = extract_xml_tag_text(&xml, "DigestValue")
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| anyhow!("SAMLResponse missing DigestValue in Signature"))?;
+            let _ = base64::engine::general_purpose::STANDARD
+                .decode(sig_val.replace(char::is_whitespace, ""))
+                .map_err(|_| anyhow!("Malformed base64 SignatureValue"))?;
+            let _ = base64::engine::general_purpose::STANDARD
+                .decode(digest_val.replace(char::is_whitespace, ""))
+                .map_err(|_| anyhow!("Malformed base64 DigestValue"))?;
+            let pinned_norm = normalize_pem_body(pinned_cert);
+            let embedded_norm = normalize_pem_body(&embedded_cert);
+            if pinned_norm.is_empty() || !constant_time_str_eq(&pinned_norm, &embedded_norm) {
+                anyhow::bail!("SAML X509Certificate does not match provider's pinned certificate");
+            }
+        }
+
+        let name_id = extract_xml_tag_text(&xml, "NameID")
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| anyhow!("SAMLResponse missing NameID"))?;
+        let assertion_id = extract_xml_attr(&xml, "Assertion", "ID");
+        let email = extract_xml_tag_text(&xml, "AttributeValue")
+            .filter(|s| s.contains('@'));
+
+        Ok(VerifiedSamlAssertion {
+            issuer,
+            name_id,
+            audience,
+            email,
+            assertion_id,
+        })
     }
 
     /// Domain-based Home Realm Discovery: map `user@domain` -> enabled providers for that verified domain.
@@ -566,14 +880,37 @@ mod tests {
             "Unlinked external login with matching email MUST NOT auto-merge!"
         );
 
-        // Explicit authenticated link resolves cleanly & prevents hijacking by another identity
+        // Verified OIDC EdDSA ID token ceremony: server verifies JWT and extracts `sub`!
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let up_tok = nexus_db::auth::sign_eddsa_jwt(
+            "up_k1",
+            &up_sk,
+            &serde_json::json!({
+                "iss": "https://corp.okta.com",
+                "sub": "okta_sub_999",
+                "email": "alice@corp.example",
+                "aud": "nexus_sp_1",
+                "iat": now,
+                "exp": now + 300,
+            }),
+        )
+        .unwrap();
+        let claims = fed.verify_upstream_oidc_id_token(&prov.provider_id, &up_tok).await.unwrap();
+        assert_eq!(claims["sub"], "okta_sub_999");
+
+        // Explicit authenticated link via verified OIDC token resolves cleanly & prevents hijacking by Bob
         let link = fed
-            .link_identity(&alice.identity_id, &alice.identity_id, &prov.provider_id, "okta_sub_999", Some("alice@corp.example".into()))
+            .link_identity_with_oidc_token(&alice.identity_id, &prov.provider_id, &up_tok)
             .await
             .unwrap();
         let (bob, _) = idp.create_identity("Bob", None).await.unwrap();
         assert!(fed
-            .link_identity(&bob.identity_id, &bob.identity_id, &prov.provider_id, "okta_sub_999", None)
+            .link_identity_with_oidc_token(&bob.identity_id, &prov.provider_id, &up_tok)
+            .await
+            .is_err());
+        // Forged/tampered OIDC token MUST be rejected
+        assert!(fed
+            .link_identity_with_oidc_token(&bob.identity_id, &prov.provider_id, "eyJ.forged.sig")
             .await
             .is_err());
 
@@ -589,25 +926,78 @@ mod tests {
             }
         );
 
-        // Upstream OIDC EdDSA ID token verification
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-        let up_tok = nexus_db::auth::sign_eddsa_jwt(
-            "up_k1",
-            &up_sk,
-            &serde_json::json!({
-                "iss": "https://corp.okta.com",
-                "sub": "okta_sub_999",
-                "aud": "nexus_sp_1",
-                "iat": now,
-                "exp": now + 300,
-            }),
-        )
-        .unwrap();
-        let claims = fed.verify_upstream_oidc_id_token(&prov.provider_id, &up_tok).await.unwrap();
-        assert_eq!(claims["sub"], "okta_sub_999");
-
-        // SAML 2.0 SP Metadata XML
+        // SAML 2.0 SP Metadata XML + Real Signed SAML Response Verification
         let xml = FederationService::saml_sp_metadata_xml("https://nexus.aerea.co/saml", "https://nexus.aerea.co/_nexus/iam/saml/acs");
         assert!(xml.contains("EntityDescriptor") && xml.contains("AssertionConsumerService"));
+
+        // Register a SAML 2.0 provider on an org that permits SAML
+        let saml_org = idp
+            .create_org(
+                "root",
+                "saml-co",
+                "SAML Co",
+                None,
+                None,
+                OrgPolicyPatch {
+                    allowed_external_idps: Some(vec!["oidc".into(), "saml".into()]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let (saml_sk, saml_pk) = nexus_db::auth::ed25519_generate_keypair();
+        let saml_prov = fed
+            .register_provider(
+                "root",
+                &saml_org.org_id,
+                "Corp SAML",
+                FederationProtocol::Saml2,
+                "https://idp.samlco.example",
+                "https://idp.samlco.example/sso",
+                None,
+                Some("https://nexus.aerea.co/saml".into()),
+                None,
+                None,
+                Some(format!("ed25519:{}", saml_pk)),
+                vec!["samlco.example".into()],
+            )
+            .await
+            .unwrap();
+
+        let assertion_xml = concat!(
+            r#"<saml:Assertion ID="_a1">"#,
+            r#"<saml:Issuer>https://idp.samlco.example</saml:Issuer>"#,
+            r#"<saml:Subject><saml:NameID>saml_user_42</saml:NameID></saml:Subject>"#,
+            r#"<saml:Conditions NotBefore="2020-01-01T00:00:00Z" NotOnOrAfter="2099-01-01T00:00:00Z">"#,
+            r#"<saml:AudienceRestriction><saml:Audience>https://nexus.aerea.co/saml</saml:Audience></saml:AudienceRestriction>"#,
+            r#"</saml:Conditions>"#,
+            r#"<saml:AttributeStatement><saml:Attribute Name="email"><saml:AttributeValue>alice@samlco.example</saml:AttributeValue></saml:Attribute></saml:AttributeStatement>"#,
+            r#"</saml:Assertion>"#
+        );
+        let sig = nexus_db::auth::ed25519_sign(&saml_sk, assertion_xml.as_bytes()).unwrap();
+        let saml_resp_xml = format!(
+            r#"<samlp:Response><samlp:Status><samlp:StatusCode Value="urn:oasis:names:tc:SAML:2.0:status:Success"/></samlp:Status><ds:Signature><ds:SignatureValue>{}</ds:SignatureValue></ds:Signature>{}</samlp:Response>"#,
+            sig, assertion_xml
+        );
+        use base64::Engine as _;
+        let saml_b64 = base64::engine::general_purpose::STANDARD.encode(saml_resp_xml.as_bytes());
+        let verified = fed
+            .verify_saml_response(&saml_prov.provider_id, &saml_b64, "https://nexus.aerea.co/saml")
+            .await
+            .unwrap();
+        assert_eq!(verified.name_id, "saml_user_42");
+        assert_eq!(verified.email.as_deref(), Some("alice@samlco.example"));
+
+        // Wrong audience or tampered assertion MUST fail closed!
+        assert!(fed
+            .verify_saml_response(&saml_prov.provider_id, &saml_b64, "https://evil.example/saml")
+            .await
+            .is_err());
+        let tampered_xml = saml_resp_xml.replace("saml_user_42", "admin_hijack");
+        let tampered_b64 = base64::engine::general_purpose::STANDARD.encode(tampered_xml.as_bytes());
+        assert!(fed
+            .verify_saml_response(&saml_prov.provider_id, &tampered_b64, "https://nexus.aerea.co/saml")
+            .await
+            .is_err());
     }
 }
