@@ -913,6 +913,29 @@ impl UxGateway {
                         .post(IamEvaluateHandler { db: self.db.clone() }),
                 )
                 .push(
+                    Router::with_path("/_nexus/iam/flows")
+                        .hoop(gate.clone())
+                        .hoop(crate::ux::iam::IamMiddleware::authenticated(self.db.clone()))
+                        .get(IamFlowsHandler { db: self.db.clone() })
+                        .post(IamFlowsHandler { db: self.db.clone() }),
+                )
+                .push(
+                    Router::with_path("/_nexus/iam/flows/{flow_id}/start")
+                        .hoop(gate.clone())
+                        .post(IamFlowStartHandler { db: self.db.clone() }),
+                )
+                .push(
+                    Router::with_path("/_nexus/iam/flows/executions/{exec_id}/submit")
+                        .hoop(gate.clone())
+                        .post(IamFlowSubmitHandler { db: self.db.clone() }),
+                )
+                .push(
+                    Router::with_path("/_nexus/iam/identities/{identity_id}/password")
+                        .hoop(gate.clone())
+                        .hoop(crate::ux::iam::IamMiddleware::authenticated(self.db.clone()))
+                        .post(IamIdentityPasswordHandler { db: self.db.clone() }),
+                )
+                .push(
                     Router::with_path("/_nexus/iam/clients")
                         .hoop(gate.clone())
                         .hoop(crate::ux::iam::IamMiddleware::admin(self.db.clone()))
@@ -2553,6 +2576,159 @@ impl Handler for IamEvaluateHandler {
             }
             Err(e) => {
                 res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+                res.render(Json(serde_json::json!({ "error": e.to_string() })));
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+struct IamFlowsHandler {
+    db: Arc<Database>,
+}
+
+#[async_trait]
+impl Handler for IamFlowsHandler {
+    async fn handle(&self, req: &mut Request, depot: &mut Depot, res: &mut Response, _ctrl: &mut FlowCtrl) {
+        let engine = crate::iam::flows::AuthFlowEngine::new(self.db.clone());
+        match *req.method() {
+            salvo::http::Method::GET => match engine.list_flows().await {
+                Ok(flows) => {
+                    res.status_code(StatusCode::OK);
+                    res.render(Json(serde_json::json!({ "flows": flows })));
+                }
+                Err(e) => {
+                    res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+                    res.render(Json(serde_json::json!({ "error": e.to_string() })));
+                }
+            },
+            salvo::http::Method::POST => {
+                #[derive(serde::Deserialize)]
+                struct CreateFlowReq {
+                    flow_id: String,
+                    name: String,
+                    #[serde(default)]
+                    org_id: Option<String>,
+                    stages: Vec<crate::iam::flows::AuthStage>,
+                    #[serde(default = "default_flow_timeout")]
+                    timeout_secs: u64,
+                    #[serde(default = "default_flow_retries")]
+                    max_retries: u32,
+                }
+                fn default_flow_timeout() -> u64 { 300 }
+                fn default_flow_retries() -> u32 { 5 }
+                let Ok(body) = req.parse_json::<CreateFlowReq>().await else {
+                    res.status_code(StatusCode::BAD_REQUEST);
+                    return;
+                };
+                let auth = crate::ux::iam::depot_auth_context(depot);
+                let actor = auth.as_ref().and_then(|a| a.actor.clone()).unwrap_or_else(|| "owner".into());
+                let is_admin = auth.as_ref().map(|a| a.roles.contains(&nexus_db::auth::Role::Owner)).unwrap_or(false);
+                if !is_admin {
+                    res.status_code(StatusCode::FORBIDDEN);
+                    res.render(Json(serde_json::json!({ "error": "Administrator privileges required to define authentication flows" })));
+                    return;
+                }
+                match engine
+                    .create_flow(&actor, &body.flow_id, &body.name, body.org_id, body.stages, body.timeout_secs, body.max_retries)
+                    .await
+                {
+                    Ok(flow) => {
+                        res.status_code(StatusCode::CREATED);
+                        res.render(Json(flow));
+                    }
+                    Err(e) => {
+                        res.status_code(StatusCode::BAD_REQUEST);
+                        res.render(Json(serde_json::json!({ "error": e.to_string() })));
+                    }
+                }
+            }
+            _ => { res.status_code(StatusCode::METHOD_NOT_ALLOWED); }
+        }
+    }
+}
+
+#[derive(Clone)]
+struct IamFlowStartHandler {
+    db: Arc<Database>,
+}
+
+#[async_trait]
+impl Handler for IamFlowStartHandler {
+    async fn handle(&self, req: &mut Request, _depot: &mut Depot, res: &mut Response, _ctrl: &mut FlowCtrl) {
+        let flow_id = req.param::<String>("flow_id").unwrap_or_default();
+        #[derive(serde::Deserialize, Default)]
+        struct StartReq {
+            #[serde(default)]
+            org_id: Option<String>,
+        }
+        let body = req.parse_json::<StartReq>().await.unwrap_or_default();
+        let engine = crate::iam::flows::AuthFlowEngine::new(self.db.clone());
+        match engine.start_flow(&flow_id, body.org_id).await {
+            Ok(exec) => {
+                res.status_code(StatusCode::CREATED);
+                res.render(Json(exec));
+            }
+            Err(e) => {
+                res.status_code(StatusCode::BAD_REQUEST);
+                res.render(Json(serde_json::json!({ "error": e.to_string() })));
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+struct IamFlowSubmitHandler {
+    db: Arc<Database>,
+}
+
+#[async_trait]
+impl Handler for IamFlowSubmitHandler {
+    async fn handle(&self, req: &mut Request, _depot: &mut Depot, res: &mut Response, _ctrl: &mut FlowCtrl) {
+        let exec_id = req.param::<String>("exec_id").unwrap_or_default();
+        let sub = req
+            .parse_json::<crate::iam::flows::StageSubmission>()
+            .await
+            .unwrap_or_default();
+        let engine = crate::iam::flows::AuthFlowEngine::new(self.db.clone());
+        match engine.submit_stage(&exec_id, sub).await {
+            Ok(exec) => {
+                res.status_code(StatusCode::OK);
+                res.render(Json(exec));
+            }
+            Err(e) => {
+                res.status_code(StatusCode::UNAUTHORIZED);
+                res.render(Json(serde_json::json!({ "error": e.to_string() })));
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+struct IamIdentityPasswordHandler {
+    db: Arc<Database>,
+}
+
+#[async_trait]
+impl Handler for IamIdentityPasswordHandler {
+    async fn handle(&self, req: &mut Request, _depot: &mut Depot, res: &mut Response, _ctrl: &mut FlowCtrl) {
+        let identity_id = req.param::<String>("identity_id").unwrap_or_default();
+        #[derive(serde::Deserialize)]
+        struct SetPassReq {
+            password: String,
+        }
+        let Ok(body) = req.parse_json::<SetPassReq>().await else {
+            res.status_code(StatusCode::BAD_REQUEST);
+            return;
+        };
+        let engine = crate::iam::flows::AuthFlowEngine::new(self.db.clone());
+        match engine.set_identity_password(&identity_id, &body.password).await {
+            Ok(()) => {
+                res.status_code(StatusCode::OK);
+                res.render(Json(serde_json::json!({ "updated": true })));
+            }
+            Err(e) => {
+                res.status_code(StatusCode::BAD_REQUEST);
                 res.render(Json(serde_json::json!({ "error": e.to_string() })));
             }
         }

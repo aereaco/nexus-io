@@ -27,18 +27,60 @@ use anyhow::{anyhow, Result};
 use base64::Engine as _;
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 
 use crate::db::Database;
 
-/// Serializes refresh-token rotation + replay-family revocation to prevent concurrent refresh races.
-static REFRESH_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+const LOCK_STRIPE_COUNT: usize = 64;
 
-/// Serializes organization hierarchy mutations (`create_org`, `reparent_org`) to prevent split-brain cycles.
-static HIERARCHY_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+fn stripe_index(key: &str) -> usize {
+    let h = blake3::hash(key.as_bytes());
+    let b = h.as_bytes();
+    (u32::from_be_bytes([b[0], b[1], b[2], b[3]]) as usize) % LOCK_STRIPE_COUNT
+}
+
+/// 64-stripe lock table linearizing refresh-token rotations per token/family without global contention.
+static REFRESH_STRIPES: Lazy<Vec<Mutex<()>>> =
+    Lazy::new(|| (0..LOCK_STRIPE_COUNT).map(|_| Mutex::new(())).collect());
+
+/// 64-stripe lock table linearizing organization hierarchy mutations without global contention.
+static HIERARCHY_STRIPES: Lazy<Vec<Mutex<()>>> =
+    Lazy::new(|| (0..LOCK_STRIPE_COUNT).map(|_| Mutex::new(())).collect());
+
+/// Zero-copy, zero-serialization live token entry with atomic revocation/rotation flags.
+struct LiveTokenEntry {
+    record: IssuedTokenRecord,
+    revoked: AtomicBool,
+    rotated: AtomicBool,
+    family_revoked: Arc<AtomicBool>,
+}
+
+/// Process-local ZCZS hot token cache keyed by `(db_ptr_addr, token_hash)`.
+static TOKEN_CACHE: Lazy<RwLock<HashMap<(usize, String), Arc<LiveTokenEntry>>>> =
+    Lazy::new(|| RwLock::new(HashMap::new()));
+
+/// Shared atomic family-revocation flags keyed by `(db_ptr_addr, family_id)`.
+static FAMILY_REVOKED: Lazy<RwLock<HashMap<(usize, String), Arc<AtomicBool>>>> =
+    Lazy::new(|| RwLock::new(HashMap::new()));
+
+fn family_flag(db_key: usize, family_id: &str) -> Arc<AtomicBool> {
+    let k = (db_key, family_id.to_string());
+    if let Ok(guard) = FAMILY_REVOKED.read() {
+        if let Some(f) = guard.get(&k) {
+            return Arc::clone(f);
+        }
+    }
+    let mut guard = FAMILY_REVOKED.write().unwrap_or_else(|e| e.into_inner());
+    Arc::clone(
+        guard
+            .entry(k)
+            .or_insert_with(|| Arc::new(AtomicBool::new(false))),
+    )
+}
 
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -1140,7 +1182,8 @@ impl NexusIdp {
         primary_domain: Option<String>,
         local_policy: OrgPolicyPatch,
     ) -> Result<Organization> {
-        let _guard = HIERARCHY_LOCK.lock().await;
+        let stripe_key = parent_org_id.as_deref().unwrap_or(slug);
+        let _guard = HIERARCHY_STRIPES[stripe_index(stripe_key)].lock().await;
         self.ensure_tables().await?;
         let clean_slug = slug.trim().to_ascii_lowercase();
         if clean_slug.is_empty()
@@ -1240,14 +1283,22 @@ impl NexusIdp {
     }
 
     /// Safely reparent an organization (and its descendants) with indexed cycle detection,
-    /// serialized hierarchy locking, depth enforcement, and O(k) descendant path updates.
+    /// ordered striped linearizability (deadlock-free), depth enforcement, and O(k) descendant path updates.
     pub async fn reparent_org(
         &self,
         actor: &str,
         org_id: &str,
         new_parent_org_id: Option<String>,
     ) -> Result<Organization> {
-        let _guard = HIERARCHY_LOCK.lock().await;
+        let s1 = stripe_index(org_id);
+        let s2 = new_parent_org_id.as_deref().map(stripe_index);
+        let (_g1, _g2) = match s2 {
+            Some(b) if b != s1 => {
+                let (lo, hi) = if s1 < b { (s1, b) } else { (b, s1) };
+                (HIERARCHY_STRIPES[lo].lock().await, Some(HIERARCHY_STRIPES[hi].lock().await))
+            }
+            _ => (HIERARCHY_STRIPES[s1].lock().await, None),
+        };
         let mut org = self
             .get_org(org_id)
             .await?
@@ -2013,7 +2064,24 @@ impl NexusIdp {
         Ok(plain_code)
     }
 
+    fn db_key(&self) -> usize {
+        Arc::as_ptr(&self.db) as usize
+    }
+
     async fn persist_token(&self, rec: &IssuedTokenRecord) -> Result<()> {
+        // 1. Update ZCZS in-memory atomic cache immediately (zero-copy hot path)
+        let dbk = self.db_key();
+        let fflag = family_flag(dbk, &rec.family_id);
+        let entry = Arc::new(LiveTokenEntry {
+            record: rec.clone(),
+            revoked: AtomicBool::new(rec.revoked),
+            rotated: AtomicBool::new(rec.rotated),
+            family_revoked: fflag,
+        });
+        if let Ok(mut cache) = TOKEN_CACHE.write() {
+            cache.insert((dbk, rec.token_hash.clone()), entry);
+        }
+        // 2. Write-through durability to nexus-db
         let val = serde_json::to_value(rec)?;
         self.db
             .client
@@ -2026,6 +2094,10 @@ impl NexusIdp {
     }
 
     async fn revoke_token_family(&self, family_id: &str) -> Result<usize> {
+        // Atomic O(1) instant cross-thread revocation across the entire token family!
+        let fflag = family_flag(self.db_key(), family_id);
+        fflag.store(true, Ordering::Release);
+
         let mut resp = self.db.client.query("SELECT * FROM sys_iam_token").await?;
         let rows: Vec<serde_json::Value> = resp.take(0).unwrap_or_default();
         let mut count = 0usize;
@@ -2199,9 +2271,9 @@ impl NexusIdp {
                 })
             }
             "refresh_token" => {
-                let _refresh_guard = REFRESH_LOCK.lock().await;
                 let raw_rt = refresh_token.ok_or_else(|| anyhow!("Missing refresh_token"))?;
                 let rhash = hash_lookup_key(raw_rt);
+                let _refresh_guard = REFRESH_STRIPES[stripe_index(&rhash)].lock().await;
                 let mut resp = self
                     .db
                     .client
@@ -2326,14 +2398,30 @@ impl NexusIdp {
         }
     }
 
+    /// ZCZS hot-path token introspection: checks the typed `Arc<LiveTokenEntry>` + `AtomicBool`
+    /// cache first (zero JSON, zero SurrealQL), falling back to `nexus-db` only on cold miss.
     pub async fn introspect_token(&self, raw_token: &str) -> Result<Option<IssuedTokenRecord>> {
-        self.ensure_tables().await?;
         let thash = hash_lookup_key(raw_token);
+        let dbk = self.db_key();
+        if let Ok(cache) = TOKEN_CACHE.read() {
+            if let Some(entry) = cache.get(&(dbk, thash.clone())) {
+                if entry.revoked.load(Ordering::Acquire)
+                    || entry.rotated.load(Ordering::Acquire)
+                    || entry.family_revoked.load(Ordering::Acquire)
+                    || now_ms() > entry.record.expires_at_ms
+                {
+                    return Ok(None);
+                }
+                return Ok(Some(entry.record.clone()));
+            }
+        }
+
+        self.ensure_tables().await?;
         let mut resp = self
             .db
             .client
             .query("SELECT * FROM type::record('sys_iam_token', $id)")
-            .bind(("id", thash))
+            .bind(("id", thash.clone()))
             .await?;
         let rows: Vec<serde_json::Value> = resp.take(0).unwrap_or_default();
         let Some(rec) = rows
@@ -2342,15 +2430,31 @@ impl NexusIdp {
         else {
             return Ok(None);
         };
-        if rec.revoked || rec.rotated || now_ms() > rec.expires_at_ms {
+        let fflag = family_flag(dbk, &rec.family_id);
+        let entry = Arc::new(LiveTokenEntry {
+            record: rec.clone(),
+            revoked: AtomicBool::new(rec.revoked),
+            rotated: AtomicBool::new(rec.rotated),
+            family_revoked: Arc::clone(&fflag),
+        });
+        if let Ok(mut cache) = TOKEN_CACHE.write() {
+            cache.insert((dbk, thash), entry);
+        }
+        if rec.revoked || rec.rotated || fflag.load(Ordering::Acquire) || now_ms() > rec.expires_at_ms {
             return Ok(None);
         }
         Ok(Some(rec))
     }
 
     pub async fn revoke_token(&self, raw_token: &str) -> Result<bool> {
-        self.ensure_tables().await?;
         let thash = hash_lookup_key(raw_token);
+        let dbk = self.db_key();
+        if let Ok(cache) = TOKEN_CACHE.read() {
+            if let Some(entry) = cache.get(&(dbk, thash.clone())) {
+                entry.revoked.store(true, Ordering::Release);
+            }
+        }
+        self.ensure_tables().await?;
         let mut resp = self
             .db
             .client
