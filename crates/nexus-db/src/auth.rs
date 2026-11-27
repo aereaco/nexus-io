@@ -922,7 +922,9 @@ pub fn sign_eddsa_jwt(
     Ok(format!("{}.{}", signing_input, sig_b64))
 }
 
-/// Verify an RFC 8037 `EdDSA` JWT signature and return the parsed JSON claims payload.
+/// Low-level cryptographic helper: verifies ONLY the RFC 8037 `EdDSA` signature and decodes the
+/// JSON payload. Callers MUST NOT treat this as a complete JWT validator — always validate `alg`,
+/// `typ`, `kid`, `iss`, `aud`, `exp`, and `nbf` at the authentication boundary (see `idp::validate_eddsa_jwt`).
 pub fn verify_eddsa_jwt_json(token: &str, public_b64url: &str) -> Result<serde_json::Value> {
     let parts: Vec<&str> = token.split('.').collect();
     if parts.len() != 3 {

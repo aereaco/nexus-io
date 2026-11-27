@@ -25,12 +25,20 @@
 
 use anyhow::{anyhow, Result};
 use base64::Engine as _;
+use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::sync::Mutex;
 
 use crate::db::Database;
+
+/// Serializes refresh-token rotation + replay-family revocation to prevent concurrent refresh races.
+static REFRESH_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+
+/// Serializes organization hierarchy mutations (`create_org`, `reparent_org`) to prevent split-brain cycles.
+static HIERARCHY_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -121,14 +129,35 @@ pub struct PortableIdentityPackage {
     pub package_sig: String,
 }
 
-/// Canonical genesis payload bytes: `"NEXUS-ID-v1" || T(be64) || nonce || root_pubkey`.
+fn validate_ed25519_pubkey_b64url(pk: &str) -> Result<[u8; 32]> {
+    let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(pk)
+        .map_err(|_| anyhow!("Invalid base64url Ed25519 public key"))?;
+    let arr: [u8; 32] = raw
+        .try_into()
+        .map_err(|_| anyhow!("Ed25519 public key must be exactly 32 bytes"))?;
+    Ok(arr)
+}
+
+fn validate_genesis_nonce(nonce: &str) -> Result<()> {
+    if nonce.len() < 16 || nonce.len() > 128 {
+        anyhow::bail!("Genesis nonce must be 16..=128 characters");
+    }
+    if !nonce.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+        anyhow::bail!("Genesis nonce contains invalid characters");
+    }
+    Ok(())
+}
+
+/// Unambiguous length-prefixed canonical genesis framing:
+/// `"NEXUS-ID-v1" || u64_be(T) || u32_be(nonce.len) || nonce || u32_be(pk.len) || pk`.
 pub fn canonical_genesis_bytes(created_at_ms: u64, nonce: &str, root_pubkey: &str) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(11 + 8 + nonce.len() + root_pubkey.len() + 2);
+    let mut buf = Vec::with_capacity(11 + 8 + 4 + nonce.len() + 4 + root_pubkey.len());
     buf.extend_from_slice(b"NEXUS-ID-v1");
     buf.extend_from_slice(&created_at_ms.to_be_bytes());
-    buf.push(b'|');
+    buf.extend_from_slice(&(nonce.len() as u32).to_be_bytes());
     buf.extend_from_slice(nonce.as_bytes());
-    buf.push(b'|');
+    buf.extend_from_slice(&(root_pubkey.len() as u32).to_be_bytes());
     buf.extend_from_slice(root_pubkey.as_bytes());
     buf
 }
@@ -146,11 +175,19 @@ fn canonical_rotation_bytes(
     new_pubkey: &str,
     rotated_at_ms: u64,
 ) -> Vec<u8> {
-    format!(
-        "NEXUS-KEY-ROTATE-v1|{}|{}|{}|{}|{}",
-        identity_id, seq, prev_pubkey, new_pubkey, rotated_at_ms
-    )
-    .into_bytes()
+    let mut buf = Vec::with_capacity(
+        19 + 4 + identity_id.len() + 8 + 4 + prev_pubkey.len() + 4 + new_pubkey.len() + 8,
+    );
+    buf.extend_from_slice(b"NEXUS-KEY-ROTATE-v1");
+    buf.extend_from_slice(&(identity_id.len() as u32).to_be_bytes());
+    buf.extend_from_slice(identity_id.as_bytes());
+    buf.extend_from_slice(&seq.to_be_bytes());
+    buf.extend_from_slice(&(prev_pubkey.len() as u32).to_be_bytes());
+    buf.extend_from_slice(prev_pubkey.as_bytes());
+    buf.extend_from_slice(&(new_pubkey.len() as u32).to_be_bytes());
+    buf.extend_from_slice(new_pubkey.as_bytes());
+    buf.extend_from_slice(&rotated_at_ms.to_be_bytes());
+    buf
 }
 
 fn canonical_package_bytes(
@@ -159,18 +196,50 @@ fn canonical_package_bytes(
     history_len: usize,
     exported_at_ms: u64,
 ) -> Vec<u8> {
-    format!(
-        "NEXUS-ID-EXPORT-v1|{}|{}|{}|{}",
-        identity_id, active_pubkey, history_len, exported_at_ms
-    )
-    .into_bytes()
+    let mut buf = Vec::with_capacity(18 + 4 + identity_id.len() + 4 + active_pubkey.len() + 8 + 8);
+    buf.extend_from_slice(b"NEXUS-ID-EXPORT-v1");
+    buf.extend_from_slice(&(identity_id.len() as u32).to_be_bytes());
+    buf.extend_from_slice(identity_id.as_bytes());
+    buf.extend_from_slice(&(active_pubkey.len() as u32).to_be_bytes());
+    buf.extend_from_slice(active_pubkey.as_bytes());
+    buf.extend_from_slice(&(history_len as u64).to_be_bytes());
+    buf.extend_from_slice(&exported_at_ms.to_be_bytes());
+    buf
 }
 
-/// Cryptographically verify a `PortableIdentityPackage` without contacting the origin cluster.
+/// Cryptographically verify a `PortableIdentityPackage` with default freshness policy
+/// (`max_age_secs = 86_400`, `max_future_skew_secs = 300`).
 pub fn verify_identity_package(pkg: &PortableIdentityPackage) -> Result<()> {
+    verify_identity_package_with_policy(pkg, 86_400, 300)
+}
+
+/// Cryptographically verify a `PortableIdentityPackage` with explicit freshness & skew bounds.
+pub fn verify_identity_package_with_policy(
+    pkg: &PortableIdentityPackage,
+    max_age_secs: u64,
+    max_future_skew_secs: u64,
+) -> Result<()> {
     if pkg.genesis.version != "NEXUS-ID-v1" {
         anyhow::bail!("Unsupported identity genesis version '{}'", pkg.genesis.version);
     }
+    validate_genesis_nonce(&pkg.genesis.nonce)?;
+    validate_ed25519_pubkey_b64url(&pkg.genesis.root_pubkey)?;
+    validate_ed25519_pubkey_b64url(&pkg.active_pubkey)?;
+
+    // Freshness & clock-skew checks
+    let now = now_ms();
+    let max_future_ms = max_future_skew_secs.saturating_mul(1000);
+    let max_age_ms = max_age_secs.saturating_mul(1000);
+    if pkg.exported_at_ms > now.saturating_add(max_future_ms) {
+        anyhow::bail!("Portable identity package exported_at_ms is in the future");
+    }
+    if now.saturating_sub(pkg.exported_at_ms) > max_age_ms {
+        anyhow::bail!("Portable identity package has expired (exceeded max_age_secs)");
+    }
+    if pkg.exported_at_ms < pkg.genesis.created_at_ms {
+        anyhow::bail!("Portable identity package exported_at_ms precedes genesis created_at_ms");
+    }
+
     let expected_id = compute_identity_id(
         pkg.genesis.created_at_ms,
         &pkg.genesis.nonce,
@@ -191,11 +260,23 @@ pub fn verify_identity_package(pkg: &PortableIdentityPackage) -> Result<()> {
     ) {
         anyhow::bail!("Invalid Ed25519 genesis signature");
     }
+
     let mut current_pk = pkg.genesis.root_pubkey.clone();
+    let mut prev_ts = pkg.genesis.created_at_ms;
+    let mut seen_keys: HashSet<String> = HashSet::new();
+    seen_keys.insert(current_pk.clone());
+
     for (idx, tr) in pkg.key_history.iter().enumerate() {
         let expected_seq = (idx as u64) + 1;
         if tr.seq != expected_seq || tr.prev_pubkey != current_pk {
             anyhow::bail!("Broken key transition chain at seq {}", tr.seq);
+        }
+        validate_ed25519_pubkey_b64url(&tr.new_pubkey)?;
+        if tr.new_pubkey == tr.prev_pubkey || seen_keys.contains(&tr.new_pubkey) {
+            anyhow::bail!("Key rotation cannot reuse a previous or compromised public key");
+        }
+        if tr.rotated_at_ms < prev_ts {
+            anyhow::bail!("Key transition timestamp regression at seq {}", tr.seq);
         }
         let rot_bytes = canonical_rotation_bytes(
             &pkg.identity_id,
@@ -207,7 +288,9 @@ pub fn verify_identity_package(pkg: &PortableIdentityPackage) -> Result<()> {
         if !nexus_db::auth::ed25519_verify(&tr.prev_pubkey, &rot_bytes, &tr.sig_by_prev) {
             anyhow::bail!("Invalid key transition signature at seq {}", tr.seq);
         }
+        seen_keys.insert(tr.new_pubkey.clone());
         current_pk = tr.new_pubkey.clone();
+        prev_ts = tr.rotated_at_ms;
     }
     if current_pk != pkg.active_pubkey {
         anyhow::bail!("active_pubkey does not match end of key history chain");
@@ -222,6 +305,109 @@ pub fn verify_identity_package(pkg: &PortableIdentityPackage) -> Result<()> {
         anyhow::bail!("Invalid portable identity package signature");
     }
     Ok(())
+}
+
+/// Complete RFC 7519 / RFC 8037 JWT validation policy (header + claims + JWKS signature).
+#[derive(Debug, Clone)]
+pub struct JwtValidationPolicy {
+    pub expected_issuer: String,
+    pub expected_audience: String,
+    pub expected_typ: String,
+    pub clock_skew_secs: u64,
+}
+
+impl JwtValidationPolicy {
+    pub fn new(issuer: impl Into<String>, audience: impl Into<String>) -> Self {
+        Self {
+            expected_issuer: issuer.into(),
+            expected_audience: audience.into(),
+            expected_typ: "JWT".into(),
+            clock_skew_secs: 60,
+        }
+    }
+}
+
+/// Complete RFC 7519 / RFC 8037 `EdDSA` JWT verifier:
+/// Validates `alg == "EdDSA"`, `typ`, `kid` lookup in JWKS (`kty == "OKP"`, `crv == "Ed25519"`),
+/// Ed25519 signature, `iss`, `aud`, `exp`, `nbf`, and `iat`.
+pub fn validate_eddsa_jwt(
+    token: &str,
+    jwks: &serde_json::Value,
+    policy: &JwtValidationPolicy,
+) -> Result<serde_json::Value> {
+    let parts: Vec<&str> = token.split('.').collect();
+    if parts.len() != 3 {
+        anyhow::bail!("Malformed JWT: expected 3 dot-separated segments");
+    }
+    let header_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(parts[0])
+        .map_err(|_| anyhow!("Invalid JWT header base64url"))?;
+    let header: serde_json::Value = serde_json::from_slice(&header_bytes)
+        .map_err(|_| anyhow!("Invalid JWT header JSON"))?;
+
+    if header.get("alg").and_then(|v| v.as_str()) != Some("EdDSA") {
+        anyhow::bail!("JWT header alg must be 'EdDSA'");
+    }
+    if header.get("typ").and_then(|v| v.as_str()) != Some(policy.expected_typ.as_str()) {
+        anyhow::bail!("JWT header typ mismatch");
+    }
+    let kid = header
+        .get("kid")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| anyhow!("JWT header missing required 'kid'"))?;
+
+    let keys = jwks
+        .get("keys")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| anyhow!("JWKS missing 'keys' array"))?;
+    let jwk = keys
+        .iter()
+        .find(|k| {
+            k.get("kid").and_then(|v| v.as_str()) == Some(kid)
+                && k.get("kty").and_then(|v| v.as_str()) == Some("OKP")
+                && k.get("crv").and_then(|v| v.as_str()) == Some("Ed25519")
+        })
+        .ok_or_else(|| anyhow!("No matching Ed25519 JWK found for kid '{}'", kid))?;
+    let pub_x = jwk
+        .get("x")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("Matched JWK missing 'x' public key"))?;
+
+    let claims = nexus_db::auth::verify_eddsa_jwt_json(token, pub_x)?;
+
+    if claims.get("iss").and_then(|v| v.as_str()) != Some(policy.expected_issuer.as_str()) {
+        anyhow::bail!("JWT issuer mismatch");
+    }
+    let aud_ok = match claims.get("aud") {
+        Some(serde_json::Value::String(s)) => s == &policy.expected_audience,
+        Some(serde_json::Value::Array(arr)) => arr
+            .iter()
+            .any(|v| v.as_str() == Some(policy.expected_audience.as_str())),
+        _ => false,
+    };
+    if !aud_ok {
+        anyhow::bail!("JWT audience mismatch");
+    }
+    let now = now_secs();
+    let exp = claims
+        .get("exp")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| anyhow!("JWT missing required 'exp' claim"))?;
+    if now > exp.saturating_add(policy.clock_skew_secs) {
+        anyhow::bail!("JWT has expired");
+    }
+    if let Some(nbf) = claims.get("nbf").and_then(|v| v.as_u64()) {
+        if now.saturating_add(policy.clock_skew_secs) < nbf {
+            anyhow::bail!("JWT is not yet valid (nbf)");
+        }
+    }
+    if let Some(iat) = claims.get("iat").and_then(|v| v.as_u64()) {
+        if iat > now.saturating_add(policy.clock_skew_secs) {
+            anyhow::bail!("JWT iat is in the future");
+        }
+    }
+    Ok(claims)
 }
 
 // =============================================================================
@@ -870,13 +1056,20 @@ impl NexusIdp {
     }
 
     /// Import a cryptographically verified `PortableIdentityPackage` onto this cluster.
-    /// Grants ZERO automatic organizational memberships or permissions.
+    /// Grants ZERO automatic organizational memberships or permissions, and NEVER overwrites
+    /// an already-registered local identity.
     pub async fn import_portable_identity(
         &self,
         pkg: &PortableIdentityPackage,
     ) -> Result<Identity> {
         self.ensure_tables().await?;
         verify_identity_package(pkg)?;
+        if self.get_identity(&pkg.identity_id).await?.is_some() {
+            anyhow::bail!(
+                "Identity '{}' already exists locally; refusing overwrite via portable import",
+                pkg.identity_id
+            );
+        }
         let ident = Identity {
             identity_id: pkg.identity_id.clone(),
             display_name: pkg.display_name.clone(),
@@ -947,6 +1140,7 @@ impl NexusIdp {
         primary_domain: Option<String>,
         local_policy: OrgPolicyPatch,
     ) -> Result<Organization> {
+        let _guard = HIERARCHY_LOCK.lock().await;
         self.ensure_tables().await?;
         let clean_slug = slug.trim().to_ascii_lowercase();
         if clean_slug.is_empty()
@@ -1045,13 +1239,15 @@ impl NexusIdp {
         Ok(org)
     }
 
-    /// Safely reparent an organization (and its descendants) with O(1) cycle detection & depth enforcement.
+    /// Safely reparent an organization (and its descendants) with indexed cycle detection,
+    /// serialized hierarchy locking, depth enforcement, and O(k) descendant path updates.
     pub async fn reparent_org(
         &self,
         actor: &str,
         org_id: &str,
         new_parent_org_id: Option<String>,
     ) -> Result<Organization> {
+        let _guard = HIERARCHY_LOCK.lock().await;
         let mut org = self
             .get_org(org_id)
             .await?
@@ -1775,11 +1971,17 @@ impl NexusIdp {
             .get_oidc_client(client_id)
             .await?
             .ok_or_else(|| anyhow!("Unknown OIDC client_id '{}'", client_id))?;
-        if !client.redirect_uris.iter().any(|u| u == redirect_uri) {
-            anyhow::bail!("redirect_uri '{}' is not registered for client '{}'", redirect_uri, client_id);
+        if redirect_uri.contains('#') || !client.redirect_uris.iter().any(|u| u == redirect_uri) {
+            anyhow::bail!("redirect_uri '{}' is invalid or not registered for client '{}'", redirect_uri, client_id);
         }
         if code_challenge.trim().is_empty() || code_challenge_method != "S256" {
             anyhow::bail!("OAuth 2.1 requires PKCE with code_challenge_method=S256");
+        }
+        // Validate every requested scope is permitted for this client
+        for s in scope.split_whitespace() {
+            if !client.scopes.iter().any(|allowed| allowed == s) {
+                anyhow::bail!("Requested scope '{}' is not allowed for client '{}'", s, client_id);
+            }
         }
         let plain_code = random_token("nxac");
         let chash = hash_lookup_key(&plain_code);
@@ -1901,7 +2103,15 @@ impl NexusIdp {
                     anyhow::bail!("Authorization code client_id or redirect_uri mismatch");
                 }
 
-                // PKCE S256 verification
+                // RFC 7636 PKCE verifier syntax (43..=128 unreserved ASCII chars) + S256 check
+                if verifier.len() < 43
+                    || verifier.len() > 128
+                    || !verifier
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~'))
+                {
+                    anyhow::bail!("PKCE code_verifier violates RFC 7636 length/character requirements");
+                }
                 let digest = sha256(verifier.as_bytes());
                 let computed = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest);
                 if !constant_time_eq(computed.as_bytes(), rec.code_challenge.as_bytes()) {
@@ -1958,6 +2168,7 @@ impl NexusIdp {
 
                 // Sign real RFC 8037 EdDSA (`Ed25519`) OIDC `id_token`
                 let sk = self.ensure_active_signing_key().await?;
+                let iat = now_secs();
                 let id_claims = serde_json::json!({
                     "iss": "nexus-idp",
                     "sub": rec.subject,
@@ -1965,8 +2176,9 @@ impl NexusIdp {
                     "org_id": rec.org_id,
                     "roles": rec.roles,
                     "nonce": rec.nonce,
-                    "iat": now_secs(),
-                    "exp": now_secs() + 3600,
+                    "iat": iat,
+                    "nbf": iat,
+                    "exp": iat + 3600,
                 });
                 let id_token =
                     nexus_db::auth::sign_eddsa_jwt(&sk.kid, &sk.secret_b64url, &id_claims)?;
@@ -1987,6 +2199,7 @@ impl NexusIdp {
                 })
             }
             "refresh_token" => {
+                let _refresh_guard = REFRESH_LOCK.lock().await;
                 let raw_rt = refresh_token.ok_or_else(|| anyhow!("Missing refresh_token"))?;
                 let rhash = hash_lookup_key(raw_rt);
                 let mut resp = self
@@ -2633,5 +2846,283 @@ mod tests {
         idp.revoke_membership("root", &acme.org_id, &alice.identity_id).await.unwrap();
         assert!(idp.introspect_token(&tok1.access_token).await.unwrap().is_none());
         assert!(idp.get_identity(&alice.identity_id).await.unwrap().is_some(), "Identity MUST survive org removal!");
+    }
+
+    #[tokio::test]
+    async fn security_genesis_canonical_framing_and_tamper_boundaries() {
+        // Length-prefixed framing prevents boundary concatenation ambiguity:
+        // ("ab", "cd") != ("abc", "d")
+        assert_ne!(
+            canonical_genesis_bytes(1000, "aaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbb"),
+            canonical_genesis_bytes(1000, "aaaaaaaaaaaaaaaab", "bbbbbbbbbbbbbbb")
+        );
+        let db = Arc::new(Database::open_mem());
+        let idp = NexusIdp::new(db);
+        let (ident, sk0) = idp.create_identity("Bob", None).await.unwrap();
+        let mut pkg = idp.export_identity_package(&ident.identity_id, &sk0).await.unwrap();
+        assert!(verify_identity_package(&pkg).is_ok());
+
+        // Tamper timestamp -> MUST fail
+        pkg.genesis.created_at_ms += 1;
+        assert!(verify_identity_package(&pkg).is_err());
+        pkg.genesis.created_at_ms -= 1;
+
+        // Invalid short nonce -> MUST fail
+        pkg.genesis.nonce = "short".into();
+        assert!(verify_identity_package(&pkg).is_err());
+    }
+
+    #[tokio::test]
+    async fn security_key_rotation_rejects_reordered_gapped_duplicate_replayed_and_compromised_keys() {
+        let db = Arc::new(Database::open_mem());
+        let idp = NexusIdp::new(db);
+        let (ident, sk0) = idp.create_identity("Carol", None).await.unwrap();
+        let (_, sk1) = idp.rotate_identity_key(&ident.identity_id, &sk0).await.unwrap();
+        // Compromised/old sk0 MUST NOT be able to rotate again!
+        assert!(idp.rotate_identity_key(&ident.identity_id, &sk0).await.is_err());
+        let (_, sk2) = idp.rotate_identity_key(&ident.identity_id, &sk1).await.unwrap();
+        let base_pkg = idp.export_identity_package(&ident.identity_id, &sk2).await.unwrap();
+        assert!(verify_identity_package(&base_pkg).is_ok());
+
+        // 1. Reordered transitions -> MUST fail
+        let mut reordered = base_pkg.clone();
+        reordered.key_history.swap(0, 1);
+        assert!(verify_identity_package(&reordered).is_err());
+
+        // 2. Gapped seq -> MUST fail
+        let mut gapped = base_pkg.clone();
+        gapped.key_history[1].seq = 3;
+        assert!(verify_identity_package(&gapped).is_err());
+
+        // 3. Missing intermediate transition -> MUST fail
+        let mut missing = base_pkg.clone();
+        missing.key_history.remove(0);
+        assert!(verify_identity_package(&missing).is_err());
+
+        // 4. Duplicate/compromised key reuse -> MUST fail
+        let mut reused = base_pkg.clone();
+        reused.key_history[1].new_pubkey = reused.genesis.root_pubkey.clone();
+        assert!(verify_identity_package(&reused).is_err());
+    }
+
+    #[tokio::test]
+    async fn security_portable_package_freshness_and_anti_overwrite() {
+        let db1 = Arc::new(Database::open_mem());
+        let idp1 = NexusIdp::new(db1);
+        let (ident, sk0) = idp1.create_identity("Dave", None).await.unwrap();
+        let pkg = idp1.export_identity_package(&ident.identity_id, &sk0).await.unwrap();
+
+        // Expired package (max_age = 0 with simulated past timestamp) -> MUST fail
+        let mut stale = pkg.clone();
+        stale.exported_at_ms = stale.exported_at_ms.saturating_sub(120_000);
+        assert!(verify_identity_package_with_policy(&stale, 60, 60).is_err());
+
+        // Future-dated package -> MUST fail
+        let mut future_pkg = pkg.clone();
+        future_pkg.exported_at_ms = now_ms() + 600_000;
+        assert!(verify_identity_package_with_policy(&future_pkg, 86_400, 60).is_err());
+
+        // Import onto Cluster 2 succeeds ONCE, second import MUST refuse overwrite!
+        let db2 = Arc::new(Database::open_mem());
+        let idp2 = NexusIdp::new(db2);
+        assert!(idp2.import_portable_identity(&pkg).await.is_ok());
+        assert!(
+            idp2.import_portable_identity(&pkg).await.is_err(),
+            "Portable import MUST NEVER overwrite an existing local identity"
+        );
+    }
+
+    #[tokio::test]
+    async fn security_full_jwt_validator_enforces_alg_typ_kid_iss_aud_exp_nbf_and_sig() {
+        let db = Arc::new(Database::open_mem());
+        let idp = NexusIdp::new(db);
+        idp.ensure_tables().await.unwrap();
+        let sk = idp.ensure_active_signing_key().await.unwrap();
+        let jwks = idp.jwks().await.unwrap();
+        let now = now_secs();
+
+        let good_claims = serde_json::json!({
+            "iss": "nexus-idp",
+            "sub": "nxid_test",
+            "aud": "client_1",
+            "iat": now,
+            "nbf": now,
+            "exp": now + 300,
+        });
+        let good_tok = nexus_db::auth::sign_eddsa_jwt(&sk.kid, &sk.secret_b64url, &good_claims).unwrap();
+        let pol = JwtValidationPolicy::new("nexus-idp", "client_1");
+        assert!(validate_eddsa_jwt(&good_tok, &jwks, &pol).is_ok());
+
+        // Wrong issuer -> MUST fail
+        assert!(validate_eddsa_jwt(&good_tok, &jwks, &JwtValidationPolicy::new("evil-idp", "client_1")).is_err());
+        // Wrong audience -> MUST fail
+        assert!(validate_eddsa_jwt(&good_tok, &jwks, &JwtValidationPolicy::new("nexus-idp", "other_client")).is_err());
+
+        // Expired token -> MUST fail
+        let exp_claims = serde_json::json!({
+            "iss": "nexus-idp", "sub": "nxid_test", "aud": "client_1",
+            "iat": now - 600, "exp": now - 120,
+        });
+        let exp_tok = nexus_db::auth::sign_eddsa_jwt(&sk.kid, &sk.secret_b64url, &exp_claims).unwrap();
+        assert!(validate_eddsa_jwt(&exp_tok, &jwks, &pol).is_err());
+
+        // Future nbf -> MUST fail
+        let nbf_claims = serde_json::json!({
+            "iss": "nexus-idp", "sub": "nxid_test", "aud": "client_1",
+            "iat": now, "nbf": now + 300, "exp": now + 600,
+        });
+        let nbf_tok = nexus_db::auth::sign_eddsa_jwt(&sk.kid, &sk.secret_b64url, &nbf_claims).unwrap();
+        assert!(validate_eddsa_jwt(&nbf_tok, &jwks, &pol).is_err());
+
+        // Unknown kid -> MUST fail
+        let bad_kid_tok = nexus_db::auth::sign_eddsa_jwt("unknown_kid", &sk.secret_b64url, &good_claims).unwrap();
+        assert!(validate_eddsa_jwt(&bad_kid_tok, &jwks, &pol).is_err());
+
+        // alg:none downgrade -> MUST fail
+        let none_hdr = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(br#"{"alg":"none","typ":"JWT","kid":"x"}"#);
+        let parts: Vec<&str> = good_tok.split('.').collect();
+        let downgraded = format!("{}.{}.{}", none_hdr, parts[1], parts[2]);
+        assert!(validate_eddsa_jwt(&downgraded, &jwks, &pol).is_err());
+    }
+
+    #[tokio::test]
+    async fn security_oauth21_redirect_pkce_scope_and_client_auth_guards() {
+        let db = Arc::new(Database::open_mem());
+        let idp = NexusIdp::new(db);
+        let (pub_cli, _) = idp
+            .create_oidc_client(
+                "root",
+                "default",
+                "Public SPA",
+                OidcClientType::Public,
+                vec!["https://app.example/cb".into()],
+                vec!["authorization_code".into(), "refresh_token".into()],
+                vec!["openid".into(), "profile".into()],
+            )
+            .await
+            .unwrap();
+
+        let verifier = "valid-rfc7636-pkce-code-verifier-string-0123456789abcd";
+        let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sha256(verifier.as_bytes()));
+
+        // Fragment in redirect_uri -> MUST fail
+        assert!(idp
+            .issue_authorization_code(&pub_cli.client_id, "https://app.example/cb#frag", "openid", &challenge, "S256", None, "u1", vec![])
+            .await
+            .is_err());
+        // Unregistered prefix redirect_uri -> MUST fail
+        assert!(idp
+            .issue_authorization_code(&pub_cli.client_id, "https://app.example/cb/evil", "openid", &challenge, "S256", None, "u1", vec![])
+            .await
+            .is_err());
+        // PKCE plain method -> MUST fail
+        assert!(idp
+            .issue_authorization_code(&pub_cli.client_id, "https://app.example/cb", "openid", verifier, "plain", None, "u1", vec![])
+            .await
+            .is_err());
+        // Unregistered scope escalation -> MUST fail
+        assert!(idp
+            .issue_authorization_code(&pub_cli.client_id, "https://app.example/cb", "openid admin:all", &challenge, "S256", None, "u1", vec![])
+            .await
+            .is_err());
+        // Public client cannot use client_credentials -> MUST fail
+        assert!(idp
+            .exchange_token("client_credentials", &pub_cli.client_id, None, None, None, None, None, Some("openid"))
+            .await
+            .is_err());
+
+        // Short (< 43 chars) PKCE verifier -> MUST fail RFC 7636 check
+        let short_v = "too-short-verifier";
+        let short_ch = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sha256(short_v.as_bytes()));
+        let code = idp
+            .issue_authorization_code(&pub_cli.client_id, "https://app.example/cb", "openid", &short_ch, "S256", None, "u1", vec![])
+            .await
+            .unwrap();
+        assert!(idp
+            .exchange_token("authorization_code", &pub_cli.client_id, None, Some(&code), Some("https://app.example/cb"), Some(short_v), None, None)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn security_concurrent_refresh_token_race_triggers_atomic_family_revocation() {
+        let db = Arc::new(Database::open_mem());
+        let idp = NexusIdp::new(db);
+        let (cli, sec) = idp
+            .create_oidc_client(
+                "root",
+                "default",
+                "Race Client",
+                OidcClientType::Confidential,
+                vec!["https://race.example/cb".into()],
+                vec!["authorization_code".into(), "refresh_token".into()],
+                vec!["openid".into()],
+            )
+            .await
+            .unwrap();
+        let sec = sec.unwrap();
+        let verifier = "concurrent-refresh-race-pkce-verifier-0123456789abcdef";
+        let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sha256(verifier.as_bytes()));
+        let code = idp
+            .issue_authorization_code(&cli.client_id, "https://race.example/cb", "openid", &challenge, "S256", None, "u_race", vec![])
+            .await
+            .unwrap();
+        let tok1 = idp
+            .exchange_token("authorization_code", &cli.client_id, Some(&sec), Some(&code), Some("https://race.example/cb"), Some(verifier), None, None)
+            .await
+            .unwrap();
+        let rt1 = tok1.refresh_token.unwrap();
+
+        // Fire two concurrent refresh exchanges with the exact same rt1!
+        let (r1, r2) = tokio::join!(
+            idp.exchange_token("refresh_token", &cli.client_id, Some(&sec), None, None, None, Some(&rt1), None),
+            idp.exchange_token("refresh_token", &cli.client_id, Some(&sec), None, None, None, Some(&rt1), None),
+        );
+        // Exactly ONE succeeds and ONE triggers replay detection; the winning access_token MUST be revoked!
+        let (winner, loser_err) = match (r1, r2) {
+            (Ok(w), Err(e)) | (Err(e), Ok(w)) => (w, e),
+            (Ok(_), Ok(_)) => panic!("Concurrent refresh race MUST NEVER allow both to succeed!"),
+            (Err(e1), Err(e2)) => panic!("One refresh should have succeeded before replay: {:?} / {:?}", e1, e2),
+        };
+        assert!(loser_err.to_string().contains("replay"));
+        assert!(
+            idp.introspect_token(&winner.access_token).await.unwrap().is_none(),
+            "Replay from racing refresh MUST atomically revoke the winning token's entire family"
+        );
+    }
+
+    #[tokio::test]
+    async fn security_hierarchy_limits_deep_reparent_and_concurrent_moves() {
+        let db = Arc::new(Database::open_mem());
+        let idp = NexusIdp::new(db).with_hierarchy_limits(HierarchyLimits {
+            max_depth: 3,
+            max_subtree_size: 4,
+        });
+        let a = idp.create_org("root", "a", "A", None, None, OrgPolicyPatch::default()).await.unwrap();
+        let b = idp.create_org("root", "b", "B", Some(a.org_id.clone()), None, OrgPolicyPatch::default()).await.unwrap();
+        let c = idp.create_org("root", "c", "C", Some(b.org_id.clone()), None, OrgPolicyPatch::default()).await.unwrap();
+        let d = idp.create_org("root", "d", "D", Some(c.org_id.clone()), None, OrgPolicyPatch::default()).await.unwrap();
+        assert_eq!(d.depth, 3);
+        // Exceeding max_depth=3 -> MUST fail
+        assert!(idp.create_org("root", "e", "E", Some(d.org_id.clone()), None, OrgPolicyPatch::default()).await.is_err());
+
+        // Create second root X and reparent subtree B->C->D under X (depth 1->2->3 OK!)
+        let x = idp.create_org("root", "x", "X", None, None, OrgPolicyPatch::default()).await.unwrap();
+        let b_moved = idp.reparent_org("root", &b.org_id, Some(x.org_id.clone())).await.unwrap();
+        assert_eq!(b_moved.path, format!("/{}/{}", x.org_id, b.org_id));
+        let d_after = idp.get_org(&d.org_id).await.unwrap().unwrap();
+        assert_eq!(d_after.path, format!("/{}/{}/{}/{}", x.org_id, b.org_id, c.org_id, d.org_id));
+        assert_eq!(d_after.depth, 3);
+
+        // Concurrent opposing reparents (X under B vs B under A) MUST NOT create a cycle!
+        let (m1, m2) = tokio::join!(
+            idp.reparent_org("root", &x.org_id, Some(b.org_id.clone())),
+            idp.reparent_org("root", &b.org_id, Some(a.org_id.clone())),
+        );
+        // Either X under B failed (because B is under X) or B moved to A first so X under B succeeded without cycle
+        let x_fin = idp.get_org(&x.org_id).await.unwrap().unwrap();
+        let b_fin = idp.get_org(&b.org_id).await.unwrap().unwrap();
+        assert!(!(x_fin.path.contains(&b.org_id) && b_fin.path.contains(&x.org_id)), "Cycle MUST be impossible: m1={:?} m2={:?}", m1, m2);
     }
 }
