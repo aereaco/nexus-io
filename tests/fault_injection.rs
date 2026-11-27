@@ -1291,3 +1291,280 @@ requires = ["gpu", "vram:16384", "region:us-west"]
     let _ = std::fs::remove_dir_all(&tmp_a);
     let _ = std::fs::remove_dir_all(&tmp_b);
 }
+
+#[tokio::test]
+async fn nexus_idp_gateway_oidc_pkce_outpost_and_mfa_e2e() {
+    use base64::Engine as _;
+    use nexus_io::iam::idp::{base32_decode, sha256, totp_code_for_step};
+    use nexus_io::ux::{GatewayConfig, UxGateway};
+    use salvo::prelude::Service;
+    use salvo::test::{ResponseExt, TestClient};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let tmp = std::env::temp_dir().join(format!("nexus_idp_gw_e2e_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let db = Arc::new(Database::open_mem());
+    let blobs = Arc::new(BlobBridge::new_in(db.clone(), &tmp).await.unwrap());
+    let gw = UxGateway::new(db.clone(), blobs.clone(), GatewayConfig::all_core());
+    gw.reconcile_storage_on_boot().await.unwrap();
+    let service = Service::new(gw.router());
+
+    // Provision an OWNER user and sign in to manage orgs/clients/MFA
+    db.inner
+        .query_scoped(
+            "nexus",
+            "system",
+            "DEFINE USER idp_admin ON ROOT PASSWORD 'secret' ROLES OWNER;",
+            vec![],
+        )
+        .unwrap();
+    let mut signin = TestClient::post("http://127.0.0.1/signin")
+        .json(&serde_json::json!({ "user": "idp_admin", "pass": "secret" }))
+        .send(&service)
+        .await;
+    assert_eq!(signin.status_code, Some(salvo::http::StatusCode::OK));
+    let admin_tok = signin.take_json::<serde_json::Value>().await.unwrap()["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // 1. OIDC Discovery + real RFC 8037 Ed25519 JWKS (public endpoints)
+    let mut disc = TestClient::get("http://127.0.0.1/.well-known/openid-configuration")
+        .send(&service)
+        .await;
+    assert_eq!(disc.status_code, Some(salvo::http::StatusCode::OK));
+    let disc_json: serde_json::Value = disc.take_json().await.unwrap();
+    assert_eq!(disc_json["code_challenge_methods_supported"][0], "S256");
+    assert_eq!(disc_json["id_token_signing_alg_values_supported"][0], "EdDSA");
+
+    let mut jwks = TestClient::get("http://127.0.0.1/.well-known/jwks.json")
+        .send(&service)
+        .await;
+    assert_eq!(jwks.status_code, Some(salvo::http::StatusCode::OK));
+    let jwks_json: serde_json::Value = jwks.take_json().await.unwrap();
+    assert_eq!(jwks_json["keys"][0]["kty"], "OKP");
+    assert_eq!(jwks_json["keys"][0]["crv"], "Ed25519");
+
+    // 2. Identity-First NEXUS-ID-v1 + Hierarchical Organizations + Non-Implicit Delegation + Policy Composition
+    let mut ident_res = TestClient::post("http://127.0.0.1/_nexus/iam/identities")
+        .add_header("Authorization", format!("Bearer {}", admin_tok), true)
+        .json(&serde_json::json!({
+            "display_name": "Alice Personal",
+            "primary_email": "alice@personal.nexus"
+        }))
+        .send(&service)
+        .await;
+    assert_eq!(ident_res.status_code, Some(salvo::http::StatusCode::CREATED));
+    let ident_json: serde_json::Value = ident_res.take_json().await.unwrap();
+    let alice_id = ident_json["identity"]["identity_id"].as_str().unwrap().to_string();
+    assert!(alice_id.starts_with("nxid_"));
+
+    let mut org_res = TestClient::post("http://127.0.0.1/_nexus/iam/orgs")
+        .add_header("Authorization", format!("Bearer {}", admin_tok), true)
+        .json(&serde_json::json!({
+            "slug": "contoso",
+            "name": "Contoso Ltd",
+            "primary_domain": "contoso.example",
+            "local_policy": { "mfa_required": true, "min_password_length": 14 }
+        }))
+        .send(&service)
+        .await;
+    assert_eq!(org_res.status_code, Some(salvo::http::StatusCode::CREATED));
+    let org_json: serde_json::Value = org_res.take_json().await.unwrap();
+    let contoso_id = org_json["org_id"].as_str().unwrap().to_string();
+
+    let mut child_res = TestClient::post("http://127.0.0.1/_nexus/iam/orgs")
+        .add_header("Authorization", format!("Bearer {}", admin_tok), true)
+        .json(&serde_json::json!({
+            "slug": "contoso-eu",
+            "name": "Contoso Europe",
+            "parent_org_id": contoso_id,
+            "local_policy": { "mfa_required": false, "branding_name": "Contoso EU" }
+        }))
+        .send(&service)
+        .await;
+    assert_eq!(child_res.status_code, Some(salvo::http::StatusCode::CREATED));
+    let child_json: serde_json::Value = child_res.take_json().await.unwrap();
+    let child_id = child_json["org_id"].as_str().unwrap().to_string();
+    assert_eq!(child_json["depth"], 1);
+    assert_eq!(child_json["path"], format!("/{}/{}", contoso_id, child_id));
+
+    // Verify policy composition provenance on child org
+    let mut pol_res = TestClient::get(format!("http://127.0.0.1/_nexus/iam/orgs/{}/policy", child_id))
+        .add_header("Authorization", format!("Bearer {}", admin_tok), true)
+        .send(&service)
+        .await;
+    assert_eq!(pol_res.status_code, Some(salvo::http::StatusCode::OK));
+    let pol_json: serde_json::Value = pol_res.take_json().await.unwrap();
+    assert_eq!(pol_json["mfa_required"]["value"], true);
+    assert_eq!(pol_json["mfa_required"]["provenance"], "prohibited_by_parent");
+    assert_eq!(pol_json["branding_name"]["value"], "Contoso EU");
+
+    // Grant Alice ORG_ADMIN on Contoso with SelfOnly -> ALLOWED on Contoso, DENIED on Contoso EU!
+    let mem_res = TestClient::post(format!("http://127.0.0.1/_nexus/iam/orgs/{}/members", contoso_id))
+        .add_header("Authorization", format!("Bearer {}", admin_tok), true)
+        .json(&serde_json::json!({
+            "subject_id": alice_id,
+            "role_assignments": ["ORG_ADMIN"],
+            "scope": { "kind": "self_only" }
+        }))
+        .send(&service)
+        .await;
+    assert_eq!(mem_res.status_code, Some(salvo::http::StatusCode::CREATED));
+
+    let mut eval_parent = TestClient::post("http://127.0.0.1/_nexus/iam/evaluate")
+        .add_header("Authorization", format!("Bearer {}", admin_tok), true)
+        .json(&serde_json::json!({ "subject_id": alice_id, "org_id": contoso_id, "action": "iam.users.manage" }))
+        .send(&service)
+        .await;
+    assert_eq!(eval_parent.take_json::<serde_json::Value>().await.unwrap()["allowed"], true);
+
+    let mut eval_child = TestClient::post("http://127.0.0.1/_nexus/iam/evaluate")
+        .add_header("Authorization", format!("Bearer {}", admin_tok), true)
+        .json(&serde_json::json!({ "subject_id": alice_id, "org_id": child_id, "action": "iam.users.manage" }))
+        .send(&service)
+        .await;
+    assert_eq!(eval_child.take_json::<serde_json::Value>().await.unwrap()["allowed"], false);
+
+    let mut cli_res = TestClient::post("http://127.0.0.1/_nexus/iam/clients")
+        .add_header("Authorization", format!("Bearer {}", admin_tok), true)
+        .json(&serde_json::json!({
+            "org_id": contoso_id,
+            "name": "Contoso Portal",
+            "client_type": "confidential",
+            "redirect_uris": ["https://contoso.example/cb"],
+            "grant_types": ["authorization_code", "refresh_token", "client_credentials"],
+            "scopes": ["openid", "profile", "email"]
+        }))
+        .send(&service)
+        .await;
+    assert_eq!(cli_res.status_code, Some(salvo::http::StatusCode::CREATED));
+    let cli_json: serde_json::Value = cli_res.take_json().await.unwrap();
+    let client_id = cli_json["client"]["client_id"].as_str().unwrap().to_string();
+    let client_secret = cli_json["client_secret"].as_str().unwrap().to_string();
+
+    // 3. OAuth 2.1 Authorization Code with mandatory PKCE S256
+    let verifier = "contoso-pkce-verifier-secret-string-0123456789abcdef";
+    let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(sha256(verifier.as_bytes()));
+    let mut authz_res = TestClient::post("http://127.0.0.1/oauth/v2/authorize")
+        .add_header("Authorization", format!("Bearer {}", admin_tok), true)
+        .json(&serde_json::json!({
+            "client_id": client_id,
+            "redirect_uri": "https://contoso.example/cb",
+            "scope": "openid profile",
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "state": "xyz"
+        }))
+        .send(&service)
+        .await;
+    assert_eq!(authz_res.status_code, Some(salvo::http::StatusCode::OK));
+    let code = authz_res.take_json::<serde_json::Value>().await.unwrap()["code"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Exchange code -> access_token + refresh_token
+    let mut tok_res = TestClient::post("http://127.0.0.1/oauth/v2/token")
+        .json(&serde_json::json!({
+            "grant_type": "authorization_code",
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "code": code,
+            "redirect_uri": "https://contoso.example/cb",
+            "code_verifier": verifier
+        }))
+        .send(&service)
+        .await;
+    assert_eq!(tok_res.status_code, Some(salvo::http::StatusCode::OK));
+    let tok_json: serde_json::Value = tok_res.take_json().await.unwrap();
+    let access_token = tok_json["access_token"].as_str().unwrap().to_string();
+    let refresh_token = tok_json["refresh_token"].as_str().unwrap().to_string();
+
+    // 4. OIDC UserInfo + Authentik-style Forward-Auth Outpost
+    let mut ui_res = TestClient::get("http://127.0.0.1/oidc/v1/userinfo")
+        .add_header("Authorization", format!("Bearer {}", access_token), true)
+        .send(&service)
+        .await;
+    assert_eq!(ui_res.status_code, Some(salvo::http::StatusCode::OK));
+    let ui_json: serde_json::Value = ui_res.take_json().await.unwrap();
+    assert_eq!(ui_json["org_id"], contoso_id);
+
+    let outpost_ok = TestClient::get("http://127.0.0.1/_nexus/outpost/auth")
+        .add_header("Authorization", format!("Bearer {}", access_token), true)
+        .send(&service)
+        .await;
+    assert_eq!(outpost_ok.status_code, Some(salvo::http::StatusCode::OK));
+    assert_eq!(
+        outpost_ok.headers().get("x-nexus-org").and_then(|v| v.to_str().ok()),
+        Some(contoso_id.as_str())
+    );
+
+    let outpost_denied = TestClient::get("http://127.0.0.1/_nexus/outpost/auth")
+        .send(&service)
+        .await;
+    assert_eq!(outpost_denied.status_code, Some(salvo::http::StatusCode::UNAUTHORIZED));
+
+    // 5. Rotating Refresh Token + Replay Detection
+    let mut rot_res = TestClient::post("http://127.0.0.1/oauth/v2/token")
+        .json(&serde_json::json!({
+            "grant_type": "refresh_token",
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "refresh_token": refresh_token
+        }))
+        .send(&service)
+        .await;
+    assert_eq!(rot_res.status_code, Some(salvo::http::StatusCode::OK));
+    let tok2 = rot_res.take_json::<serde_json::Value>().await.unwrap()["access_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Replaying old refresh_token MUST fail AND revoke tok2!
+    let replay_res = TestClient::post("http://127.0.0.1/oauth/v2/token")
+        .json(&serde_json::json!({
+            "grant_type": "refresh_token",
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "refresh_token": refresh_token
+        }))
+        .send(&service)
+        .await;
+    assert_eq!(replay_res.status_code, Some(salvo::http::StatusCode::BAD_REQUEST));
+
+    let outpost_revoked = TestClient::get("http://127.0.0.1/_nexus/outpost/auth")
+        .add_header("Authorization", format!("Bearer {}", tok2), true)
+        .send(&service)
+        .await;
+    assert_eq!(outpost_revoked.status_code, Some(salvo::http::StatusCode::UNAUTHORIZED));
+
+    // 6. TOTP MFA enroll + verify + Audit Log check
+    let mut enroll = TestClient::post(format!("http://127.0.0.1/_nexus/iam/mfa/totp/enroll?org_id={}", contoso_id))
+        .add_header("Authorization", format!("Bearer {}", admin_tok), true)
+        .send(&service)
+        .await;
+    assert_eq!(enroll.status_code, Some(salvo::http::StatusCode::OK));
+    let enroll_json: serde_json::Value = enroll.take_json().await.unwrap();
+    let sec_b32 = enroll_json["secret"].as_str().unwrap();
+    let step = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() / 30;
+    let code = totp_code_for_step(&base32_decode(sec_b32).unwrap(), step);
+
+    let verify = TestClient::post("http://127.0.0.1/_nexus/iam/mfa/totp/verify")
+        .add_header("Authorization", format!("Bearer {}", admin_tok), true)
+        .json(&serde_json::json!({ "org_id": contoso_id, "code": code }))
+        .send(&service)
+        .await;
+    assert_eq!(verify.status_code, Some(salvo::http::StatusCode::OK));
+
+    let mut audit_res = TestClient::get(format!("http://127.0.0.1/_nexus/iam/audit?org_id={}", contoso_id))
+        .add_header("Authorization", format!("Bearer {}", admin_tok), true)
+        .send(&service)
+        .await;
+    assert_eq!(audit_res.status_code, Some(salvo::http::StatusCode::OK));
+    let audit_json: serde_json::Value = audit_res.take_json().await.unwrap();
+    assert!(audit_json["events"].as_array().unwrap().len() >= 4);
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}

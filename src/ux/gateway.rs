@@ -830,6 +830,112 @@ impl UxGateway {
                             db: self.db.clone(),
                             garage: self.garage.clone(),
                         }),
+                )
+                // --- Nexus-IDP: Universal Identity-First, Hierarchical Org, OIDC/OAuth 2.1, Outpost ---
+                .push(Router::with_path("/.well-known/openid-configuration").get(OidcDiscoveryHandler))
+                .push(Router::with_path("/.well-known/jwks.json").get(OidcJwksHandler { db: self.db.clone() }))
+                .push(
+                    Router::with_path("/oauth/v2/authorize")
+                        .hoop(gate.clone())
+                        .hoop(crate::ux::iam::IamMiddleware::authenticated(self.db.clone()))
+                        .post(OAuthAuthorizeHandler { db: self.db.clone() }),
+                )
+                .push(
+                    Router::with_path("/oauth/v2/token")
+                        .hoop(gate.clone())
+                        .post(OAuthTokenHandler { db: self.db.clone() }),
+                )
+                .push(
+                    Router::with_path("/oauth/v2/revoke")
+                        .hoop(gate.clone())
+                        .post(OAuthRevokeHandler { db: self.db.clone() }),
+                )
+                .push(
+                    Router::with_path("/oauth/v2/introspect")
+                        .hoop(gate.clone())
+                        .post(OAuthIntrospectHandler { db: self.db.clone() }),
+                )
+                .push(
+                    Router::with_path("/oidc/v1/userinfo")
+                        .hoop(gate.clone())
+                        .get(OidcUserInfoHandler { db: self.db.clone() }),
+                )
+                .push(
+                    Router::with_path("/_nexus/outpost/auth")
+                        .hoop(gate.clone())
+                        .get(ForwardAuthOutpostHandler { db: self.db.clone() }),
+                )
+                .push(
+                    Router::with_path("/_nexus/iam/identities")
+                        .hoop(gate.clone())
+                        .hoop(crate::ux::iam::IamMiddleware::authenticated(self.db.clone()))
+                        .get(IamIdentitiesHandler { db: self.db.clone() })
+                        .post(IamIdentitiesHandler { db: self.db.clone() }),
+                )
+                .push(
+                    Router::with_path("/_nexus/iam/identities/import")
+                        .hoop(gate.clone())
+                        .hoop(crate::ux::iam::IamMiddleware::authenticated(self.db.clone()))
+                        .post(IamIdentityImportHandler { db: self.db.clone() }),
+                )
+                .push(
+                    Router::with_path("/_nexus/iam/orgs")
+                        .hoop(gate.clone())
+                        .hoop(crate::ux::iam::IamMiddleware::authenticated(self.db.clone()))
+                        .get(IamOrgsHandler { db: self.db.clone() })
+                        .post(IamOrgsHandler { db: self.db.clone() }),
+                )
+                .push(
+                    Router::with_path("/_nexus/iam/orgs/{org_id}")
+                        .hoop(gate.clone())
+                        .hoop(crate::ux::iam::IamMiddleware::authenticated(self.db.clone()))
+                        .get(IamOrgDetailHandler { db: self.db.clone() }),
+                )
+                .push(
+                    Router::with_path("/_nexus/iam/orgs/{org_id}/members")
+                        .hoop(gate.clone())
+                        .hoop(crate::ux::iam::IamMiddleware::authenticated(self.db.clone()))
+                        .get(IamOrgMembersHandler { db: self.db.clone() })
+                        .post(IamOrgMembersHandler { db: self.db.clone() })
+                        .delete(IamOrgMembersHandler { db: self.db.clone() }),
+                )
+                .push(
+                    Router::with_path("/_nexus/iam/orgs/{org_id}/policy")
+                        .hoop(gate.clone())
+                        .hoop(crate::ux::iam::IamMiddleware::authenticated(self.db.clone()))
+                        .get(IamOrgPolicyHandler { db: self.db.clone() })
+                        .put(IamOrgPolicyHandler { db: self.db.clone() }),
+                )
+                .push(
+                    Router::with_path("/_nexus/iam/evaluate")
+                        .hoop(gate.clone())
+                        .hoop(crate::ux::iam::IamMiddleware::authenticated(self.db.clone()))
+                        .post(IamEvaluateHandler { db: self.db.clone() }),
+                )
+                .push(
+                    Router::with_path("/_nexus/iam/clients")
+                        .hoop(gate.clone())
+                        .hoop(crate::ux::iam::IamMiddleware::admin(self.db.clone()))
+                        .get(IamClientsHandler { db: self.db.clone() })
+                        .post(IamClientsHandler { db: self.db.clone() }),
+                )
+                .push(
+                    Router::with_path("/_nexus/iam/audit")
+                        .hoop(gate.clone())
+                        .hoop(crate::ux::iam::IamMiddleware::admin(self.db.clone()))
+                        .get(IamAuditHandler { db: self.db.clone() }),
+                )
+                .push(
+                    Router::with_path("/_nexus/iam/mfa/totp/enroll")
+                        .hoop(gate.clone())
+                        .hoop(crate::ux::iam::IamMiddleware::authenticated(self.db.clone()))
+                        .post(IamTotpHandler { db: self.db.clone(), is_verify: false }),
+                )
+                .push(
+                    Router::with_path("/_nexus/iam/mfa/totp/verify")
+                        .hoop(gate.clone())
+                        .hoop(crate::ux::iam::IamMiddleware::authenticated(self.db.clone()))
+                        .post(IamTotpHandler { db: self.db.clone(), is_verify: true }),
                 );
         }
 
@@ -1684,6 +1790,928 @@ impl Handler for RegistryInstallHandler {
             Err(e) => {
                 res.status_code(StatusCode::BAD_REQUEST);
                 res.render(Json(serde_json::json!({ "error": e.to_string() })));
+            }
+        }
+    }
+}
+
+// =============================================================================
+// Nexus-IDP Gateway Handlers (OIDC, OAuth 2.1 PKCE, TOTP MFA, Orgs, Audit, Outpost)
+// =============================================================================
+
+#[derive(Clone)]
+struct OidcDiscoveryHandler;
+
+#[async_trait]
+impl Handler for OidcDiscoveryHandler {
+    async fn handle(&self, req: &mut Request, _depot: &mut Depot, res: &mut Response, _ctrl: &mut FlowCtrl) {
+        let host = req
+            .headers()
+            .get("host")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("127.0.0.1:8443");
+        let scheme = if req.headers().get("x-forwarded-proto").and_then(|v| v.to_str().ok()) == Some("https") {
+            "https"
+        } else {
+            "http"
+        };
+        let issuer = format!("{}://{}", scheme, host);
+        res.status_code(StatusCode::OK);
+        res.render(Json(serde_json::json!({
+            "issuer": issuer,
+            "authorization_endpoint": format!("{}/oauth/v2/authorize", issuer),
+            "token_endpoint": format!("{}/oauth/v2/token", issuer),
+            "userinfo_endpoint": format!("{}/oidc/v1/userinfo", issuer),
+            "revocation_endpoint": format!("{}/oauth/v2/revoke", issuer),
+            "introspection_endpoint": format!("{}/oauth/v2/introspect", issuer),
+            "jwks_uri": format!("{}/.well-known/jwks.json", issuer),
+            "response_types_supported": ["code"],
+            "grant_types_supported": ["authorization_code", "refresh_token", "client_credentials"],
+            "code_challenge_methods_supported": ["S256"],
+            "scopes_supported": ["openid", "profile", "email", "offline_access"],
+            "token_endpoint_auth_methods_supported": ["client_secret_post", "none"],
+            "id_token_signing_alg_values_supported": ["EdDSA"],
+        })));
+    }
+}
+
+#[derive(Clone)]
+struct OidcJwksHandler {
+    db: Arc<Database>,
+}
+
+#[async_trait]
+impl Handler for OidcJwksHandler {
+    async fn handle(&self, _req: &mut Request, _depot: &mut Depot, res: &mut Response, _ctrl: &mut FlowCtrl) {
+        let idp = crate::iam::idp::NexusIdp::new(self.db.clone());
+        match idp.jwks().await {
+            Ok(jwks) => {
+                res.status_code(StatusCode::OK);
+                res.render(Json(jwks));
+            }
+            Err(e) => {
+                res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+                res.render(Json(serde_json::json!({ "error": e.to_string() })));
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+struct OAuthAuthorizeHandler {
+    db: Arc<Database>,
+}
+
+#[async_trait]
+impl Handler for OAuthAuthorizeHandler {
+    async fn handle(&self, req: &mut Request, depot: &mut Depot, res: &mut Response, _ctrl: &mut FlowCtrl) {
+        #[derive(serde::Deserialize)]
+        struct AuthzReq {
+            client_id: String,
+            redirect_uri: String,
+            #[serde(default = "default_oidc_scope")]
+            scope: String,
+            code_challenge: String,
+            #[serde(default = "default_s256")]
+            code_challenge_method: String,
+            #[serde(default)]
+            nonce: Option<String>,
+            #[serde(default)]
+            state: Option<String>,
+        }
+        fn default_oidc_scope() -> String { "openid profile".into() }
+        fn default_s256() -> String { "S256".into() }
+
+        let Ok(body) = req.parse_json::<AuthzReq>().await else {
+            res.status_code(StatusCode::BAD_REQUEST);
+            res.render(Json(serde_json::json!({ "error": "invalid_request" })));
+            return;
+        };
+        let auth = crate::ux::iam::depot_auth_context(depot);
+        let subject = auth
+            .as_ref()
+            .and_then(|a| a.actor.clone())
+            .unwrap_or_else(|| "anonymous".into());
+        let roles: Vec<String> = auth
+            .as_ref()
+            .map(|a| a.roles.iter().map(|r| format!("{:?}", r)).collect())
+            .unwrap_or_default();
+
+        let idp = crate::iam::idp::NexusIdp::new(self.db.clone());
+        match idp
+            .issue_authorization_code(
+                &body.client_id,
+                &body.redirect_uri,
+                &body.scope,
+                &body.code_challenge,
+                &body.code_challenge_method,
+                body.nonce,
+                &subject,
+                roles,
+            )
+            .await
+        {
+            Ok(code) => {
+                res.status_code(StatusCode::OK);
+                res.render(Json(serde_json::json!({
+                    "code": code,
+                    "state": body.state,
+                    "redirect_uri": body.redirect_uri,
+                })));
+            }
+            Err(e) => {
+                res.status_code(StatusCode::BAD_REQUEST);
+                res.render(Json(serde_json::json!({ "error": "invalid_request", "error_description": e.to_string() })));
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+struct OAuthTokenHandler {
+    db: Arc<Database>,
+}
+
+#[async_trait]
+impl Handler for OAuthTokenHandler {
+    async fn handle(&self, req: &mut Request, _depot: &mut Depot, res: &mut Response, _ctrl: &mut FlowCtrl) {
+        #[derive(serde::Deserialize)]
+        struct TokenReq {
+            grant_type: String,
+            client_id: String,
+            #[serde(default)]
+            client_secret: Option<String>,
+            #[serde(default)]
+            code: Option<String>,
+            #[serde(default)]
+            redirect_uri: Option<String>,
+            #[serde(default)]
+            code_verifier: Option<String>,
+            #[serde(default)]
+            refresh_token: Option<String>,
+            #[serde(default)]
+            scope: Option<String>,
+        }
+        let Ok(body) = req.parse_json::<TokenReq>().await else {
+            res.status_code(StatusCode::BAD_REQUEST);
+            res.render(Json(serde_json::json!({ "error": "invalid_request" })));
+            return;
+        };
+        let idp = crate::iam::idp::NexusIdp::new(self.db.clone());
+        match idp
+            .exchange_token(
+                &body.grant_type,
+                &body.client_id,
+                body.client_secret.as_deref(),
+                body.code.as_deref(),
+                body.redirect_uri.as_deref(),
+                body.code_verifier.as_deref(),
+                body.refresh_token.as_deref(),
+                body.scope.as_deref(),
+            )
+            .await
+        {
+            Ok(tok) => {
+                res.status_code(StatusCode::OK);
+                res.render(Json(tok));
+            }
+            Err(e) => {
+                res.status_code(StatusCode::BAD_REQUEST);
+                res.render(Json(serde_json::json!({ "error": "invalid_grant", "error_description": e.to_string() })));
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+struct OAuthRevokeHandler {
+    db: Arc<Database>,
+}
+
+#[async_trait]
+impl Handler for OAuthRevokeHandler {
+    async fn handle(&self, req: &mut Request, _depot: &mut Depot, res: &mut Response, _ctrl: &mut FlowCtrl) {
+        #[derive(serde::Deserialize)]
+        struct RevokeReq { token: String }
+        let Ok(body) = req.parse_json::<RevokeReq>().await else {
+            res.status_code(StatusCode::BAD_REQUEST);
+            return;
+        };
+        let idp = crate::iam::idp::NexusIdp::new(self.db.clone());
+        let revoked = idp.revoke_token(&body.token).await.unwrap_or(false);
+        res.status_code(StatusCode::OK);
+        res.render(Json(serde_json::json!({ "revoked": revoked })));
+    }
+}
+
+#[derive(Clone)]
+struct OAuthIntrospectHandler {
+    db: Arc<Database>,
+}
+
+#[async_trait]
+impl Handler for OAuthIntrospectHandler {
+    async fn handle(&self, req: &mut Request, _depot: &mut Depot, res: &mut Response, _ctrl: &mut FlowCtrl) {
+        #[derive(serde::Deserialize)]
+        struct IntroReq { token: String }
+        let Ok(body) = req.parse_json::<IntroReq>().await else {
+            res.status_code(StatusCode::BAD_REQUEST);
+            return;
+        };
+        let idp = crate::iam::idp::NexusIdp::new(self.db.clone());
+        match idp.introspect_token(&body.token).await {
+            Ok(Some(rec)) => {
+                res.status_code(StatusCode::OK);
+                res.render(Json(serde_json::json!({
+                    "active": true,
+                    "sub": rec.subject,
+                    "org_id": rec.org_id,
+                    "client_id": rec.client_id,
+                    "scope": rec.scope,
+                    "roles": rec.roles,
+                    "exp": rec.expires_at_ms / 1000,
+                })));
+            }
+            _ => {
+                res.status_code(StatusCode::OK);
+                res.render(Json(serde_json::json!({ "active": false })));
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+struct OidcUserInfoHandler {
+    db: Arc<Database>,
+}
+
+#[async_trait]
+impl Handler for OidcUserInfoHandler {
+    async fn handle(&self, req: &mut Request, _depot: &mut Depot, res: &mut Response, _ctrl: &mut FlowCtrl) {
+        let Some(token) = req
+            .headers()
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.strip_prefix("Bearer "))
+        else {
+            res.status_code(StatusCode::UNAUTHORIZED);
+            return;
+        };
+        let idp = crate::iam::idp::NexusIdp::new(self.db.clone());
+        match idp.introspect_token(token.trim()).await {
+            Ok(Some(rec)) => {
+                res.status_code(StatusCode::OK);
+                res.render(Json(serde_json::json!({
+                    "sub": rec.subject,
+                    "org_id": rec.org_id,
+                    "roles": rec.roles,
+                    "scope": rec.scope,
+                })));
+            }
+            _ => {
+                res.status_code(StatusCode::UNAUTHORIZED);
+            }
+        }
+    }
+}
+
+/// Authentik-style Forward-Auth Proxy Outpost (`GET /_nexus/outpost/auth`).
+/// Validates either an OAuth 2.1 Bearer access token or standard Nexus-DB IAM session,
+/// returning `200 OK` with `X-Nexus-User`, `X-Nexus-Org`, and `X-Nexus-Roles` headers (or `401`).
+#[derive(Clone)]
+struct ForwardAuthOutpostHandler {
+    db: Arc<Database>,
+}
+
+#[async_trait]
+impl Handler for ForwardAuthOutpostHandler {
+    async fn handle(&self, req: &mut Request, _depot: &mut Depot, res: &mut Response, _ctrl: &mut FlowCtrl) {
+        if let Some(bearer) = req
+            .headers()
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.strip_prefix("Bearer "))
+        {
+            let idp = crate::iam::idp::NexusIdp::new(self.db.clone());
+            if let Ok(Some(rec)) = idp.introspect_token(bearer.trim()).await {
+                res.status_code(StatusCode::OK);
+                if let Ok(hv) = salvo::http::header::HeaderValue::from_str(&rec.subject) {
+                    res.headers_mut().insert("x-nexus-user", hv);
+                }
+                if let Ok(hv) = salvo::http::header::HeaderValue::from_str(&rec.org_id) {
+                    res.headers_mut().insert("x-nexus-org", hv);
+                }
+                if let Ok(hv) = salvo::http::header::HeaderValue::from_str(&rec.roles.join(",")) {
+                    res.headers_mut().insert("x-nexus-roles", hv);
+                }
+                res.render(Json(serde_json::json!({
+                    "authenticated": true,
+                    "sub": rec.subject,
+                    "org_id": rec.org_id,
+                    "roles": rec.roles,
+                })));
+                return;
+            }
+        }
+
+        let (ns, db_name) = crate::ux::surreal_http::extract_ns_db(req);
+        if let Ok(Some(ctx)) = crate::ux::surreal_http::resolve_http_auth(req, &self.db, &ns, &db_name) {
+            let user = ctx.actor.unwrap_or_else(|| "authenticated".into());
+            let roles_str = ctx.roles.iter().map(|r| format!("{:?}", r)).collect::<Vec<_>>().join(",");
+            res.status_code(StatusCode::OK);
+            if let Ok(hv) = salvo::http::header::HeaderValue::from_str(&user) {
+                res.headers_mut().insert("x-nexus-user", hv);
+            }
+            res.headers_mut().insert("x-nexus-org", salvo::http::header::HeaderValue::from_static("default"));
+            if let Ok(hv) = salvo::http::header::HeaderValue::from_str(&roles_str) {
+                res.headers_mut().insert("x-nexus-roles", hv);
+            }
+            res.render(Json(serde_json::json!({ "authenticated": true, "sub": user, "org_id": "default" })));
+            return;
+        }
+
+        res.status_code(StatusCode::UNAUTHORIZED);
+        res.render(Json(serde_json::json!({ "authenticated": false })));
+    }
+}
+
+#[derive(Clone)]
+struct IamIdentitiesHandler {
+    db: Arc<Database>,
+}
+
+#[async_trait]
+impl Handler for IamIdentitiesHandler {
+    async fn handle(&self, req: &mut Request, _depot: &mut Depot, res: &mut Response, _ctrl: &mut FlowCtrl) {
+        let idp = crate::iam::idp::NexusIdp::new(self.db.clone());
+        match *req.method() {
+            salvo::http::Method::GET => match idp.list_identities().await {
+                Ok(identities) => {
+                    res.status_code(StatusCode::OK);
+                    res.render(Json(serde_json::json!({ "identities": identities })));
+                }
+                Err(e) => {
+                    res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+                    res.render(Json(serde_json::json!({ "error": e.to_string() })));
+                }
+            },
+            salvo::http::Method::POST => {
+                #[derive(serde::Deserialize)]
+                struct CreateIdentReq {
+                    display_name: String,
+                    #[serde(default)]
+                    primary_email: Option<String>,
+                }
+                let Ok(body) = req.parse_json::<CreateIdentReq>().await else {
+                    res.status_code(StatusCode::BAD_REQUEST);
+                    return;
+                };
+                match idp.create_identity(&body.display_name, body.primary_email).await {
+                    Ok((identity, root_secret)) => {
+                        res.status_code(StatusCode::CREATED);
+                        res.render(Json(serde_json::json!({
+                            "identity": identity,
+                            "root_secret": root_secret,
+                        })));
+                    }
+                    Err(e) => {
+                        res.status_code(StatusCode::BAD_REQUEST);
+                        res.render(Json(serde_json::json!({ "error": e.to_string() })));
+                    }
+                }
+            }
+            _ => { res.status_code(StatusCode::METHOD_NOT_ALLOWED); }
+        }
+    }
+}
+
+#[derive(Clone)]
+struct IamIdentityImportHandler {
+    db: Arc<Database>,
+}
+
+#[async_trait]
+impl Handler for IamIdentityImportHandler {
+    async fn handle(&self, req: &mut Request, _depot: &mut Depot, res: &mut Response, _ctrl: &mut FlowCtrl) {
+        let Ok(pkg) = req.parse_json::<crate::iam::idp::PortableIdentityPackage>().await else {
+            res.status_code(StatusCode::BAD_REQUEST);
+            return;
+        };
+        let idp = crate::iam::idp::NexusIdp::new(self.db.clone());
+        match idp.import_portable_identity(&pkg).await {
+            Ok(identity) => {
+                res.status_code(StatusCode::CREATED);
+                res.render(Json(identity));
+            }
+            Err(e) => {
+                res.status_code(StatusCode::BAD_REQUEST);
+                res.render(Json(serde_json::json!({ "error": e.to_string() })));
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+struct IamOrgsHandler {
+    db: Arc<Database>,
+}
+
+#[async_trait]
+impl Handler for IamOrgsHandler {
+    async fn handle(&self, req: &mut Request, depot: &mut Depot, res: &mut Response, _ctrl: &mut FlowCtrl) {
+        let idp = crate::iam::idp::NexusIdp::new(self.db.clone());
+        let auth = crate::ux::iam::depot_auth_context(depot);
+        let actor = auth
+            .as_ref()
+            .and_then(|a| a.actor.clone())
+            .unwrap_or_else(|| "anonymous".into());
+        let is_platform_admin = auth
+            .as_ref()
+            .map(|a| a.roles.contains(&nexus_db::auth::Role::Owner))
+            .unwrap_or(false);
+
+        match *req.method() {
+            salvo::http::Method::GET => {
+                match idp.list_authorized_orgs(&actor, is_platform_admin).await {
+                    Ok(orgs) => {
+                        res.status_code(StatusCode::OK);
+                        res.render(Json(serde_json::json!({ "orgs": orgs })));
+                    }
+                    Err(e) => {
+                        res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+                        res.render(Json(serde_json::json!({ "error": e.to_string() })));
+                    }
+                }
+            }
+            salvo::http::Method::POST => {
+                #[derive(serde::Deserialize)]
+                struct CreateOrgReq {
+                    slug: String,
+                    name: String,
+                    #[serde(default)]
+                    parent_org_id: Option<String>,
+                    #[serde(default)]
+                    primary_domain: Option<String>,
+                    #[serde(default)]
+                    local_policy: crate::iam::idp::OrgPolicyPatch,
+                }
+                let Ok(body) = req.parse_json::<CreateOrgReq>().await else {
+                    res.status_code(StatusCode::BAD_REQUEST);
+                    return;
+                };
+                if let Some(ref parent_id) = body.parent_org_id {
+                    let dec = idp
+                        .evaluate_permission(&actor, is_platform_admin, parent_id, "iam.org.create_child")
+                        .await;
+                    if !matches!(dec, Ok(d) if d.allowed) {
+                        res.status_code(StatusCode::FORBIDDEN);
+                        res.render(Json(serde_json::json!({ "error": "Insufficient permission to create child organization" })));
+                        return;
+                    }
+                } else if !is_platform_admin {
+                    res.status_code(StatusCode::FORBIDDEN);
+                    res.render(Json(serde_json::json!({ "error": "Platform Administrator authority required to create root organization" })));
+                    return;
+                }
+                match idp
+                    .create_org(
+                        &actor,
+                        &body.slug,
+                        &body.name,
+                        body.parent_org_id,
+                        body.primary_domain,
+                        body.local_policy,
+                    )
+                    .await
+                {
+                    Ok(org) => {
+                        res.status_code(StatusCode::CREATED);
+                        res.render(Json(org));
+                    }
+                    Err(e) => {
+                        res.status_code(StatusCode::BAD_REQUEST);
+                        res.render(Json(serde_json::json!({ "error": e.to_string() })));
+                    }
+                }
+            }
+            _ => { res.status_code(StatusCode::METHOD_NOT_ALLOWED); }
+        }
+    }
+}
+
+#[derive(Clone)]
+struct IamOrgDetailHandler {
+    db: Arc<Database>,
+}
+
+#[async_trait]
+impl Handler for IamOrgDetailHandler {
+    async fn handle(&self, req: &mut Request, depot: &mut Depot, res: &mut Response, _ctrl: &mut FlowCtrl) {
+        let org_id = req.param::<String>("org_id").unwrap_or_default();
+        let idp = crate::iam::idp::NexusIdp::new(self.db.clone());
+        let auth = crate::ux::iam::depot_auth_context(depot);
+        let actor = auth.as_ref().and_then(|a| a.actor.clone()).unwrap_or_default();
+        let is_platform_admin = auth
+            .as_ref()
+            .map(|a| a.roles.contains(&nexus_db::auth::Role::Owner))
+            .unwrap_or(false);
+        let dec = idp.evaluate_permission(&actor, is_platform_admin, &org_id, "iam.org.read").await;
+        if !matches!(dec, Ok(d) if d.allowed) {
+            res.status_code(StatusCode::FORBIDDEN);
+            res.render(Json(serde_json::json!({ "error": "Forbidden" })));
+            return;
+        }
+        match idp.get_org(&org_id).await {
+            Ok(Some(org)) => {
+                let policy = idp.resolve_org_policy(&org_id).await.ok();
+                let members = idp.list_memberships_for_org(&org_id).await.unwrap_or_default();
+                let all_auth = idp.list_authorized_orgs(&actor, is_platform_admin).await.unwrap_or_default();
+                let children: Vec<_> = all_auth
+                    .into_iter()
+                    .filter(|o| o.parent_org_id.as_deref() == Some(&org_id))
+                    .collect();
+                res.status_code(StatusCode::OK);
+                res.render(Json(serde_json::json!({
+                    "organization": org,
+                    "composed_policy": policy,
+                    "children": children,
+                    "members": members,
+                })));
+            }
+            Ok(None) => {
+                res.status_code(StatusCode::NOT_FOUND);
+            }
+            Err(e) => {
+                res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+                res.render(Json(serde_json::json!({ "error": e.to_string() })));
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+struct IamOrgMembersHandler {
+    db: Arc<Database>,
+}
+
+#[async_trait]
+impl Handler for IamOrgMembersHandler {
+    async fn handle(&self, req: &mut Request, depot: &mut Depot, res: &mut Response, _ctrl: &mut FlowCtrl) {
+        let org_id = req.param::<String>("org_id").unwrap_or_default();
+        let idp = crate::iam::idp::NexusIdp::new(self.db.clone());
+        let auth = crate::ux::iam::depot_auth_context(depot);
+        let actor = auth.as_ref().and_then(|a| a.actor.clone()).unwrap_or_default();
+        let is_platform_admin = auth
+            .as_ref()
+            .map(|a| a.roles.contains(&nexus_db::auth::Role::Owner))
+            .unwrap_or(false);
+        let needed = if *req.method() == salvo::http::Method::GET {
+            "iam.users.read"
+        } else {
+            "iam.users.manage"
+        };
+        if !matches!(idp.evaluate_permission(&actor, is_platform_admin, &org_id, needed).await, Ok(d) if d.allowed) {
+            res.status_code(StatusCode::FORBIDDEN);
+            res.render(Json(serde_json::json!({ "error": "Forbidden" })));
+            return;
+        }
+        match *req.method() {
+            salvo::http::Method::GET => match idp.list_memberships_for_org(&org_id).await {
+                Ok(members) => {
+                    res.status_code(StatusCode::OK);
+                    res.render(Json(serde_json::json!({ "members": members })));
+                }
+                Err(e) => {
+                    res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+                    res.render(Json(serde_json::json!({ "error": e.to_string() })));
+                }
+            },
+            salvo::http::Method::POST => {
+                #[derive(serde::Deserialize)]
+                struct GrantMemberReq {
+                    subject_id: String,
+                    #[serde(default)]
+                    role_assignments: Vec<String>,
+                    #[serde(default)]
+                    direct_permissions: Vec<String>,
+                    #[serde(default)]
+                    scope: crate::iam::idp::DelegationScope,
+                    #[serde(default)]
+                    expires_at_ms: Option<u64>,
+                }
+                let Ok(body) = req.parse_json::<GrantMemberReq>().await else {
+                    res.status_code(StatusCode::BAD_REQUEST);
+                    return;
+                };
+                match idp
+                    .grant_membership(
+                        &actor,
+                        &org_id,
+                        &body.subject_id,
+                        body.role_assignments,
+                        body.direct_permissions,
+                        body.scope,
+                        body.expires_at_ms,
+                    )
+                    .await
+                {
+                    Ok(mem) => {
+                        res.status_code(StatusCode::CREATED);
+                        res.render(Json(mem));
+                    }
+                    Err(e) => {
+                        res.status_code(StatusCode::BAD_REQUEST);
+                        res.render(Json(serde_json::json!({ "error": e.to_string() })));
+                    }
+                }
+            }
+            salvo::http::Method::DELETE => {
+                let subject_id = req.query::<String>("subject_id").unwrap_or_default();
+                if subject_id.is_empty() {
+                    res.status_code(StatusCode::BAD_REQUEST);
+                    return;
+                }
+                match idp.revoke_membership(&actor, &org_id, &subject_id).await {
+                    Ok(revoked) => {
+                        res.status_code(StatusCode::OK);
+                        res.render(Json(serde_json::json!({ "revoked": revoked })));
+                    }
+                    Err(e) => {
+                        res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+                        res.render(Json(serde_json::json!({ "error": e.to_string() })));
+                    }
+                }
+            }
+            _ => { res.status_code(StatusCode::METHOD_NOT_ALLOWED); }
+        }
+    }
+}
+
+#[derive(Clone)]
+struct IamOrgPolicyHandler {
+    db: Arc<Database>,
+}
+
+#[async_trait]
+impl Handler for IamOrgPolicyHandler {
+    async fn handle(&self, req: &mut Request, depot: &mut Depot, res: &mut Response, _ctrl: &mut FlowCtrl) {
+        let org_id = req.param::<String>("org_id").unwrap_or_default();
+        let idp = crate::iam::idp::NexusIdp::new(self.db.clone());
+        let auth = crate::ux::iam::depot_auth_context(depot);
+        let actor = auth.as_ref().and_then(|a| a.actor.clone()).unwrap_or_default();
+        let is_platform_admin = auth
+            .as_ref()
+            .map(|a| a.roles.contains(&nexus_db::auth::Role::Owner))
+            .unwrap_or(false);
+        let needed = if *req.method() == salvo::http::Method::GET {
+            "iam.policy.read"
+        } else {
+            "iam.policy.update"
+        };
+        if !matches!(idp.evaluate_permission(&actor, is_platform_admin, &org_id, needed).await, Ok(d) if d.allowed) {
+            res.status_code(StatusCode::FORBIDDEN);
+            res.render(Json(serde_json::json!({ "error": "Forbidden" })));
+            return;
+        }
+        match *req.method() {
+            salvo::http::Method::GET => match idp.resolve_org_policy(&org_id).await {
+                Ok(pol) => {
+                    res.status_code(StatusCode::OK);
+                    res.render(Json(pol));
+                }
+                Err(e) => {
+                    res.status_code(StatusCode::NOT_FOUND);
+                    res.render(Json(serde_json::json!({ "error": e.to_string() })));
+                }
+            },
+            salvo::http::Method::PUT => {
+                let Ok(patch) = req.parse_json::<crate::iam::idp::OrgPolicyPatch>().await else {
+                    res.status_code(StatusCode::BAD_REQUEST);
+                    return;
+                };
+                match idp.update_org_policy(&actor, &org_id, patch).await {
+                    Ok(_) => match idp.resolve_org_policy(&org_id).await {
+                        Ok(pol) => {
+                            res.status_code(StatusCode::OK);
+                            res.render(Json(pol));
+                        }
+                        Err(e) => {
+                            res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+                            res.render(Json(serde_json::json!({ "error": e.to_string() })));
+                        }
+                    },
+                    Err(e) => {
+                        res.status_code(StatusCode::BAD_REQUEST);
+                        res.render(Json(serde_json::json!({ "error": e.to_string() })));
+                    }
+                }
+            }
+            _ => { res.status_code(StatusCode::METHOD_NOT_ALLOWED); }
+        }
+    }
+}
+
+#[derive(Clone)]
+struct IamEvaluateHandler {
+    db: Arc<Database>,
+}
+
+#[async_trait]
+impl Handler for IamEvaluateHandler {
+    async fn handle(&self, req: &mut Request, depot: &mut Depot, res: &mut Response, _ctrl: &mut FlowCtrl) {
+        #[derive(serde::Deserialize)]
+        struct EvalReq {
+            #[serde(default)]
+            subject_id: Option<String>,
+            org_id: String,
+            action: String,
+        }
+        let Ok(body) = req.parse_json::<EvalReq>().await else {
+            res.status_code(StatusCode::BAD_REQUEST);
+            return;
+        };
+        let auth = crate::ux::iam::depot_auth_context(depot);
+        let caller = auth.as_ref().and_then(|a| a.actor.clone()).unwrap_or_default();
+        let is_platform_admin = auth
+            .as_ref()
+            .map(|a| a.roles.contains(&nexus_db::auth::Role::Owner))
+            .unwrap_or(false);
+        let subject = if is_platform_admin {
+            body.subject_id.unwrap_or(caller)
+        } else {
+            caller
+        };
+        let eval_platform_admin = is_platform_admin && subject == auth.as_ref().and_then(|a| a.actor.clone()).unwrap_or_default();
+        let idp = crate::iam::idp::NexusIdp::new(self.db.clone());
+        match idp
+            .evaluate_permission(&subject, eval_platform_admin, &body.org_id, &body.action)
+            .await
+        {
+            Ok(dec) => {
+                res.status_code(StatusCode::OK);
+                res.render(Json(dec));
+            }
+            Err(e) => {
+                res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+                res.render(Json(serde_json::json!({ "error": e.to_string() })));
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+struct IamClientsHandler {
+    db: Arc<Database>,
+}
+
+#[async_trait]
+impl Handler for IamClientsHandler {
+    async fn handle(&self, req: &mut Request, depot: &mut Depot, res: &mut Response, _ctrl: &mut FlowCtrl) {
+        let idp = crate::iam::idp::NexusIdp::new(self.db.clone());
+        match *req.method() {
+            salvo::http::Method::GET => {
+                let org_id = req.query::<String>("org_id");
+                match idp.list_oidc_clients(org_id.as_deref()).await {
+                    Ok(clients) => {
+                        res.status_code(StatusCode::OK);
+                        res.render(Json(serde_json::json!({ "clients": clients })));
+                    }
+                    Err(e) => {
+                        res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+                        res.render(Json(serde_json::json!({ "error": e.to_string() })));
+                    }
+                }
+            }
+            salvo::http::Method::POST => {
+                #[derive(serde::Deserialize)]
+                struct CreateClientReq {
+                    #[serde(default = "default_org")]
+                    org_id: String,
+                    name: String,
+                    #[serde(default)]
+                    client_type: Option<crate::iam::idp::OidcClientType>,
+                    #[serde(default)]
+                    redirect_uris: Vec<String>,
+                    #[serde(default)]
+                    grant_types: Vec<String>,
+                    #[serde(default)]
+                    scopes: Vec<String>,
+                }
+                fn default_org() -> String { "default".into() }
+                let Ok(body) = req.parse_json::<CreateClientReq>().await else {
+                    res.status_code(StatusCode::BAD_REQUEST);
+                    return;
+                };
+                let actor = crate::ux::iam::depot_auth_context(depot)
+                    .and_then(|a| a.actor)
+                    .unwrap_or_else(|| "owner".into());
+                match idp
+                    .create_oidc_client(
+                        &actor,
+                        &body.org_id,
+                        &body.name,
+                        body.client_type.unwrap_or(crate::iam::idp::OidcClientType::Public),
+                        body.redirect_uris,
+                        body.grant_types,
+                        body.scopes,
+                    )
+                    .await
+                {
+                    Ok((client, secret)) => {
+                        res.status_code(StatusCode::CREATED);
+                        res.render(Json(serde_json::json!({
+                            "client": client,
+                            "client_secret": secret,
+                        })));
+                    }
+                    Err(e) => {
+                        res.status_code(StatusCode::BAD_REQUEST);
+                        res.render(Json(serde_json::json!({ "error": e.to_string() })));
+                    }
+                }
+            }
+            _ => { res.status_code(StatusCode::METHOD_NOT_ALLOWED); }
+        }
+    }
+}
+
+#[derive(Clone)]
+struct IamAuditHandler {
+    db: Arc<Database>,
+}
+
+#[async_trait]
+impl Handler for IamAuditHandler {
+    async fn handle(&self, req: &mut Request, _depot: &mut Depot, res: &mut Response, _ctrl: &mut FlowCtrl) {
+        let idp = crate::iam::idp::NexusIdp::new(self.db.clone());
+        let org_id = req.query::<String>("org_id");
+        let limit = req.query::<usize>("limit").unwrap_or(100);
+        match idp.list_audit_events(org_id.as_deref(), limit).await {
+            Ok(events) => {
+                res.status_code(StatusCode::OK);
+                res.render(Json(serde_json::json!({ "events": events })));
+            }
+            Err(e) => {
+                res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+                res.render(Json(serde_json::json!({ "error": e.to_string() })));
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+struct IamTotpHandler {
+    db: Arc<Database>,
+    is_verify: bool,
+}
+
+#[async_trait]
+impl Handler for IamTotpHandler {
+    async fn handle(&self, req: &mut Request, depot: &mut Depot, res: &mut Response, _ctrl: &mut FlowCtrl) {
+        let auth = crate::ux::iam::depot_auth_context(depot);
+        let subject = auth
+            .as_ref()
+            .and_then(|a| a.actor.clone())
+            .unwrap_or_else(|| "owner".into());
+        let idp = crate::iam::idp::NexusIdp::new(self.db.clone());
+
+        if !self.is_verify {
+            let org_id = req.query::<String>("org_id").unwrap_or_else(|| "default".into());
+            match idp.enroll_totp(&org_id, &subject).await {
+                Ok((secret, uri, recovery_codes)) => {
+                    res.status_code(StatusCode::OK);
+                    res.render(Json(serde_json::json!({
+                        "secret": secret,
+                        "otpauth_uri": uri,
+                        "recovery_codes": recovery_codes,
+                    })));
+                }
+                Err(e) => {
+                    res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+                    res.render(Json(serde_json::json!({ "error": e.to_string() })));
+                }
+            }
+        } else {
+            #[derive(serde::Deserialize)]
+            struct VerifyReq {
+                #[serde(default = "default_org")]
+                org_id: String,
+                code: String,
+            }
+            fn default_org() -> String { "default".into() }
+            let Ok(body) = req.parse_json::<VerifyReq>().await else {
+                res.status_code(StatusCode::BAD_REQUEST);
+                return;
+            };
+            match idp.verify_totp(&body.org_id, &subject, &body.code).await {
+                Ok(valid) => {
+                    res.status_code(if valid { StatusCode::OK } else { StatusCode::UNAUTHORIZED });
+                    res.render(Json(serde_json::json!({ "valid": valid })));
+                }
+                Err(e) => {
+                    res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+                    res.render(Json(serde_json::json!({ "error": e.to_string() })));
+                }
             }
         }
     }

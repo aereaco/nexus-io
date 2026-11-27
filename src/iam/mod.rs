@@ -1,4 +1,5 @@
 pub mod capabilities;
+pub mod idp;
 pub mod kernel;
 
 #[cfg(feature = "ops-shell")]

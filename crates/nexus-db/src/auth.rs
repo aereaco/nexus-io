@@ -848,3 +848,105 @@ pub fn authenticate_token(
     }
     Err(anyhow!("Authentication failed: invalid or expired JWT"))
 }
+
+// =============================================================================
+// Standard Asymmetric Cryptography Helpers (Ed25519 + RFC 8037 EdDSA JWT/JWKS)
+// =============================================================================
+
+/// Generate a fresh Ed25519 keypair from OS CSPRNG entropy.
+/// Returns `(secret_seed_b64url, public_key_b64url)`.
+pub fn ed25519_generate_keypair() -> (String, String) {
+    use ed25519_dalek::SigningKey;
+    let mut seed = [0u8; 32];
+    seed[..16].copy_from_slice(Uuid::new_v4().as_bytes());
+    seed[16..].copy_from_slice(Uuid::new_v4().as_bytes());
+    let sk = SigningKey::from_bytes(&seed);
+    let pk = sk.verifying_key();
+    (
+        URL_SAFE_NO_PAD.encode(sk.to_bytes()),
+        URL_SAFE_NO_PAD.encode(pk.to_bytes()),
+    )
+}
+
+/// Sign arbitrary bytes with an Ed25519 secret seed (base64url-encoded 32 bytes).
+pub fn ed25519_sign(secret_b64url: &str, message: &[u8]) -> Result<String> {
+    use ed25519_dalek::{Signer, SigningKey};
+    let raw = URL_SAFE_NO_PAD
+        .decode(secret_b64url)
+        .map_err(|e| anyhow!("Invalid Ed25519 secret encoding: {}", e))?;
+    let seed: [u8; 32] = raw
+        .try_into()
+        .map_err(|_| anyhow!("Ed25519 secret must be 32 bytes"))?;
+    let sk = SigningKey::from_bytes(&seed);
+    let sig = sk.sign(message);
+    Ok(URL_SAFE_NO_PAD.encode(sig.to_bytes()))
+}
+
+/// Verify an Ed25519 signature (base64url-encoded 64 bytes) against a base64url-encoded 32-byte public key.
+pub fn ed25519_verify(public_b64url: &str, message: &[u8], sig_b64url: &str) -> bool {
+    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+    let Ok(pk_raw) = URL_SAFE_NO_PAD.decode(public_b64url) else {
+        return false;
+    };
+    let Ok(pk_arr): Result<[u8; 32], _> = pk_raw.try_into() else {
+        return false;
+    };
+    let Ok(vk) = VerifyingKey::from_bytes(&pk_arr) else {
+        return false;
+    };
+    let Ok(sig_raw) = URL_SAFE_NO_PAD.decode(sig_b64url) else {
+        return false;
+    };
+    let Ok(sig_arr): Result<[u8; 64], _> = sig_raw.try_into() else {
+        return false;
+    };
+    let sig = Signature::from_bytes(&sig_arr);
+    vk.verify(message, &sig).is_ok()
+}
+
+/// Sign an RFC 8037 `EdDSA` JWT (`alg: "EdDSA"`, `typ: "JWT"`, `kid`).
+pub fn sign_eddsa_jwt(
+    kid: &str,
+    secret_b64url: &str,
+    claims: &serde_json::Value,
+) -> Result<String> {
+    let header = serde_json::json!({
+        "alg": "EdDSA",
+        "typ": "JWT",
+        "kid": kid,
+    });
+    let h_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header)?);
+    let p_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(claims)?);
+    let signing_input = format!("{}.{}", h_b64, p_b64);
+    let sig_b64 = ed25519_sign(secret_b64url, signing_input.as_bytes())?;
+    Ok(format!("{}.{}", signing_input, sig_b64))
+}
+
+/// Verify an RFC 8037 `EdDSA` JWT signature and return the parsed JSON claims payload.
+pub fn verify_eddsa_jwt_json(token: &str, public_b64url: &str) -> Result<serde_json::Value> {
+    let parts: Vec<&str> = token.split('.').collect();
+    if parts.len() != 3 {
+        return Err(anyhow!("Malformed JWT"));
+    }
+    let signing_input = format!("{}.{}", parts[0], parts[1]);
+    if !ed25519_verify(public_b64url, signing_input.as_bytes(), parts[2]) {
+        return Err(anyhow!("Invalid EdDSA JWT signature"));
+    }
+    let payload_bytes = URL_SAFE_NO_PAD
+        .decode(parts[1])
+        .map_err(|e| anyhow!("Invalid JWT payload encoding: {}", e))?;
+    let claims: serde_json::Value = serde_json::from_slice(&payload_bytes)?;
+    Ok(claims)
+}
+
+/// Format an Ed25519 public key as a standard RFC 8037 JWK (`kty: "OKP"`, `crv: "Ed25519"`).
+pub fn ed25519_jwk(kid: &str, public_b64url: &str) -> serde_json::Value {
+    serde_json::json!({
+        "kty": "OKP",
+        "crv": "Ed25519",
+        "alg": "EdDSA",
+        "use": "sig",
+        "kid": kid,
+        "x": public_b64url,
+    })
+}
