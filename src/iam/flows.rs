@@ -214,6 +214,9 @@ pub struct StageSubmission {
     /// Optional verified federated subject/provider assertion (Phase 2C).
     #[serde(default)]
     pub federated_subject: Option<String>,
+    /// Optional W3C WebAuthn assertion response (Phase 2B).
+    #[serde(default)]
+    pub webauthn_response: Option<crate::iam::webauthn::AuthenticationResponse>,
 }
 
 /// Identity-controlled Argon2id password credential record (`sys_iam_credential`).
@@ -590,7 +593,26 @@ impl AuthFlowEngine {
                 }
             }
             AuthStageKind::WebAuthnAssert => {
-                Err(anyhow!("WebAuthn ceremony requires Phase 2B WebAuthn verifier"))
+                let wa_resp = sub
+                    .webauthn_response
+                    .ok_or_else(|| anyhow!("webauthn_response is required for WebAuthnAssert stage"))?;
+                let svc = crate::iam::webauthn::WebAuthnService::new(self.db.clone());
+                let res = svc.finish_authentication(wa_resp).await?;
+                if let Some(ref existing_id) = exec.identity_id {
+                    if existing_id != &res.identity_id {
+                        anyhow::bail!("WebAuthn credential identity mismatch");
+                    }
+                } else {
+                    exec.identity_id = Some(res.identity_id.clone());
+                }
+                if !exec.amr.iter().any(|m| m == "hwk") {
+                    exec.amr.push("hwk".into());
+                }
+                if !exec.authorities.contains(&AuthAuthority::IdentityControlled) {
+                    exec.authorities.push(AuthAuthority::IdentityControlled);
+                }
+                exec.required_step_up_factors.retain(|f| f != "hwk" && f != "webauthn" && f != "passkey");
+                Ok(format!("webauthn cred={} uv={}", res.credential_id, res.user_verified))
             }
             AuthStageKind::ExternalProvider { provider_id } => {
                 let fed_sub = sub

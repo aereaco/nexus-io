@@ -1,6 +1,7 @@
 pub mod capabilities;
 pub mod flows;
 pub mod idp;
+pub mod webauthn;
 pub mod kernel;
 
 #[cfg(feature = "ops-shell")]

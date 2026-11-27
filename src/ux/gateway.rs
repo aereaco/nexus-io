@@ -936,6 +936,40 @@ impl UxGateway {
                         .post(IamIdentityPasswordHandler { db: self.db.clone() }),
                 )
                 .push(
+                    Router::with_path("/_nexus/iam/webauthn/register/begin")
+                        .hoop(gate.clone())
+                        .hoop(crate::ux::iam::IamMiddleware::authenticated(self.db.clone()))
+                        .post(IamWebAuthnRegisterHandler { db: self.db.clone(), is_finish: false }),
+                )
+                .push(
+                    Router::with_path("/_nexus/iam/webauthn/register/finish")
+                        .hoop(gate.clone())
+                        .hoop(crate::ux::iam::IamMiddleware::authenticated(self.db.clone()))
+                        .post(IamWebAuthnRegisterHandler { db: self.db.clone(), is_finish: true }),
+                )
+                .push(
+                    Router::with_path("/_nexus/iam/webauthn/auth/begin")
+                        .hoop(gate.clone())
+                        .post(IamWebAuthnAuthHandler { db: self.db.clone(), is_finish: false }),
+                )
+                .push(
+                    Router::with_path("/_nexus/iam/webauthn/auth/finish")
+                        .hoop(gate.clone())
+                        .post(IamWebAuthnAuthHandler { db: self.db.clone(), is_finish: true }),
+                )
+                .push(
+                    Router::with_path("/_nexus/iam/webauthn/credentials")
+                        .hoop(gate.clone())
+                        .hoop(crate::ux::iam::IamMiddleware::authenticated(self.db.clone()))
+                        .get(IamWebAuthnCredsHandler { db: self.db.clone() }),
+                )
+                .push(
+                    Router::with_path("/_nexus/iam/webauthn/credentials/{cred_id}")
+                        .hoop(gate.clone())
+                        .hoop(crate::ux::iam::IamMiddleware::authenticated(self.db.clone()))
+                        .delete(IamWebAuthnCredsHandler { db: self.db.clone() }),
+                )
+                .push(
                     Router::with_path("/_nexus/iam/clients")
                         .hoop(gate.clone())
                         .hoop(crate::ux::iam::IamMiddleware::admin(self.db.clone()))
@@ -2731,6 +2765,135 @@ impl Handler for IamIdentityPasswordHandler {
                 res.status_code(StatusCode::BAD_REQUEST);
                 res.render(Json(serde_json::json!({ "error": e.to_string() })));
             }
+        }
+    }
+}
+
+#[derive(Clone)]
+struct IamWebAuthnRegisterHandler {
+    db: Arc<Database>,
+    is_finish: bool,
+}
+
+#[async_trait]
+impl Handler for IamWebAuthnRegisterHandler {
+    async fn handle(&self, req: &mut Request, _depot: &mut Depot, res: &mut Response, _ctrl: &mut FlowCtrl) {
+        let svc = crate::iam::webauthn::WebAuthnService::new(self.db.clone());
+        if !self.is_finish {
+            let Ok(body) = req.parse_json::<crate::iam::webauthn::RegistrationRequest>().await else {
+                res.status_code(StatusCode::BAD_REQUEST);
+                return;
+            };
+            match svc.begin_registration(body).await {
+                Ok(ch) => {
+                    res.status_code(StatusCode::OK);
+                    res.render(Json(ch));
+                }
+                Err(e) => {
+                    res.status_code(StatusCode::BAD_REQUEST);
+                    res.render(Json(serde_json::json!({ "error": e.to_string() })));
+                }
+            }
+        } else {
+            let Ok(body) = req.parse_json::<crate::iam::webauthn::RegistrationResponse>().await else {
+                res.status_code(StatusCode::BAD_REQUEST);
+                return;
+            };
+            match svc.finish_registration(body).await {
+                Ok(cred) => {
+                    res.status_code(StatusCode::CREATED);
+                    res.render(Json(cred));
+                }
+                Err(e) => {
+                    res.status_code(StatusCode::BAD_REQUEST);
+                    res.render(Json(serde_json::json!({ "error": e.to_string() })));
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+struct IamWebAuthnAuthHandler {
+    db: Arc<Database>,
+    is_finish: bool,
+}
+
+#[async_trait]
+impl Handler for IamWebAuthnAuthHandler {
+    async fn handle(&self, req: &mut Request, _depot: &mut Depot, res: &mut Response, _ctrl: &mut FlowCtrl) {
+        let svc = crate::iam::webauthn::WebAuthnService::new(self.db.clone());
+        if !self.is_finish {
+            let Ok(body) = req.parse_json::<crate::iam::webauthn::AuthenticationRequest>().await else {
+                res.status_code(StatusCode::BAD_REQUEST);
+                return;
+            };
+            match svc.begin_authentication(body).await {
+                Ok(ch) => {
+                    res.status_code(StatusCode::OK);
+                    res.render(Json(ch));
+                }
+                Err(e) => {
+                    res.status_code(StatusCode::BAD_REQUEST);
+                    res.render(Json(serde_json::json!({ "error": e.to_string() })));
+                }
+            }
+        } else {
+            let Ok(body) = req.parse_json::<crate::iam::webauthn::AuthenticationResponse>().await else {
+                res.status_code(StatusCode::BAD_REQUEST);
+                return;
+            };
+            match svc.finish_authentication(body).await {
+                Ok(auth_res) => {
+                    res.status_code(StatusCode::OK);
+                    res.render(Json(auth_res));
+                }
+                Err(e) => {
+                    res.status_code(StatusCode::UNAUTHORIZED);
+                    res.render(Json(serde_json::json!({ "error": e.to_string() })));
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+struct IamWebAuthnCredsHandler {
+    db: Arc<Database>,
+}
+
+#[async_trait]
+impl Handler for IamWebAuthnCredsHandler {
+    async fn handle(&self, req: &mut Request, depot: &mut Depot, res: &mut Response, _ctrl: &mut FlowCtrl) {
+        let auth = crate::ux::iam::depot_auth_context(depot);
+        let actor = auth.as_ref().and_then(|a| a.actor.clone()).unwrap_or_default();
+        let identity_id = req.query::<String>("identity_id").unwrap_or_else(|| actor.clone());
+        let svc = crate::iam::webauthn::WebAuthnService::new(self.db.clone());
+        match *req.method() {
+            salvo::http::Method::GET => match svc.list_credentials(&identity_id).await {
+                Ok(creds) => {
+                    res.status_code(StatusCode::OK);
+                    res.render(Json(serde_json::json!({ "credentials": creds })));
+                }
+                Err(e) => {
+                    res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+                    res.render(Json(serde_json::json!({ "error": e.to_string() })));
+                }
+            },
+            salvo::http::Method::DELETE => {
+                let cred_id = req.param::<String>("cred_id").unwrap_or_default();
+                match svc.revoke_credential(&actor, &identity_id, &cred_id).await {
+                    Ok(revoked) => {
+                        res.status_code(StatusCode::OK);
+                        res.render(Json(serde_json::json!({ "revoked": revoked })));
+                    }
+                    Err(e) => {
+                        res.status_code(StatusCode::BAD_REQUEST);
+                        res.render(Json(serde_json::json!({ "error": e.to_string() })));
+                    }
+                }
+            }
+            _ => { res.status_code(StatusCode::METHOD_NOT_ALLOWED); }
         }
     }
 }
