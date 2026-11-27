@@ -101,7 +101,14 @@ Nexus-IO acts as a **universal application runtime** shared across all Wasm host
   - `wit/nexus-host.wit` (`package nexus:host@0.1.0`) defines the canonical Component Model contract to be bound to the same `HardwareRegistry::dispatch_authorized` & `NexusSharedArena` backend.
   - Gateway exposes `GET /_nexus/hardware` and `POST /_nexus/hardware/call` (strictly IAM + capability gated).
 
-## 9. Semantic Deployment Profiles (`Cargo.toml`)
+## 9. Federated Nexus Registry & `nexus install` (`src/registry/mod.rs`, `src/ux/gateway.rs`)
+Nexus-IO serves as a self-hosted, federated Wasm & application registry backed directly by `CasStore` (immutable BLAKE3 blobs) and `nexus-db` (`sys::registry_release`) — requiring **zero external Docker Registry or Harbor**:
+
+- **Unified Package References (`PackageRef`):** Supports `github:<owner>/<repo>[/<subpath>]@<ref>`, `oci://<host>/<repo>[:<tag>|@sha256:...]`, short-form `<namespace>/<package>@<version>`, and immutable `blake3:<64-hex>`.
+- **Security Invariants:** Mandatory digest pinning, BLAKE3 checksum verification before acceptance, optional provenance/signature metadata, strict `AppManifest::validate()` before activation, zero install-script execution, and IAM + `Capability::RuntimeInstall` namespace authorization.
+- **Self-Hosted OCI v2 & Nexus Registry Endpoints:** `GET /v2/`, `GET/PUT /v2/{ns}/{repo}/blobs/{digest}`, `GET/PUT /v2/{ns}/{repo}/manifests/{reference}`, `GET /_nexus/registry/packages`, `POST /_nexus/registry/install`, plus CLI `nexus install <ref>`.
+
+## 10. Semantic Deployment Profiles (`Cargo.toml`)
 - **`core`** *(default, 422 unique crates, 15.87 MB stripped)*: `runtime-wasm`, `db-auth`, `db-cbor` + `BlobBridge`/`CasStore` + `UxGateway` + `IAM` + `NexusMetrics`.
 - **`full`** *(1,161 unique crates)*: `core` + `runtime-all`, `db-all`, `net-all`, `storage-all`, `serve-all`, `ops-all`.
 - **Composable GUI:** `--features gui-all` (`gui-webview`) adds OS-autodetected native WebView (WebView2 / WKWebView / WebKitGTK / Android / iOS) to any profile.

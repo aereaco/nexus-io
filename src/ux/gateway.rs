@@ -778,6 +778,58 @@ impl UxGateway {
                         .hoop(gate.clone())
                         .hoop(crate::ux::iam::IamMiddleware::authenticated(self.db.clone()))
                         .post(HardwareCallHandler),
+                )
+                .push(
+                    Router::with_path("/v2")
+                        .get(OciV2PingHandler),
+                )
+                .push(
+                    Router::with_path("/v2/")
+                        .get(OciV2PingHandler),
+                )
+                .push(
+                    Router::with_path("/v2/{ns}/{repo}/blobs/{digest}")
+                        .hoop(gate.clone())
+                        .hoop(crate::ux::iam::IamMiddleware::authenticated(self.db.clone()))
+                        .get(RegistryBlobHandler {
+                            db: self.db.clone(),
+                            garage: self.garage.clone(),
+                        })
+                        .put(RegistryBlobHandler {
+                            db: self.db.clone(),
+                            garage: self.garage.clone(),
+                        }),
+                )
+                .push(
+                    Router::with_path("/v2/{ns}/{repo}/manifests/{reference}")
+                        .hoop(gate.clone())
+                        .hoop(crate::ux::iam::IamMiddleware::authenticated(self.db.clone()))
+                        .get(RegistryManifestHandler {
+                            db: self.db.clone(),
+                            garage: self.garage.clone(),
+                        })
+                        .put(RegistryManifestHandler {
+                            db: self.db.clone(),
+                            garage: self.garage.clone(),
+                        }),
+                )
+                .push(
+                    Router::with_path("/_nexus/registry/packages")
+                        .hoop(gate.clone())
+                        .hoop(crate::ux::iam::IamMiddleware::authenticated(self.db.clone()))
+                        .get(RegistryPackagesHandler {
+                            db: self.db.clone(),
+                            garage: self.garage.clone(),
+                        }),
+                )
+                .push(
+                    Router::with_path("/_nexus/registry/install")
+                        .hoop(gate.clone())
+                        .hoop(crate::ux::iam::IamMiddleware::authenticated(self.db.clone()))
+                        .post(RegistryInstallHandler {
+                            db: self.db.clone(),
+                            garage: self.garage.clone(),
+                        }),
                 );
         }
 
@@ -1380,6 +1432,260 @@ impl Handler for HardwareCallHandler {
         };
         res.status_code(code);
         res.render(Json(resp));
+    }
+}
+
+#[derive(Clone)]
+struct OciV2PingHandler;
+
+#[async_trait]
+impl Handler for OciV2PingHandler {
+    async fn handle(&self, _req: &mut Request, _depot: &mut Depot, res: &mut Response, _ctrl: &mut FlowCtrl) {
+        res.status_code(StatusCode::OK);
+        res.headers_mut().insert(
+            "docker-distribution-api-version",
+            salvo::http::HeaderValue::from_static("registry/2.0"),
+        );
+        res.render(Json(serde_json::json!({ "registry": "nexus-io", "version": "2.0" })));
+    }
+}
+
+#[derive(Clone)]
+struct RegistryBlobHandler {
+    db: Arc<Database>,
+    garage: Arc<BlobBridge>,
+}
+
+#[async_trait]
+impl Handler for RegistryBlobHandler {
+    async fn handle(&self, req: &mut Request, depot: &mut Depot, res: &mut Response, _ctrl: &mut FlowCtrl) {
+        use crate::iam::capabilities::{Capability, CapabilitySet};
+        use crate::registry::{ArtifactProvenance, NexusRegistry};
+
+        let ns = req.param::<String>("ns").unwrap_or_default();
+        let repo = req.param::<String>("repo").unwrap_or_default();
+        let digest = req.param::<String>("digest").unwrap_or_default();
+        let auth = crate::ux::iam::depot_auth_context(depot);
+        let caps = CapabilitySet::from_auth_context(auth.as_ref());
+        let reg = NexusRegistry::new(self.db.clone(), self.garage.clone());
+
+        match *req.method() {
+            salvo::http::Method::GET => {
+                if !caps.has(Capability::BlobRead) {
+                    res.status_code(StatusCode::FORBIDDEN);
+                    return;
+                }
+                match reg.get_blob(&digest).await {
+                    Ok(bytes) => {
+                        res.status_code(StatusCode::OK);
+                        res.headers_mut().insert(
+                            salvo::http::header::CONTENT_TYPE,
+                            salvo::http::HeaderValue::from_static("application/octet-stream"),
+                        );
+                        let _ = res.write_body(bytes);
+                    }
+                    Err(e) => {
+                        res.status_code(StatusCode::NOT_FOUND);
+                        res.render(Json(serde_json::json!({ "error": e.to_string() })));
+                    }
+                }
+            }
+            salvo::http::Method::PUT => {
+                if !caps.has(Capability::RuntimeInstall) {
+                    crate::observability::global_metrics().inc_iam_auth_denial();
+                    res.status_code(StatusCode::FORBIDDEN);
+                    return;
+                }
+                let Ok(payload) = req.payload_with_max_size(64 * 1024 * 1024).await else {
+                    res.status_code(StatusCode::BAD_REQUEST);
+                    return;
+                };
+                match reg
+                    .publish_release(
+                        &ns,
+                        &repo,
+                        &digest,
+                        bytes::Bytes::copy_from_slice(payload),
+                        Some(&digest),
+                        "application/wasm",
+                        None,
+                        ArtifactProvenance::default(),
+                    )
+                    .await
+                {
+                    Ok(rel) => {
+                        res.status_code(StatusCode::CREATED);
+                        res.render(Json(rel));
+                    }
+                    Err(e) => {
+                        res.status_code(StatusCode::BAD_REQUEST);
+                        res.render(Json(serde_json::json!({ "error": e.to_string() })));
+                    }
+                }
+            }
+            _ => {
+                res.status_code(StatusCode::METHOD_NOT_ALLOWED);
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+struct RegistryManifestHandler {
+    db: Arc<Database>,
+    garage: Arc<BlobBridge>,
+}
+
+#[async_trait]
+impl Handler for RegistryManifestHandler {
+    async fn handle(&self, req: &mut Request, depot: &mut Depot, res: &mut Response, _ctrl: &mut FlowCtrl) {
+        use crate::iam::capabilities::{Capability, CapabilitySet};
+        use crate::registry::{ArtifactProvenance, NexusRegistry};
+
+        let ns = req.param::<String>("ns").unwrap_or_default();
+        let repo = req.param::<String>("repo").unwrap_or_default();
+        let reference = req.param::<String>("reference").unwrap_or_default();
+        let auth = crate::ux::iam::depot_auth_context(depot);
+        let caps = CapabilitySet::from_auth_context(auth.as_ref());
+        let reg = NexusRegistry::new(self.db.clone(), self.garage.clone());
+
+        match *req.method() {
+            salvo::http::Method::GET => {
+                match reg.get_release(&ns, &repo, &reference).await {
+                    Ok(Some(rel)) => {
+                        res.status_code(StatusCode::OK);
+                        res.render(Json(rel));
+                    }
+                    Ok(None) => {
+                        res.status_code(StatusCode::NOT_FOUND);
+                    }
+                    Err(e) => {
+                        res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+                        res.render(Json(serde_json::json!({ "error": e.to_string() })));
+                    }
+                }
+            }
+            salvo::http::Method::PUT => {
+                if !caps.has(Capability::RuntimeInstall) {
+                    crate::observability::global_metrics().inc_iam_auth_denial();
+                    res.status_code(StatusCode::FORBIDDEN);
+                    return;
+                }
+                let expected = req
+                    .headers()
+                    .get("x-nexus-blake3")
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| s.to_string());
+                let Ok(payload) = req.payload_with_max_size(64 * 1024 * 1024).await else {
+                    res.status_code(StatusCode::BAD_REQUEST);
+                    return;
+                };
+                match reg
+                    .publish_release(
+                        &ns,
+                        &repo,
+                        &reference,
+                        bytes::Bytes::copy_from_slice(payload),
+                        expected.as_deref(),
+                        "application/wasm",
+                        None,
+                        ArtifactProvenance {
+                            publisher: auth.and_then(|a| a.actor).unwrap_or_else(|| "authenticated".into()),
+                            ..ArtifactProvenance::default()
+                        },
+                    )
+                    .await
+                {
+                    Ok(rel) => {
+                        res.status_code(StatusCode::CREATED);
+                        res.render(Json(rel));
+                    }
+                    Err(e) => {
+                        res.status_code(StatusCode::BAD_REQUEST);
+                        res.render(Json(serde_json::json!({ "error": e.to_string() })));
+                    }
+                }
+            }
+            _ => {
+                res.status_code(StatusCode::METHOD_NOT_ALLOWED);
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+struct RegistryPackagesHandler {
+    db: Arc<Database>,
+    garage: Arc<BlobBridge>,
+}
+
+#[async_trait]
+impl Handler for RegistryPackagesHandler {
+    async fn handle(&self, _req: &mut Request, _depot: &mut Depot, res: &mut Response, _ctrl: &mut FlowCtrl) {
+        let reg = crate::registry::NexusRegistry::new(self.db.clone(), self.garage.clone());
+        match reg.list_releases().await {
+            Ok(releases) => {
+                res.status_code(StatusCode::OK);
+                res.render(Json(serde_json::json!({ "count": releases.len(), "releases": releases })));
+            }
+            Err(e) => {
+                res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+                res.render(Json(serde_json::json!({ "error": e.to_string() })));
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+struct RegistryInstallHandler {
+    db: Arc<Database>,
+    garage: Arc<BlobBridge>,
+}
+
+#[async_trait]
+impl Handler for RegistryInstallHandler {
+    async fn handle(&self, req: &mut Request, depot: &mut Depot, res: &mut Response, _ctrl: &mut FlowCtrl) {
+        use crate::iam::capabilities::{Capability, CapabilitySet};
+
+        let auth = crate::ux::iam::depot_auth_context(depot);
+        let caps = CapabilitySet::from_auth_context(auth.as_ref());
+        if !caps.has(Capability::RuntimeInstall) {
+            crate::observability::global_metrics().inc_iam_auth_denial();
+            res.status_code(StatusCode::FORBIDDEN);
+            res.render(Json(serde_json::json!({ "error": "Missing required capability runtime.install" })));
+            return;
+        }
+
+        #[derive(serde::Deserialize)]
+        struct InstallBody {
+            reference: String,
+            #[serde(default)]
+            expected_blake3: Option<String>,
+        }
+
+        let body: InstallBody = match req.parse_json().await {
+            Ok(b) => b,
+            Err(e) => {
+                res.status_code(StatusCode::BAD_REQUEST);
+                res.render(Json(serde_json::json!({ "error": format!("Invalid install JSON: {}", e) })));
+                return;
+            }
+        };
+
+        let reg = crate::registry::NexusRegistry::new(self.db.clone(), self.garage.clone());
+        match reg
+            .install_package(&body.reference, body.expected_blake3.as_deref())
+            .await
+        {
+            Ok(lock) => {
+                res.status_code(StatusCode::OK);
+                res.render(Json(lock));
+            }
+            Err(e) => {
+                res.status_code(StatusCode::BAD_REQUEST);
+                res.render(Json(serde_json::json!({ "error": e.to_string() })));
+            }
+        }
     }
 }
 

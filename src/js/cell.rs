@@ -263,13 +263,29 @@ pub enum CellLifecycleState {
     Failed(String),
 }
 
-/// Enforced per-cell execution resource limits (CPU fuel, output cap, concurrency, and deadline).
+/// Enforced per-cell execution resource limits (CPU fuel, memory caps, output cap, concurrency, and deadline).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CellResourceLimits {
     pub max_fuel: u64,
     pub max_output_bytes: usize,
     pub max_concurrent_execs: usize,
     pub deadline_ms: u64,
+    #[serde(default = "default_cell_max_memory_bytes")]
+    pub max_memory_bytes: usize,
+    #[serde(default = "default_cell_max_memories")]
+    pub max_memories: usize,
+    #[serde(default = "default_cell_max_tables")]
+    pub max_tables: usize,
+}
+
+fn default_cell_max_memory_bytes() -> usize {
+    16 * 1024 * 1024
+}
+fn default_cell_max_memories() -> usize {
+    1
+}
+fn default_cell_max_tables() -> usize {
+    4
 }
 
 impl Default for CellResourceLimits {
@@ -279,6 +295,24 @@ impl Default for CellResourceLimits {
             max_output_bytes: 4 * 1024 * 1024,
             max_concurrent_execs: 16,
             deadline_ms: 15_000,
+            max_memory_bytes: default_cell_max_memory_bytes(),
+            max_memories: default_cell_max_memories(),
+            max_tables: default_cell_max_tables(),
+        }
+    }
+}
+
+impl CellResourceLimits {
+    /// Clamp requested cell limits against the node operator's hard ceiling (`min(requested, ceiling)`).
+    pub fn clamp_to_ceiling(&self, ceiling: &Self) -> Self {
+        Self {
+            max_fuel: self.max_fuel.min(ceiling.max_fuel),
+            max_output_bytes: self.max_output_bytes.min(ceiling.max_output_bytes),
+            max_concurrent_execs: self.max_concurrent_execs.min(ceiling.max_concurrent_execs),
+            deadline_ms: self.deadline_ms.min(ceiling.deadline_ms),
+            max_memory_bytes: self.max_memory_bytes.min(ceiling.max_memory_bytes),
+            max_memories: self.max_memories.min(ceiling.max_memories),
+            max_tables: self.max_tables.min(ceiling.max_tables),
         }
     }
 }

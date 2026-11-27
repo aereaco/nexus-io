@@ -7,6 +7,7 @@ pub mod hardware;
 pub mod iam;
 pub mod js;
 pub mod observability;
+pub mod registry;
 pub mod runtime;
 #[cfg(feature = "ops-shell")]
 pub mod shell;

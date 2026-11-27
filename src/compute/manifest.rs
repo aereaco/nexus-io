@@ -58,11 +58,61 @@ pub struct AppManifest {
     #[serde(default)]
     pub topology: TopologySpec,
     #[serde(default)]
+    pub runtime: Option<RuntimeTuningSpec>,
+    #[serde(default)]
     pub defaults: CellDefaults,
     #[serde(default)]
     pub gateway: Option<GatewaySpec>,
     #[serde(default)]
     pub cells: BTreeMap<String, CellSpec>,
+}
+
+/// Optional operator-definable Wasmtime density & virtual-memory tuning block (`[runtime]`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeTuningSpec {
+    /// `"standard"` | `"high_density"` (default) | `"ultra_compact"` | `"custom"`
+    #[serde(default)]
+    pub density_profile: Option<String>,
+    /// Optional custom virtual address reservation per linear memory (bytes).
+    #[serde(default)]
+    pub memory_reservation_bytes: Option<u64>,
+    /// Optional custom virtual address growth reservation (bytes).
+    #[serde(default)]
+    pub memory_growth_bytes: Option<u64>,
+    /// Optional custom guard page size (bytes).
+    #[serde(default)]
+    pub memory_guard_bytes: Option<u64>,
+}
+
+impl RuntimeTuningSpec {
+    #[cfg(feature = "runtime-wasm")]
+    pub fn to_density_profile(&self) -> crate::compute::crystal::DensityProfile {
+        use crate::compute::crystal::DensityProfile;
+        match self.density_profile.as_deref().unwrap_or("high_density").trim().to_ascii_lowercase().as_str() {
+            "standard" => DensityProfile::Standard,
+            "ultra_compact" | "ultracompact" => DensityProfile::UltraCompact,
+            "custom" => DensityProfile::Custom {
+                memory_reservation_bytes: self.memory_reservation_bytes.unwrap_or(4 * 1024 * 1024),
+                memory_growth_bytes: self.memory_growth_bytes.unwrap_or(2 * 1024 * 1024),
+                memory_guard_bytes: self.memory_guard_bytes.unwrap_or(64 * 1024),
+            },
+            _ => {
+                if self.memory_reservation_bytes.is_some()
+                    || self.memory_growth_bytes.is_some()
+                    || self.memory_guard_bytes.is_some()
+                {
+                    DensityProfile::Custom {
+                        memory_reservation_bytes: self.memory_reservation_bytes.unwrap_or(4 * 1024 * 1024),
+                        memory_growth_bytes: self.memory_growth_bytes.unwrap_or(2 * 1024 * 1024),
+                        memory_guard_bytes: self.memory_guard_bytes.unwrap_or(64 * 1024),
+                    }
+                } else {
+                    DensityProfile::HighDensity
+                }
+            }
+        }
+    }
 }
 
 /// Declarative gateway & service activation specification.
@@ -199,6 +249,12 @@ pub struct CellDefaults {
     pub max_concurrent_execs: usize,
     #[serde(default = "default_deadline_ms")]
     pub deadline_ms: u64,
+    #[serde(default = "default_max_memory_bytes")]
+    pub max_memory_bytes: usize,
+    #[serde(default = "default_max_memories")]
+    pub max_memories: usize,
+    #[serde(default = "default_max_tables")]
+    pub max_tables: usize,
 }
 
 fn default_max_fuel() -> u64 {
@@ -213,6 +269,15 @@ fn default_max_concurrent_execs() -> usize {
 fn default_deadline_ms() -> u64 {
     CellResourceLimits::default().deadline_ms
 }
+fn default_max_memory_bytes() -> usize {
+    CellResourceLimits::default().max_memory_bytes
+}
+fn default_max_memories() -> usize {
+    CellResourceLimits::default().max_memories
+}
+fn default_max_tables() -> usize {
+    CellResourceLimits::default().max_tables
+}
 
 impl Default for CellDefaults {
     fn default() -> Self {
@@ -221,6 +286,9 @@ impl Default for CellDefaults {
             max_output_bytes: default_max_output_bytes(),
             max_concurrent_execs: default_max_concurrent_execs(),
             deadline_ms: default_deadline_ms(),
+            max_memory_bytes: default_max_memory_bytes(),
+            max_memories: default_max_memories(),
+            max_tables: default_max_tables(),
         }
     }
 }
@@ -271,6 +339,9 @@ pub struct ResourceOverrides {
     pub max_output_bytes: Option<usize>,
     pub max_concurrent_execs: Option<usize>,
     pub deadline_ms: Option<u64>,
+    pub max_memory_bytes: Option<usize>,
+    pub max_memories: Option<usize>,
+    pub max_tables: Option<usize>,
 }
 
 /// Default-deny capability request block. Never grants authority on its own.
@@ -686,7 +757,28 @@ impl AppManifest {
                 .resources
                 .deadline_ms
                 .unwrap_or(self.defaults.deadline_ms),
-        };
+            max_memory_bytes: spec
+                .resources
+                .max_memory_bytes
+                .unwrap_or(self.defaults.max_memory_bytes),
+            max_memories: spec
+                .resources
+                .max_memories
+                .unwrap_or(self.defaults.max_memories),
+            max_tables: spec
+                .resources
+                .max_tables
+                .unwrap_or(self.defaults.max_tables),
+        }
+        .clamp_to_ceiling(&CellResourceLimits {
+            max_fuel: 1_000_000_000,
+            max_output_bytes: 32 * 1024 * 1024,
+            max_concurrent_execs: 128,
+            deadline_ms: 120_000,
+            max_memory_bytes: 256 * 1024 * 1024,
+            max_memories: 4,
+            max_tables: 16,
+        });
 
         let policy = match spec.lifecycle.hibernation {
             HibernationMode::Pinned => CellPolicy::Pinned,

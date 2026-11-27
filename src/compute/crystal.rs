@@ -102,6 +102,12 @@ pub enum DensityProfile {
     /// Ultra-compact reservation profile for massive tiny-cell fanout:
     /// 1 MiB initial virtual reservation, 512 KiB growth reservation, 64 KiB guard page.
     UltraCompact,
+    /// Operator-defined custom Wasmtime virtual reservation & guard-page parameters.
+    Custom {
+        memory_reservation_bytes: u64,
+        memory_growth_bytes: u64,
+        memory_guard_bytes: u64,
+    },
 }
 
 /// Capability-scoped configuration for executing any WASI polyglot module
@@ -192,6 +198,15 @@ impl CrystalEngine {
                 config.memory_reservation(1024 * 1024);
                 config.memory_reservation_for_growth(512 * 1024);
                 config.memory_guard_size(64 * 1024);
+            }
+            DensityProfile::Custom {
+                memory_reservation_bytes,
+                memory_growth_bytes,
+                memory_guard_bytes,
+            } => {
+                config.memory_reservation(memory_reservation_bytes);
+                config.memory_reservation_for_growth(memory_growth_bytes);
+                config.memory_guard_size(memory_guard_bytes);
             }
         }
         let engine = Engine::new(&config).map_err(wt_err)?;

@@ -9,6 +9,7 @@ fn print_cli_help() {
     println!("  start, serve   Start node strictly from a declared manifest (all services opt-in)");
     println!("  check          Validate a manifest (schema, paths, compiled features) without starting");
     println!("  init           Scaffold a declarative nexus.toml manifest (--preset erp|api|empty)");
+    println!("  install        Resolve, verify, and pin a package (github:..., oci://..., ns/pkg@ver)");
     println!("  help           Print this command reference");
     println!();
     println!("OPTIONS:");
@@ -216,6 +217,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let gw = ux::UxGateway::new(db, bridge, gw_cfg);
                 gw.start().await
             })?;
+            return Ok(());
+        }
+        "install" => {
+            let Some(pkg_ref) = args.get(2).cloned() else {
+                eprintln!("❌ Usage: nexus install <github:owner/repo@ref | oci://host/repo:tag | ns/pkg@ver> [--blake3 <hex>]");
+                std::process::exit(2);
+            };
+            let expected_b3 = parse_flag_value(&args[3..], "-b", "--blake3");
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
+            let lock = rt.block_on(async {
+                let db = Arc::new(db::Database::init().await);
+                let bridge = Arc::new(
+                    storage::BlobBridge::new(db.clone())
+                        .await
+                        .expect("Failed to init storage bridge"),
+                );
+                let reg = nexus_io::registry::NexusRegistry::new(db, bridge);
+                reg.install_package(&pkg_ref, expected_b3.as_deref()).await
+            })?;
+            println!(
+                "✅ Installed {}/{}@{} (pinned blake3:{}, {} bytes)",
+                lock.namespace, lock.package, lock.version, lock.pinned_blake3, lock.size_bytes
+            );
             return Ok(());
         }
         other => {
