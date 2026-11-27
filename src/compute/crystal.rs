@@ -2,7 +2,7 @@ use anyhow::{anyhow, Result};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
-use wasmtime::{Caller, Config, Engine, Instance, Linker, Module, Store};
+use wasmtime::{Caller, Config, Engine, Instance, Linker, Module, Store, StoreLimits, StoreLimitsBuilder};
 use wasmtime_wasi::p1::{self, WasiP1Ctx};
 use wasmtime_wasi::p2::pipe::{MemoryInputPipe, MemoryOutputPipe};
 use wasmtime_wasi::{FsPerms, WasiCtxBuilder};
@@ -86,13 +86,29 @@ struct CrystalWasiState {
     wasi: WasiP1Ctx,
     host: Option<NexusHostContext>,
     arena_owner: Option<String>,
+    limits: StoreLimits,
+}
+
+/// Configurable Wasmtime memory & allocation profile for empirical density tuning.
+/// Distinguishes virtual address reservation and guard pages from per-cell physical
+/// linear memory limits (`WasiRunConfig::max_memory_bytes`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DensityProfile {
+    /// Wasmtime defaults (baseline for A/B comparison).
+    Standard,
+    /// Tuned on-demand allocator for high-density tiny/medium cells:
+    /// 4 MiB initial virtual reservation, 2 MiB growth reservation, 64 KiB guard page.
+    HighDensity,
+    /// Ultra-compact reservation profile for massive tiny-cell fanout:
+    /// 1 MiB initial virtual reservation, 512 KiB growth reservation, 64 KiB guard page.
+    UltraCompact,
 }
 
 /// Capability-scoped configuration for executing any WASI polyglot module
 /// (PHP/WordPress `php-cgi.wasm`, CPython `python.wasm`, Go `wasip1`, Rust, C/C++, Ruby).
 ///
-/// Zero ambient host authority: env vars, argv, stdin, and preopened directories must be
-/// explicitly granted per invocation.
+/// Zero ambient host authority: env vars, argv, stdin, preopened directories, and enforced
+/// `StoreLimits` (`max_memory_bytes`, `max_memories`, `max_tables`) must be explicitly scoped.
 #[derive(Debug, Clone)]
 pub struct WasiRunConfig {
     pub args: Vec<String>,
@@ -101,6 +117,12 @@ pub struct WasiRunConfig {
     /// `(host_path, guest_mount_path, writable)`
     pub preopen_dirs: Vec<(PathBuf, String, bool)>,
     pub fuel_limit: u64,
+    /// Hard enforced per-store linear memory cap (bytes) via Wasmtime `StoreLimits`.
+    pub max_memory_bytes: usize,
+    /// Hard cap on number of linear memories a guest may instantiate (prevents aggregate bypass).
+    pub max_memories: usize,
+    /// Hard cap on number of tables a guest may instantiate.
+    pub max_tables: usize,
 }
 
 impl Default for WasiRunConfig {
@@ -111,6 +133,9 @@ impl Default for WasiRunConfig {
             stdin: Vec::new(),
             preopen_dirs: Vec::new(),
             fuel_limit: 50_000_000,
+            max_memory_bytes: 16 * 1024 * 1024,
+            max_memories: 1,
+            max_tables: 4,
         }
     }
 }
@@ -141,18 +166,48 @@ pub struct WasiCgiResponse {
 ///   zero ambient OS access, scoped virtual filesystem mounts, and deterministic fuel metering.
 pub struct CrystalEngine {
     engine: Engine,
+    linker: Linker<CrystalWasiState>,
+    profile: DensityProfile,
     module_cache: RwLock<HashMap<String, Module>>,
 }
 
 impl CrystalEngine {
+    /// Default engine constructor using `DensityProfile::HighDensity`.
     pub fn new() -> Result<Self> {
+        Self::with_profile(DensityProfile::HighDensity)
+    }
+
+    /// Construct a `CrystalEngine` with an explicit `DensityProfile` (`Standard`, `HighDensity`, or `Pooling`).
+    pub fn with_profile(profile: DensityProfile) -> Result<Self> {
         let mut config = Config::new();
         config.consume_fuel(true);
+        match profile {
+            DensityProfile::Standard => {}
+            DensityProfile::HighDensity => {
+                config.memory_reservation(4 * 1024 * 1024);
+                config.memory_reservation_for_growth(2 * 1024 * 1024);
+                config.memory_guard_size(64 * 1024);
+            }
+            DensityProfile::UltraCompact => {
+                config.memory_reservation(1024 * 1024);
+                config.memory_reservation_for_growth(512 * 1024);
+                config.memory_guard_size(64 * 1024);
+            }
+        }
         let engine = Engine::new(&config).map_err(wt_err)?;
+        let mut linker: Linker<CrystalWasiState> = Linker::new(&engine);
+        p1::add_to_linker_sync(&mut linker, |s| &mut s.wasi).map_err(wt_err)?;
+        register_nexus_host_abi(&mut linker)?;
         Ok(Self {
             engine,
+            linker,
+            profile,
             module_cache: RwLock::new(HashMap::new()),
         })
+    }
+
+    pub fn profile(&self) -> DensityProfile {
+        self.profile
     }
 
     /// Resolve a cached `Module` by BLAKE3 hash of its AOT `.cwasm` bytes, deserializing only on first use.
@@ -272,6 +327,7 @@ impl CrystalEngine {
             stdin: input_json.to_vec(),
             preopen_dirs: Vec::new(),
             fuel_limit,
+            ..WasiRunConfig::default()
         };
         let module = Module::new(&self.engine, quickjs_wasm).map_err(wt_err)?;
         self.exec_wasi_p1_module(&module, cfg, host)
@@ -342,6 +398,7 @@ impl CrystalEngine {
                 stdin: body.to_vec(),
                 preopen_dirs,
                 fuel_limit,
+                ..WasiRunConfig::default()
             },
             host,
         )?;
@@ -395,19 +452,24 @@ impl CrystalEngine {
                 .as_canonical()
         });
 
+        let limits = StoreLimitsBuilder::new()
+            .memory_size(cfg.max_memory_bytes)
+            .memories(cfg.max_memories)
+            .tables(cfg.max_tables)
+            .instances(2)
+            .build();
+
         let state = CrystalWasiState {
             wasi: builder.build_p1(),
             host,
             arena_owner: owner_key.clone(),
+            limits,
         };
         let mut store = Store::new(&self.engine, state);
+        store.limiter(|s| &mut s.limits);
         store.set_fuel(cfg.fuel_limit).map_err(wt_err)?;
 
-        let mut linker: Linker<CrystalWasiState> = Linker::new(&self.engine);
-        p1::add_to_linker_sync(&mut linker, |s| &mut s.wasi).map_err(wt_err)?;
-        register_nexus_host_abi(&mut linker)?;
-
-        let instance = linker.instantiate(&mut store, module).map_err(wt_err)?;
+        let instance = self.linker.instantiate(&mut store, module).map_err(wt_err)?;
         let start = instance
             .get_typed_func::<(), ()>(&mut store, "_start")
             .map_err(|e| anyhow!("WASI module missing '_start' entrypoint: {}", e))?;

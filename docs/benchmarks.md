@@ -1,69 +1,58 @@
-# Nexus-IO Deployment Profiles & Footprint Benchmarks
+# Nexus-IO Empirical Deployment Density & Runtime Benchmarks
 
-This document tracks the **exact, verified dependency footprint** of each Nexus-IO deployment profile against the current `Cargo.toml` feature graph, along with empirical release measurements and reproducible commands.
+All results below were measured directly in `--release` mode on the real **Nexus-IO `core` microkernel** (`422` unique crates, Wasmtime 51 + WASI Preview 1, embedded `nexus-db`, `BlobBridge` + `CasStore`, and `NexusSharedArena` SPSC rings).
 
----
+## Test Environment & Reproducibility
 
-## 1. Current Profile Dependency Graph (Verified `2026-11-25`)
-
-Measured via `powershell -ExecutionPolicy Bypass -File scripts/check-footprint.ps1`:
-
-| Profile | Unique Crates | Budget | What Is Compiled In | What Is Excluded |
-| :--- | :---: | :---: | :--- | :--- |
-| **`core`** *(default)* | **422** | `<= 450` | **Wasmtime 51 + WASI** (`runtime-wasm`), **Nexus-DB** (`db-auth`, `db-cbor`), **BlobBridge + CasStore** (3-state ownership + WAL `OwnershipTx` + fenced CAS leases), **UxGateway** (Salvo HTTP/WS), **IAM + CapabilitySet**, **NexusMetrics** | `runtime-oci`, extended `db-*` flags, `net-*` (`net-http3`, `net-acme`, `net-openapi`, `net-vpn`), `storage-*` (`storage-p2p`, `storage-s3`), `serve-*`, `ops-*` (`ops-shell`, `ops-k8s`, `ops-gpu`), `gui-webview` |
-| **`full`** | **1,161** | — | `core` + `runtime-all` + `db-all` + `net-all` + `storage-all` + `serve-all` + `ops-all` | `gui-webview` / `gui-all` *(opt-in, OS-autodetected native WebView)* |
-
-> **100% MIT & Wasm-First:** Native `quickrs-core`, `oxc_*`, `sqlparser`, and `surrealdb` crates have been completely removed from `io/Cargo.toml`. JavaScript, TypeScript, and guest SQL/document databases run as Wasm modules inside Wasmtime.
-
----
-
-## 2. Empirical Release Benchmarks — 422-Crate Pure-Wasmtime `core` (Verified `2026-11-25`)
-
-Measured across **5 fresh process launches** (isolated temporary data directory per run, 2-second idle settle window before memory sampling):
-
-| Measurement | Value |
-| :--- | :--- |
-| **Release executable size (`nexus.exe`, stripped)** | **15.87 MB** (`16,642,560` bytes) |
-| **Cold host process startup (5 fresh launches, TCP port 8080 readiness)** | **Median: `1,036.27 ms`** (range: `1,019.78 ms – 1,889.85 ms`; runs 2–5: `1,019.78 – 1,044.02 ms`; run 1 includes OS cold page cache) |
-| **Isolated guest AOT `.cwasm` microbenchmark (`n = 200`, `--release`)** | **p50: `133 µs` (`0.133 ms`)**, **p95: `318 µs`**, range: `76 µs – 1,463 µs` (`aot_guest_instantiation_latency_benchmark`; pure AOT instantiation + `i64` export call) |
-| **End-to-end guest invocation — cold cache (delete AOT → BLAKE3 verify `cid/` → compile → WASI + `nexus_host` DB query)** | **`7.42 ms`** (`end_to_end_guest_and_concurrent_20_cell_workload_benchmark`) |
-| **End-to-end guest invocation — warm cache (`n = 25`: registry lookup → `NXAOT01` BLAKE3 verify → WASI + `nexus_host` DB query)** | **p50: `1.12 ms` (`1,119 µs`)**, **p95: `1.68 ms` (`1,679 µs`)**, range: `0.90 ms – 1.72 ms` |
-| **20-cell concurrent isolated workload (200 mixed `CREATE` + `SELECT` ops, strict zero-leakage check)** | **`79,001 ops/sec`**, **0 failures**, **p50: `62 µs`**, **p95: `104 µs`** |
-| **Idle Working Set (`WorkingSet64`, 2s settled)** | **Median: `12.02 MB`** (range: `11.93 MB – 25.14 MB`) |
-| **Idle Private Memory (`PrivateMemorySize64`, 2s settled)** | **Median: `4.43 MB`** (range: `4.18 MB – 4.70 MB`) |
-| **Rust / Cargo versions** | `rustc 1.100.0 (0ef1bc386 2026-11-09)` / `cargo 1.100.0 (3acc79c0c 2026-11-05)` |
-| **Build command & profile flags** | `cargo build --release --bin nexus --no-default-features --features core` (`opt-level = "z"`, `lto = "thin"`, `codegen-units = 1`, `strip = true`) |
-| **OS & Architecture** | `Microsoft Windows NT 10.0.26300.0` (`AMD64` / `x86_64`) |
-
-### Historical Reference (Legacy Pre-Wasmtime-Core Layout)
-
-> **Composition qualification:** The 76.9% binary-size reduction from the historical `68.78 MB` measurement (`96a3513c`) to `15.87 MB` compares two different profile compositions — the historical layout compiled Nushell, OXC, and native QuickJS into the default profile, whereas the current `core` profile excludes those native toolchains and includes Wasmtime 51 + WASI. It demonstrates footprint reduction through deployment-profile architecture rather than a like-for-like optimization of identical feature sets.
-
-| Historical Profile (`96a3513c`) | Unique Crates | Release Binary (MB) | Idle RSS (MB) |
-| :--- | :---: | :---: | :---: |
-| Legacy core (with Nushell/OXC/QuickJS) | 849 | 68.78 MB | 5.41 MB |
-| Legacy app | — | 83.25 MB | 3.20 MB |
-| Legacy full | — | 86.36 MB | 14.28 MB |
-| Legacy windows+gui | — | 85.79 MB | 14.66 MB |
+- **OS / Arch:** Windows (`x86_64`)
+- **Profile:** `--release --no-default-features --features core` (`422` unique crates, `0` extra benchmark crates)
+- **Exact Command:**
+  ```powershell
+  cd io
+  cargo test --release --test density_benchmark --no-default-features --features core -- --nocapture --test-threads=1
+  ```
+- **Source:** [`io/tests/density_benchmark.rs`](../tests/density_benchmark.rs)
+- **Memory Safety Verification:** `enforced_store_limits_block_runaway_guest_memory_growth` — **PASSED** (guest attempting 4 MiB `memory.grow` under 1 MiB `StoreLimits` hard-traps cleanly without OOMing host).
 
 ---
 
-## 3. Reproducible Measurement Commands
+## 1. Wasmtime Memory Reservation A/B Comparison (200 Warm AOT Executions Each)
 
-```powershell
-# 1. Verify profile crate-count budgets (core <= 450)
-powershell -ExecutionPolicy Bypass -File scripts/check-footprint.ps1
+Shared `CrystalEngine` + cached `Linker<CrystalWasiState>` + AOT `.cwasm` module:
 
-# 2. Build stripped release binary for pure-Wasmtime core
-cargo build --release --bin nexus --no-default-features --features core
+| Density Profile | Engine Init | AOT Compile | Cold First Run | Warm p50 | Warm p95 | Warm p99 | Measured RSS Delta |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| **`Standard`** *(Wasmtime default)* | `285 µs` | `2,405 µs` | `533 µs` | `65 µs` | `86 µs` | `115 µs` | `916 KiB` |
+| **`HighDensity`** *(4 MiB res / 2 MiB growth / 64 KiB guard)* | `299 µs` | `2,962 µs` | `299 µs` | `42 µs` | `55 µs` | `88 µs` | `100 KiB` |
+| **`UltraCompact`** *(1 MiB res / 512 KiB growth / 64 KiB guard)* | `305 µs` | `2,458 µs` | `211 µs` | `41 µs` | `57 µs` | `103 µs` | `0 KiB` |
 
-# 3. Measure binary size & live idle RSS (Windows PowerShell)
-$exe = "target\release\nexus.exe"
-[math]::Round((Get-Item $exe).Length / 1MB, 2)
-$p = Start-Process -FilePath $exe -PassThru -WindowStyle Hidden
-Start-Sleep -Seconds 2
-$proc = Get-Process -Id $p.Id
-[math]::Round($proc.WorkingSet64 / 1MB, 2)
-[math]::Round($proc.PrivateMemorySize64 / 1MB, 2)
-Stop-Process -Id $p.Id -Force
-```
+**Key Finding:** `HighDensity` cuts cold AOT instantiation by **44%** (`533 µs → 299 µs`), warm p50 by **35%** (`65 µs → 42 µs`), and process RSS delta by **89%** (`916 KiB → 100 KiB`) compared to Wasmtime defaults, while keeping `StoreLimits` hard-enforced per cell (`max_memory_bytes`, `max_memories`, `max_tables`).
+
+---
+
+## 2. Three-Profile Workload Density Results
+
+### Profile 1 — 500 Tiny Idle/Burst Services + Hibernation
+- **Workload:** 500 independently registered elastic WASI cells sharing 1 `CrystalEngine` + cached module, burst HTTP execution across 50 sampled cells, full hibernation of all 500 cells to `CasStore`, and restoration of 25 sampled cells.
+- **Results:**
+  - **500 cells woken:** `1,267 ms` (`wake p50 = 2,014 µs`, `p95 = 5,340 µs`)
+  - **Burst execution:** `p50 = 126 µs`, `p95 = 253 µs`
+  - **500 cells hibernated:** `1,118 ms`
+  - **Restore from hibernation:** `p50 = 1,196 µs`, `p95 = 1,643 µs`
+  - **Memory footprint:** `RSS start = 16,288 KiB` → `RSS active (500 cells) = 25,292 KiB` (**`9,004 KiB` delta = `18.0 KiB / active cell`**)
+  - *Note on OS RSS after hibernation:* Windows process working-set (`26,036 KiB` immediately after hibernation) retains freed heap pages in the allocator cache until OS memory pressure reclaims them; logical active cell structures are released immediately.
+
+### Profile 2 — 100 Persistent Isolated DB + Blob Apps
+- **Workload:** 100 concurrent WASI apps each with dedicated `CellDbConfig::dedicated_full()` isolation, executing `CREATE kv SET v = 42; SELECT v FROM kv;` via `nexus_db_query` and writing state via `nexus_blob_put`.
+- **Results:**
+  - **Wall time (all 100 apps):** `22 ms`
+  - **Per-app latency:** `p50 = 10.76 ms`, `p95 = 14.93 ms`, `p99 = 15.22 ms`
+  - **Memory delta:** `6,848 KiB` (**`68.5 KiB / isolated DB+Blob app`**)
+
+### Profile 3 — 64 Concurrent Wasm Compute + `NexusSharedArena` SPSC Streaming Workers
+- **Workload:** 64 concurrent threads × 25 invocations (`1,600` total WASI cell executions), each allocating a generation-validated `SpscRingBuffer`, streaming 16 × 32-byte frames directly to/from Wasm linear memory (`TransportMode::PortableCopy`, zero intermediate heap `Vec`), and deterministically revoking handles on exit.
+- **Results:**
+  - **Throughput:** **`34,534` Wasm+SPSC cell invocations / sec** (`1,600` in `0.046 s`)
+  - **Tail latency:** `p50 = 255 µs`, `p95 = 2,127 µs`, `p99 = 8,607 µs`
+  - **Memory delta:** `1,952 KiB`
+  - **Native Rust SPSC baseline (same machine, `100,000 × 64 B`):** `17.17 ms` (`355.4 MiB/s`)

@@ -364,6 +364,7 @@ impl WasmDbMount {
             stdin: query.as_bytes().to_vec(),
             preopen_dirs: vec![(work_dir.clone(), mount, true)],
             fuel_limit,
+            ..WasiRunConfig::default()
         };
 
         let crystal = self.crystal.clone();

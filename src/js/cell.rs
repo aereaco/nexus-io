@@ -947,6 +947,7 @@ impl CellManager {
                     stdin: body.to_vec(),
                     preopen_dirs,
                     fuel_limit,
+                    ..crate::compute::crystal::WasiRunConfig::default()
                 };
                 let out = tokio::task::spawn_blocking(move || {
                     crystal.run_wasi_with_host(&module_bytes, cfg, host)
@@ -981,6 +982,7 @@ impl CellManager {
                                 stdin: body_vec,
                                 preopen_dirs: Vec::new(),
                                 fuel_limit: fuel_cap,
+                                ..crate::compute::crystal::WasiRunConfig::default()
                             };
                             crystal.run_wasi_aot_with_host(&engine_wasm, cfg, host)
                         } else {
