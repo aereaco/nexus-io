@@ -180,10 +180,46 @@ impl SessionService {
         let ddl = "\
             DEFINE TABLE IF NOT EXISTS sys_iam_session SCHEMALESS;\
             DEFINE TABLE IF NOT EXISTS sys_iam_session_tok SCHEMALESS;\
+            DEFINE TABLE IF NOT EXISTS sys_iam_revocation_epoch SCHEMALESS;\
             DEFINE TABLE IF NOT EXISTS sys_iam_device SCHEMALESS;\
             DEFINE TABLE IF NOT EXISTS sys_iam_cluster_trust SCHEMALESS;";
         let _ = self.db.client.query(ddl).await;
         Ok(())
+    }
+
+    /// Durable monotonic revocation watermark for cross-instance revocation coherence.
+    pub async fn bump_revocation_epoch(&self, identity_id: &str) -> Result<u64> {
+        self.ensure_tables().await?;
+        let cur = self.get_revocation_epoch(identity_id).await.unwrap_or(0);
+        let next = cur + 1;
+        let rec = serde_json::json!({
+            "identity_id": identity_id,
+            "epoch": next,
+            "updated_at_ms": now_ms(),
+        });
+        self.db
+            .client
+            .query("UPSERT type::record('sys_iam_revocation_epoch', $id) CONTENT $r;")
+            .bind(("id", identity_id.to_string()))
+            .bind(("r", rec))
+            .await?
+            .check()?;
+        Ok(next)
+    }
+
+    pub async fn get_revocation_epoch(&self, identity_id: &str) -> Result<u64> {
+        self.ensure_tables().await?;
+        let mut resp = self
+            .db
+            .client
+            .query("SELECT * FROM type::record('sys_iam_revocation_epoch', $id)")
+            .bind(("id", identity_id.to_string()))
+            .await?;
+        let rows: Vec<serde_json::Value> = resp.take(0).unwrap_or_default();
+        Ok(rows
+            .first()
+            .and_then(|v| v["epoch"].as_u64())
+            .unwrap_or(0))
     }
 
     /// Persist-before-publish guarantee: durable `nexus-db` write + token index MUST succeed
@@ -384,6 +420,7 @@ impl SessionService {
             }
             rec.revoked = true;
             self.persist_session(&rec).await?;
+            let _ = self.bump_revocation_epoch(&rec.identity_id).await;
             let _ = self
                 .idp
                 .append_audit("instance", actor, "session.revoke", session_id, "ok", &rec.identity_id)
@@ -409,6 +446,9 @@ impl SessionService {
                 self.persist_session(&ses).await?;
                 count += 1;
             }
+        }
+        if count > 0 {
+            let _ = self.bump_revocation_epoch(identity_id).await;
         }
         let _ = self
             .idp

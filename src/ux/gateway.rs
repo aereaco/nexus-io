@@ -838,6 +838,7 @@ impl UxGateway {
                     Router::with_path("/oauth/v2/authorize")
                         .hoop(gate.clone())
                         .hoop(crate::ux::iam::IamMiddleware::authenticated(self.db.clone()))
+                        .get(OAuthAuthorizeHandler { db: self.db.clone() })
                         .post(OAuthAuthorizeHandler { db: self.db.clone() }),
                 )
                 .push(
@@ -996,6 +997,40 @@ impl UxGateway {
                     Router::with_path("/_nexus/iam/saml/acs")
                         .hoop(gate.clone())
                         .post(IamSamlAcsHandler { db: self.db.clone() }),
+                )
+                .push(
+                    Router::with_path("/scim/v2/ServiceProviderConfig")
+                        .get(ScimSpcHandler),
+                )
+                .push(
+                    Router::with_path("/scim/v2/Users")
+                        .hoop(gate.clone())
+                        .hoop(crate::ux::iam::IamMiddleware::admin(self.db.clone()))
+                        .get(ScimUsersHandler { db: self.db.clone() })
+                        .post(ScimUsersHandler { db: self.db.clone() }),
+                )
+                .push(
+                    Router::with_path("/scim/v2/Users/{id}")
+                        .hoop(gate.clone())
+                        .hoop(crate::ux::iam::IamMiddleware::admin(self.db.clone()))
+                        .get(ScimUsersHandler { db: self.db.clone() })
+                        .patch(ScimUsersHandler { db: self.db.clone() })
+                        .delete(ScimUsersHandler { db: self.db.clone() }),
+                )
+                .push(
+                    Router::with_path("/scim/v2/Groups")
+                        .hoop(gate.clone())
+                        .hoop(crate::ux::iam::IamMiddleware::admin(self.db.clone()))
+                        .get(ScimGroupsHandler { db: self.db.clone() })
+                        .post(ScimGroupsHandler { db: self.db.clone() }),
+                )
+                .push(
+                    Router::with_path("/scim/v2/Groups/{id}")
+                        .hoop(gate.clone())
+                        .hoop(crate::ux::iam::IamMiddleware::admin(self.db.clone()))
+                        .get(ScimGroupsHandler { db: self.db.clone() })
+                        .patch(ScimGroupsHandler { db: self.db.clone() })
+                        .delete(ScimGroupsHandler { db: self.db.clone() }),
                 )
                 .push(
                     Router::with_path("/_nexus/iam/sessions")
@@ -2005,7 +2040,16 @@ impl Handler for OAuthAuthorizeHandler {
         fn default_oidc_scope() -> String { "openid profile".into() }
         fn default_s256() -> String { "S256".into() }
 
-        let Ok(body) = req.parse_json::<AuthzReq>().await else {
+        let is_get = *req.method() == salvo::http::Method::GET;
+        let parsed = if is_get {
+            req.parse_queries::<AuthzReq>().ok()
+        } else {
+            req.parse_json::<AuthzReq>()
+                .await
+                .ok()
+                .or_else(|| req.parse_queries::<AuthzReq>().ok())
+        };
+        let Some(body) = parsed else {
             res.status_code(StatusCode::BAD_REQUEST);
             res.render(Json(serde_json::json!({ "error": "invalid_request" })));
             return;
@@ -2035,12 +2079,24 @@ impl Handler for OAuthAuthorizeHandler {
             .await
         {
             Ok(code) => {
-                res.status_code(StatusCode::OK);
-                res.render(Json(serde_json::json!({
-                    "code": code,
-                    "state": body.state,
-                    "redirect_uri": body.redirect_uri,
-                })));
+                if is_get {
+                    let sep = if body.redirect_uri.contains('?') { '&' } else { '?' };
+                    let mut loc = format!("{}{}code={}", body.redirect_uri, sep, code);
+                    if let Some(ref st) = body.state {
+                        loc.push_str(&format!("&state={}", st));
+                    }
+                    res.status_code(StatusCode::FOUND);
+                    if let Ok(hv) = salvo::http::HeaderValue::from_str(&loc) {
+                        res.headers_mut().insert(salvo::http::header::LOCATION, hv);
+                    }
+                } else {
+                    res.status_code(StatusCode::OK);
+                    res.render(Json(serde_json::json!({
+                        "code": code,
+                        "state": body.state,
+                        "redirect_uri": body.redirect_uri,
+                    })));
+                }
             }
             Err(e) => {
                 res.status_code(StatusCode::BAD_REQUEST);
@@ -2075,11 +2131,33 @@ impl Handler for OAuthTokenHandler {
             #[serde(default)]
             scope: Option<String>,
         }
-        let Ok(body) = req.parse_json::<TokenReq>().await else {
+        // RFC 6749 standard: accept application/x-www-form-urlencoded OR JSON, plus HTTP Basic client auth
+        let parsed = match req.parse_form::<TokenReq>().await {
+            Ok(v) => Some(v),
+            Err(_) => req.parse_json::<TokenReq>().await.ok(),
+        };
+        let Some(mut body) = parsed else {
             res.status_code(StatusCode::BAD_REQUEST);
             res.render(Json(serde_json::json!({ "error": "invalid_request" })));
             return;
         };
+        if body.client_secret.is_none() {
+            if let Some(auth_hdr) = req.headers().get("authorization").and_then(|v| v.to_str().ok()) {
+                if let Some(b64) = auth_hdr.strip_prefix("Basic ") {
+                    use base64::Engine as _;
+                    if let Ok(raw) = base64::engine::general_purpose::STANDARD.decode(b64.trim()) {
+                        if let Ok(creds) = String::from_utf8(raw) {
+                            if let Some((cid, csec)) = creds.split_once(':') {
+                                if body.client_id.is_empty() {
+                                    body.client_id = cid.to_string();
+                                }
+                                body.client_secret = Some(csec.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
         let idp = crate::iam::idp::NexusIdp::new(self.db.clone());
         match idp
             .exchange_token(
@@ -3244,6 +3322,174 @@ impl Handler for IamSamlAcsHandler {
                 res.status_code(StatusCode::BAD_REQUEST);
                 res.render(Json(serde_json::json!({ "error": e.to_string() })));
             }
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ScimSpcHandler;
+
+#[async_trait]
+impl Handler for ScimSpcHandler {
+    async fn handle(&self, _req: &mut Request, _depot: &mut Depot, res: &mut Response, _ctrl: &mut FlowCtrl) {
+        res.status_code(StatusCode::OK);
+        res.render(Json(crate::iam::scim::ScimService::service_provider_config()));
+    }
+}
+
+#[derive(Clone)]
+struct ScimUsersHandler {
+    db: Arc<Database>,
+}
+
+#[async_trait]
+impl Handler for ScimUsersHandler {
+    async fn handle(&self, req: &mut Request, depot: &mut Depot, res: &mut Response, _ctrl: &mut FlowCtrl) {
+        let auth = crate::ux::iam::depot_auth_context(depot);
+        let actor = auth.as_ref().and_then(|a| a.actor.clone()).unwrap_or_else(|| "scim".into());
+        let scim = crate::iam::scim::ScimService::new(self.db.clone());
+        let id_param = req.param::<String>("id");
+        match *req.method() {
+            salvo::http::Method::GET => {
+                if let Some(id) = id_param {
+                    match scim.get_user(&id).await {
+                        Ok(Some(u)) => { res.status_code(StatusCode::OK); res.render(Json(u)); }
+                        Ok(None) => { res.status_code(StatusCode::NOT_FOUND); res.render(Json(serde_json::json!({ "status": "404", "detail": "Not found" }))); }
+                        Err(e) => { res.status_code(StatusCode::INTERNAL_SERVER_ERROR); res.render(Json(serde_json::json!({ "detail": e.to_string() }))); }
+                    }
+                } else {
+                    let org_id = req.query::<String>("org_id");
+                    let filter = req.query::<String>("filter");
+                    match scim.list_users(org_id.as_deref(), filter.as_deref()).await {
+                        Ok(list) => { res.status_code(StatusCode::OK); res.render(Json(list)); }
+                        Err(e) => { res.status_code(StatusCode::INTERNAL_SERVER_ERROR); res.render(Json(serde_json::json!({ "detail": e.to_string() }))); }
+                    }
+                }
+            }
+            salvo::http::Method::POST => {
+                #[derive(serde::Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct CreateScimUserReq {
+                    user_name: String,
+                    #[serde(default)]
+                    display_name: Option<String>,
+                    #[serde(default)]
+                    external_id: Option<String>,
+                    #[serde(default)]
+                    emails: Vec<crate::iam::scim::ScimEmail>,
+                    #[serde(default = "default_true")]
+                    active: bool,
+                    #[serde(default = "default_scim_org")]
+                    org_id: String,
+                }
+                fn default_true() -> bool { true }
+                fn default_scim_org() -> String { "default".into() }
+                let Ok(body) = req.parse_json::<CreateScimUserReq>().await else {
+                    res.status_code(StatusCode::BAD_REQUEST);
+                    return;
+                };
+                match scim
+                    .create_user(&actor, &body.org_id, &body.user_name, body.display_name, body.external_id, body.emails, body.active)
+                    .await
+                {
+                    Ok(u) => { res.status_code(StatusCode::CREATED); res.render(Json(u)); }
+                    Err(e) => { res.status_code(StatusCode::CONFLICT); res.render(Json(serde_json::json!({ "detail": e.to_string() }))); }
+                }
+            }
+            salvo::http::Method::PATCH => {
+                let id = id_param.unwrap_or_default();
+                let Ok(patch) = req.parse_json::<crate::iam::scim::ScimPatchRequest>().await else {
+                    res.status_code(StatusCode::BAD_REQUEST);
+                    return;
+                };
+                match scim.patch_user(&actor, &id, &patch).await {
+                    Ok(u) => { res.status_code(StatusCode::OK); res.render(Json(u)); }
+                    Err(e) => { res.status_code(StatusCode::BAD_REQUEST); res.render(Json(serde_json::json!({ "detail": e.to_string() }))); }
+                }
+            }
+            salvo::http::Method::DELETE => {
+                let id = id_param.unwrap_or_default();
+                match scim.delete_user(&actor, &id).await {
+                    Ok(true) => { res.status_code(StatusCode::NO_CONTENT); }
+                    Ok(false) => { res.status_code(StatusCode::NOT_FOUND); }
+                    Err(e) => { res.status_code(StatusCode::BAD_REQUEST); res.render(Json(serde_json::json!({ "detail": e.to_string() }))); }
+                }
+            }
+            _ => { res.status_code(StatusCode::METHOD_NOT_ALLOWED); }
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ScimGroupsHandler {
+    db: Arc<Database>,
+}
+
+#[async_trait]
+impl Handler for ScimGroupsHandler {
+    async fn handle(&self, req: &mut Request, depot: &mut Depot, res: &mut Response, _ctrl: &mut FlowCtrl) {
+        let auth = crate::ux::iam::depot_auth_context(depot);
+        let actor = auth.as_ref().and_then(|a| a.actor.clone()).unwrap_or_else(|| "scim".into());
+        let scim = crate::iam::scim::ScimService::new(self.db.clone());
+        let id_param = req.param::<String>("id");
+        match *req.method() {
+            salvo::http::Method::GET => {
+                if let Some(id) = id_param {
+                    match scim.get_group(&id).await {
+                        Ok(Some(g)) => { res.status_code(StatusCode::OK); res.render(Json(g)); }
+                        Ok(None) => { res.status_code(StatusCode::NOT_FOUND); }
+                        Err(e) => { res.status_code(StatusCode::INTERNAL_SERVER_ERROR); res.render(Json(serde_json::json!({ "detail": e.to_string() }))); }
+                    }
+                } else {
+                    let org_id = req.query::<String>("org_id");
+                    match scim.list_groups(org_id.as_deref()).await {
+                        Ok(list) => { res.status_code(StatusCode::OK); res.render(Json(list)); }
+                        Err(e) => { res.status_code(StatusCode::INTERNAL_SERVER_ERROR); res.render(Json(serde_json::json!({ "detail": e.to_string() }))); }
+                    }
+                }
+            }
+            salvo::http::Method::POST => {
+                #[derive(serde::Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct CreateScimGroupReq {
+                    display_name: String,
+                    #[serde(default)]
+                    external_id: Option<String>,
+                    #[serde(default)]
+                    members: Vec<crate::iam::scim::ScimGroupMember>,
+                    #[serde(default = "default_scim_org")]
+                    org_id: String,
+                }
+                fn default_scim_org() -> String { "default".into() }
+                let Ok(body) = req.parse_json::<CreateScimGroupReq>().await else {
+                    res.status_code(StatusCode::BAD_REQUEST);
+                    return;
+                };
+                match scim.create_group(&actor, &body.org_id, &body.display_name, body.external_id, body.members).await {
+                    Ok(g) => { res.status_code(StatusCode::CREATED); res.render(Json(g)); }
+                    Err(e) => { res.status_code(StatusCode::BAD_REQUEST); res.render(Json(serde_json::json!({ "detail": e.to_string() }))); }
+                }
+            }
+            salvo::http::Method::PATCH => {
+                let id = id_param.unwrap_or_default();
+                let Ok(patch) = req.parse_json::<crate::iam::scim::ScimPatchRequest>().await else {
+                    res.status_code(StatusCode::BAD_REQUEST);
+                    return;
+                };
+                match scim.patch_group(&actor, &id, &patch).await {
+                    Ok(g) => { res.status_code(StatusCode::OK); res.render(Json(g)); }
+                    Err(e) => { res.status_code(StatusCode::BAD_REQUEST); res.render(Json(serde_json::json!({ "detail": e.to_string() }))); }
+                }
+            }
+            salvo::http::Method::DELETE => {
+                let id = id_param.unwrap_or_default();
+                match scim.delete_group(&actor, &id).await {
+                    Ok(true) => { res.status_code(StatusCode::NO_CONTENT); }
+                    Ok(false) => { res.status_code(StatusCode::NOT_FOUND); }
+                    Err(e) => { res.status_code(StatusCode::BAD_REQUEST); res.render(Json(serde_json::json!({ "detail": e.to_string() }))); }
+                }
+            }
+            _ => { res.status_code(StatusCode::METHOD_NOT_ALLOWED); }
         }
     }
 }

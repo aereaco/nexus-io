@@ -11,12 +11,20 @@
 //!    is emitted as standard OASIS `EntityDescriptor` XML.
 
 use anyhow::{anyhow, Result};
+use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::db::Database;
 use crate::iam::idp::{validate_eddsa_jwt, JwtValidationPolicy, NexusIdp};
+
+const MAX_REPLAY_ENTRIES: usize = 32_768;
+
+/// Process-local replay cache keyed by `(db_ptr_addr, kind:token_id) -> expires_at_ms`.
+static REPLAY_CACHE: Lazy<RwLock<HashMap<(usize, String), u64>>> =
+    Lazy::new(|| RwLock::new(HashMap::new()));
 
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -270,8 +278,62 @@ impl FederationService {
         self.idp.ensure_tables().await?;
         let ddl = "\
             DEFINE TABLE IF NOT EXISTS sys_iam_fed_provider SCHEMALESS;\
-            DEFINE TABLE IF NOT EXISTS sys_iam_identity_link SCHEMALESS;";
+            DEFINE TABLE IF NOT EXISTS sys_iam_identity_link SCHEMALESS;\
+            DEFINE TABLE IF NOT EXISTS sys_iam_replay_jti SCHEMALESS;";
         let _ = self.db.client.query(ddl).await;
+        Ok(())
+    }
+
+    fn db_key(&self) -> usize {
+        Arc::as_ptr(&self.db) as usize
+    }
+
+    /// Single-use replay protection for SAML `Assertion ID` and OIDC `jti` values.
+    /// Persists durably to `sys_iam_replay_jti` before publishing to the bounded `REPLAY_CACHE`.
+    async fn consume_replay_id(&self, kind: &str, token_id: &str, expires_at_ms: u64) -> Result<()> {
+        let key = format!("{}:{}", kind, token_id.trim());
+        let dbk = self.db_key();
+        let now = now_ms();
+        if let Ok(cache) = REPLAY_CACHE.read() {
+            if let Some(&exp) = cache.get(&(dbk, key.clone())) {
+                if exp > now {
+                    anyhow::bail!("Replay detected: {} '{}' has already been consumed", kind, token_id);
+                }
+            }
+        }
+        self.ensure_tables().await?;
+        let mut resp = self
+            .db
+            .client
+            .query("SELECT * FROM type::record('sys_iam_replay_jti', $id)")
+            .bind(("id", key.clone()))
+            .await?;
+        let rows: Vec<serde_json::Value> = resp.take(0).unwrap_or_default();
+        if let Some(existing) = rows.first() {
+            let exp = existing["expires_at_ms"].as_u64().unwrap_or(0);
+            if exp > now {
+                anyhow::bail!("Replay detected: {} '{}' has already been consumed", kind, token_id);
+            }
+        }
+        let rec = serde_json::json!({
+            "key": key,
+            "kind": kind,
+            "consumed_at_ms": now,
+            "expires_at_ms": expires_at_ms.max(now + 60_000),
+        });
+        self.db
+            .client
+            .query("UPSERT type::record('sys_iam_replay_jti', $id) CONTENT $r;")
+            .bind(("id", key.clone()))
+            .bind(("r", rec))
+            .await?
+            .check()?;
+        if let Ok(mut cache) = REPLAY_CACHE.write() {
+            if cache.len() >= MAX_REPLAY_ENTRIES {
+                cache.retain(|_, exp| *exp > now);
+            }
+            cache.insert((dbk, key), expires_at_ms.max(now + 60_000));
+        }
         Ok(())
     }
 
@@ -601,7 +663,12 @@ impl FederationService {
             .as_deref()
             .ok_or_else(|| anyhow!("Provider '{}' missing client_id for audience validation", provider_id))?;
         let pol = JwtValidationPolicy::new(&prov.issuer, aud);
-        validate_eddsa_jwt(raw_id_token, jwks, &pol)
+        let claims = validate_eddsa_jwt(raw_id_token, jwks, &pol)?;
+        if let Some(jti) = claims["jti"].as_str().map(str::trim).filter(|s| !s.is_empty()) {
+            let exp_ms = claims["exp"].as_u64().unwrap_or(0).saturating_mul(1000);
+            self.consume_replay_id("oidc_jti", jti, exp_ms).await?;
+        }
+        Ok(claims)
     }
 
     /// Validate a SAML 2.0 HTTP-POST `SAMLResponse` (base64 XML) against a registered SAML provider.
@@ -721,7 +788,11 @@ impl FederationService {
         let name_id = extract_xml_tag_text(&xml, "NameID")
             .filter(|s| !s.is_empty())
             .ok_or_else(|| anyhow!("SAMLResponse missing NameID"))?;
-        let assertion_id = extract_xml_attr(&xml, "Assertion", "ID");
+        let assertion_id = extract_xml_attr(&xml, "Assertion", "ID")
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| anyhow!("SAML Assertion missing required ID attribute for replay protection"))?;
+        self.consume_replay_id("saml_assertion", &assertion_id, noa_s.saturating_mul(1000))
+            .await?;
         let email = extract_xml_tag_text(&xml, "AttributeValue")
             .filter(|s| s.contains('@'));
 
@@ -730,7 +801,7 @@ impl FederationService {
             name_id,
             audience,
             email,
-            assertion_id,
+            assertion_id: Some(assertion_id),
         })
     }
 
@@ -987,6 +1058,14 @@ mod tests {
             .unwrap();
         assert_eq!(verified.name_id, "saml_user_42");
         assert_eq!(verified.email.as_deref(), Some("alice@samlco.example"));
+
+        // Replaying the exact same SAML assertion ID MUST be rejected!
+        assert!(
+            fed.verify_saml_response(&saml_prov.provider_id, &saml_b64, "https://nexus.aerea.co/saml")
+                .await
+                .is_err(),
+            "Replayed SAML assertion MUST be rejected!"
+        );
 
         // Wrong audience or tampered assertion MUST fail closed!
         assert!(fed

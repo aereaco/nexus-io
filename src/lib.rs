@@ -6,6 +6,7 @@ pub mod ffi;
 pub mod hardware;
 pub mod iam;
 pub mod js;
+pub mod mesh;
 pub mod observability;
 pub mod registry;
 pub mod runtime;
