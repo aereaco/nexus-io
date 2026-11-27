@@ -1,4 +1,5 @@
 pub mod capabilities;
+pub mod federation;
 pub mod flows;
 pub mod idp;
 pub mod webauthn;

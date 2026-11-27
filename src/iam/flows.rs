@@ -620,13 +620,31 @@ impl AuthFlowEngine {
                     .as_deref()
                     .filter(|s| !s.is_empty())
                     .ok_or_else(|| anyhow!("federated_subject required for provider '{}'", provider_id))?;
-                if !exec.amr.iter().any(|m| m == "fed") {
-                    exec.amr.push("fed".into());
+                let fed = crate::iam::federation::FederationService::new(self.db.clone());
+                match fed.resolve_federated_login(provider_id, fed_sub, None).await? {
+                    crate::iam::federation::FederatedLoginResolution::Linked { identity_id, link_id } => {
+                        if let Some(ref existing) = exec.identity_id {
+                            if existing != &identity_id {
+                                anyhow::bail!("Federated link identity mismatch");
+                            }
+                        } else {
+                            exec.identity_id = Some(identity_id);
+                        }
+                        if !exec.amr.iter().any(|m| m == "fed") {
+                            exec.amr.push("fed".into());
+                        }
+                        if !exec.authorities.contains(&AuthAuthority::Federated) {
+                            exec.authorities.push(AuthAuthority::Federated);
+                        }
+                        Ok(format!("federated={} link={} provider={}", fed_sub, link_id, provider_id))
+                    }
+                    crate::iam::federation::FederatedLoginResolution::ExplicitLinkRequired { reason } => {
+                        Err(anyhow!("{}", reason))
+                    }
+                    crate::iam::federation::FederatedLoginResolution::Unlinked => {
+                        Err(anyhow!("External subject '{}' is not explicitly linked to a Nexus identity", fed_sub))
+                    }
                 }
-                if !exec.authorities.contains(&AuthAuthority::Federated) {
-                    exec.authorities.push(AuthAuthority::Federated);
-                }
-                Ok(format!("federated={} provider={}", fed_sub, provider_id))
             }
             AuthStageKind::ConditionalBranch {
                 condition,

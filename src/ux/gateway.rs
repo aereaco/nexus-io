@@ -970,6 +970,29 @@ impl UxGateway {
                         .delete(IamWebAuthnCredsHandler { db: self.db.clone() }),
                 )
                 .push(
+                    Router::with_path("/_nexus/iam/federation/providers")
+                        .hoop(gate.clone())
+                        .hoop(crate::ux::iam::IamMiddleware::authenticated(self.db.clone()))
+                        .get(IamFedProvidersHandler { db: self.db.clone() })
+                        .post(IamFedProvidersHandler { db: self.db.clone() }),
+                )
+                .push(
+                    Router::with_path("/_nexus/iam/federation/links")
+                        .hoop(gate.clone())
+                        .hoop(crate::ux::iam::IamMiddleware::authenticated(self.db.clone()))
+                        .get(IamFedLinksHandler { db: self.db.clone() })
+                        .post(IamFedLinksHandler { db: self.db.clone() }),
+                )
+                .push(
+                    Router::with_path("/_nexus/iam/federation/discover")
+                        .hoop(gate.clone())
+                        .post(IamFedDiscoverHandler { db: self.db.clone() }),
+                )
+                .push(
+                    Router::with_path("/_nexus/iam/saml/metadata")
+                        .get(IamSamlMetadataHandler),
+                )
+                .push(
                     Router::with_path("/_nexus/iam/clients")
                         .hoop(gate.clone())
                         .hoop(crate::ux::iam::IamMiddleware::admin(self.db.clone()))
@@ -2895,6 +2918,210 @@ impl Handler for IamWebAuthnCredsHandler {
             }
             _ => { res.status_code(StatusCode::METHOD_NOT_ALLOWED); }
         }
+    }
+}
+
+#[derive(Clone)]
+struct IamFedProvidersHandler {
+    db: Arc<Database>,
+}
+
+#[async_trait]
+impl Handler for IamFedProvidersHandler {
+    async fn handle(&self, req: &mut Request, depot: &mut Depot, res: &mut Response, _ctrl: &mut FlowCtrl) {
+        let fed = crate::iam::federation::FederationService::new(self.db.clone());
+        match *req.method() {
+            salvo::http::Method::GET => {
+                let org_id = req.query::<String>("org_id");
+                match fed.list_providers(org_id.as_deref()).await {
+                    Ok(providers) => {
+                        res.status_code(StatusCode::OK);
+                        res.render(Json(serde_json::json!({ "providers": providers })));
+                    }
+                    Err(e) => {
+                        res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+                        res.render(Json(serde_json::json!({ "error": e.to_string() })));
+                    }
+                }
+            }
+            salvo::http::Method::POST => {
+                #[derive(serde::Deserialize)]
+                struct RegProvReq {
+                    org_id: String,
+                    name: String,
+                    protocol: crate::iam::federation::FederationProtocol,
+                    issuer: String,
+                    sso_url: String,
+                    #[serde(default)]
+                    token_endpoint: Option<String>,
+                    #[serde(default)]
+                    client_id: Option<String>,
+                    #[serde(default)]
+                    client_secret: Option<String>,
+                    #[serde(default)]
+                    jwks_json: Option<serde_json::Value>,
+                    #[serde(default)]
+                    x509_cert_pem: Option<String>,
+                    #[serde(default)]
+                    verified_domains: Vec<String>,
+                }
+                let Ok(body) = req.parse_json::<RegProvReq>().await else {
+                    res.status_code(StatusCode::BAD_REQUEST);
+                    return;
+                };
+                let auth = crate::ux::iam::depot_auth_context(depot);
+                let actor = auth.as_ref().and_then(|a| a.actor.clone()).unwrap_or_default();
+                let is_admin = auth.as_ref().map(|a| a.roles.contains(&nexus_db::auth::Role::Owner)).unwrap_or(false);
+                let idp = crate::iam::idp::NexusIdp::new(self.db.clone());
+                if !matches!(idp.evaluate_permission(&actor, is_admin, &body.org_id, "iam.policy.update").await, Ok(d) if d.allowed) {
+                    res.status_code(StatusCode::FORBIDDEN);
+                    res.render(Json(serde_json::json!({ "error": "Forbidden" })));
+                    return;
+                }
+                match fed
+                    .register_provider(
+                        &actor,
+                        &body.org_id,
+                        &body.name,
+                        body.protocol,
+                        &body.issuer,
+                        &body.sso_url,
+                        body.token_endpoint,
+                        body.client_id,
+                        body.client_secret.as_deref(),
+                        body.jwks_json,
+                        body.x509_cert_pem,
+                        body.verified_domains,
+                    )
+                    .await
+                {
+                    Ok(prov) => {
+                        res.status_code(StatusCode::CREATED);
+                        res.render(Json(prov));
+                    }
+                    Err(e) => {
+                        res.status_code(StatusCode::BAD_REQUEST);
+                        res.render(Json(serde_json::json!({ "error": e.to_string() })));
+                    }
+                }
+            }
+            _ => { res.status_code(StatusCode::METHOD_NOT_ALLOWED); }
+        }
+    }
+}
+
+#[derive(Clone)]
+struct IamFedLinksHandler {
+    db: Arc<Database>,
+}
+
+#[async_trait]
+impl Handler for IamFedLinksHandler {
+    async fn handle(&self, req: &mut Request, depot: &mut Depot, res: &mut Response, _ctrl: &mut FlowCtrl) {
+        let auth = crate::ux::iam::depot_auth_context(depot);
+        let actor = auth.as_ref().and_then(|a| a.actor.clone()).unwrap_or_default();
+        let fed = crate::iam::federation::FederationService::new(self.db.clone());
+        match *req.method() {
+            salvo::http::Method::GET => {
+                let ident = req.query::<String>("identity_id").unwrap_or_else(|| actor.clone());
+                match fed.list_links_for_identity(&ident).await {
+                    Ok(links) => {
+                        res.status_code(StatusCode::OK);
+                        res.render(Json(serde_json::json!({ "links": links })));
+                    }
+                    Err(e) => {
+                        res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+                        res.render(Json(serde_json::json!({ "error": e.to_string() })));
+                    }
+                }
+            }
+            salvo::http::Method::POST => {
+                #[derive(serde::Deserialize)]
+                struct LinkReq {
+                    identity_id: String,
+                    provider_id: String,
+                    external_subject: String,
+                    #[serde(default)]
+                    linked_email: Option<String>,
+                }
+                let Ok(body) = req.parse_json::<LinkReq>().await else {
+                    res.status_code(StatusCode::BAD_REQUEST);
+                    return;
+                };
+                match fed
+                    .link_identity(&actor, &body.identity_id, &body.provider_id, &body.external_subject, body.linked_email)
+                    .await
+                {
+                    Ok(link) => {
+                        res.status_code(StatusCode::CREATED);
+                        res.render(Json(link));
+                    }
+                    Err(e) => {
+                        res.status_code(StatusCode::BAD_REQUEST);
+                        res.render(Json(serde_json::json!({ "error": e.to_string() })));
+                    }
+                }
+            }
+            _ => { res.status_code(StatusCode::METHOD_NOT_ALLOWED); }
+        }
+    }
+}
+
+#[derive(Clone)]
+struct IamFedDiscoverHandler {
+    db: Arc<Database>,
+}
+
+#[async_trait]
+impl Handler for IamFedDiscoverHandler {
+    async fn handle(&self, req: &mut Request, _depot: &mut Depot, res: &mut Response, _ctrl: &mut FlowCtrl) {
+        #[derive(serde::Deserialize)]
+        struct DiscReq {
+            email: String,
+        }
+        let Ok(body) = req.parse_json::<DiscReq>().await else {
+            res.status_code(StatusCode::BAD_REQUEST);
+            return;
+        };
+        let fed = crate::iam::federation::FederationService::new(self.db.clone());
+        match fed.discover_by_email(&body.email).await {
+            Ok(d) => {
+                res.status_code(StatusCode::OK);
+                res.render(Json(d));
+            }
+            Err(e) => {
+                res.status_code(StatusCode::BAD_REQUEST);
+                res.render(Json(serde_json::json!({ "error": e.to_string() })));
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+struct IamSamlMetadataHandler;
+
+#[async_trait]
+impl Handler for IamSamlMetadataHandler {
+    async fn handle(&self, req: &mut Request, _depot: &mut Depot, res: &mut Response, _ctrl: &mut FlowCtrl) {
+        let host = req
+            .headers()
+            .get("host")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("127.0.0.1:8443");
+        let scheme = if req.headers().get("x-forwarded-proto").and_then(|v| v.to_str().ok()) == Some("https") {
+            "https"
+        } else {
+            "http"
+        };
+        let entity_id = format!("{}://{}/_nexus/iam/saml/metadata", scheme, host);
+        let acs_url = format!("{}://{}/_nexus/iam/saml/acs", scheme, host);
+        let xml = crate::iam::federation::FederationService::saml_sp_metadata_xml(&entity_id, &acs_url);
+        res.status_code(StatusCode::OK);
+        res.headers_mut().insert(
+            salvo::http::header::CONTENT_TYPE,
+            salvo::http::HeaderValue::from_static("application/samlmetadata+xml; charset=utf-8"),
+        );
+        res.body(xml);
     }
 }
 
