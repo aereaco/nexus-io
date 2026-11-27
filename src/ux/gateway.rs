@@ -993,6 +993,38 @@ impl UxGateway {
                         .get(IamSamlMetadataHandler),
                 )
                 .push(
+                    Router::with_path("/_nexus/iam/sessions")
+                        .hoop(gate.clone())
+                        .hoop(crate::ux::iam::IamMiddleware::authenticated(self.db.clone()))
+                        .get(IamSessionsHandler { db: self.db.clone() }),
+                )
+                .push(
+                    Router::with_path("/_nexus/iam/sessions/{session_id}")
+                        .hoop(gate.clone())
+                        .hoop(crate::ux::iam::IamMiddleware::authenticated(self.db.clone()))
+                        .delete(IamSessionsHandler { db: self.db.clone() }),
+                )
+                .push(
+                    Router::with_path("/_nexus/iam/devices")
+                        .hoop(gate.clone())
+                        .hoop(crate::ux::iam::IamMiddleware::authenticated(self.db.clone()))
+                        .get(IamDevicesHandler { db: self.db.clone() })
+                        .post(IamDevicesHandler { db: self.db.clone() }),
+                )
+                .push(
+                    Router::with_path("/_nexus/iam/devices/{device_id}")
+                        .hoop(gate.clone())
+                        .hoop(crate::ux::iam::IamMiddleware::authenticated(self.db.clone()))
+                        .delete(IamDevicesHandler { db: self.db.clone() }),
+                )
+                .push(
+                    Router::with_path("/_nexus/iam/trust/clusters")
+                        .hoop(gate.clone())
+                        .hoop(crate::ux::iam::IamMiddleware::admin(self.db.clone()))
+                        .get(IamClusterTrustHandler { db: self.db.clone() })
+                        .post(IamClusterTrustHandler { db: self.db.clone() }),
+                )
+                .push(
                     Router::with_path("/_nexus/iam/clients")
                         .hoop(gate.clone())
                         .hoop(crate::ux::iam::IamMiddleware::admin(self.db.clone()))
@@ -3122,6 +3154,192 @@ impl Handler for IamSamlMetadataHandler {
             salvo::http::HeaderValue::from_static("application/samlmetadata+xml; charset=utf-8"),
         );
         res.body(xml);
+    }
+}
+
+#[derive(Clone)]
+struct IamSessionsHandler {
+    db: Arc<Database>,
+}
+
+#[async_trait]
+impl Handler for IamSessionsHandler {
+    async fn handle(&self, req: &mut Request, depot: &mut Depot, res: &mut Response, _ctrl: &mut FlowCtrl) {
+        let auth = crate::ux::iam::depot_auth_context(depot);
+        let actor = auth.as_ref().and_then(|a| a.actor.clone()).unwrap_or_default();
+        let svc = crate::iam::sessions::SessionService::new(self.db.clone());
+        match *req.method() {
+            salvo::http::Method::GET => {
+                let ident = req.query::<String>("identity_id").unwrap_or_else(|| actor.clone());
+                match svc.list_sessions(&ident).await {
+                    Ok(sessions) => {
+                        res.status_code(StatusCode::OK);
+                        res.render(Json(serde_json::json!({ "sessions": sessions })));
+                    }
+                    Err(e) => {
+                        res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+                        res.render(Json(serde_json::json!({ "error": e.to_string() })));
+                    }
+                }
+            }
+            salvo::http::Method::DELETE => {
+                let session_id = req.param::<String>("session_id").unwrap_or_default();
+                match svc.revoke_session(&actor, &session_id).await {
+                    Ok(revoked) => {
+                        res.status_code(StatusCode::OK);
+                        res.render(Json(serde_json::json!({ "revoked": revoked })));
+                    }
+                    Err(e) => {
+                        res.status_code(StatusCode::BAD_REQUEST);
+                        res.render(Json(serde_json::json!({ "error": e.to_string() })));
+                    }
+                }
+            }
+            _ => { res.status_code(StatusCode::METHOD_NOT_ALLOWED); }
+        }
+    }
+}
+
+#[derive(Clone)]
+struct IamDevicesHandler {
+    db: Arc<Database>,
+}
+
+#[async_trait]
+impl Handler for IamDevicesHandler {
+    async fn handle(&self, req: &mut Request, depot: &mut Depot, res: &mut Response, _ctrl: &mut FlowCtrl) {
+        let auth = crate::ux::iam::depot_auth_context(depot);
+        let actor = auth.as_ref().and_then(|a| a.actor.clone()).unwrap_or_default();
+        let svc = crate::iam::sessions::SessionService::new(self.db.clone());
+        match *req.method() {
+            salvo::http::Method::GET => {
+                let ident = req.query::<String>("identity_id").unwrap_or_else(|| actor.clone());
+                match svc.list_devices(&ident).await {
+                    Ok(devices) => {
+                        res.status_code(StatusCode::OK);
+                        res.render(Json(serde_json::json!({ "devices": devices })));
+                    }
+                    Err(e) => {
+                        res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+                        res.render(Json(serde_json::json!({ "error": e.to_string() })));
+                    }
+                }
+            }
+            salvo::http::Method::POST => {
+                #[derive(serde::Deserialize)]
+                struct RegDevReq {
+                    #[serde(default)]
+                    identity_id: Option<String>,
+                    label: String,
+                    fingerprint: String,
+                    #[serde(default)]
+                    trust_level: Option<crate::iam::sessions::DeviceTrustLevel>,
+                }
+                let Ok(body) = req.parse_json::<RegDevReq>().await else {
+                    res.status_code(StatusCode::BAD_REQUEST);
+                    return;
+                };
+                let ident = body.identity_id.unwrap_or_else(|| actor.clone());
+                match svc
+                    .register_device(
+                        &ident,
+                        &body.label,
+                        &body.fingerprint,
+                        body.trust_level.unwrap_or(crate::iam::sessions::DeviceTrustLevel::Verified),
+                    )
+                    .await
+                {
+                    Ok(dev) => {
+                        res.status_code(StatusCode::CREATED);
+                        res.render(Json(dev));
+                    }
+                    Err(e) => {
+                        res.status_code(StatusCode::BAD_REQUEST);
+                        res.render(Json(serde_json::json!({ "error": e.to_string() })));
+                    }
+                }
+            }
+            salvo::http::Method::DELETE => {
+                let device_id = req.param::<String>("device_id").unwrap_or_default();
+                let ident = req.query::<String>("identity_id").unwrap_or_else(|| actor.clone());
+                match svc.revoke_device(&actor, &ident, &device_id).await {
+                    Ok(revoked) => {
+                        res.status_code(StatusCode::OK);
+                        res.render(Json(serde_json::json!({ "revoked": revoked })));
+                    }
+                    Err(e) => {
+                        res.status_code(StatusCode::BAD_REQUEST);
+                        res.render(Json(serde_json::json!({ "error": e.to_string() })));
+                    }
+                }
+            }
+            _ => { res.status_code(StatusCode::METHOD_NOT_ALLOWED); }
+        }
+    }
+}
+
+#[derive(Clone)]
+struct IamClusterTrustHandler {
+    db: Arc<Database>,
+}
+
+#[async_trait]
+impl Handler for IamClusterTrustHandler {
+    async fn handle(&self, req: &mut Request, depot: &mut Depot, res: &mut Response, _ctrl: &mut FlowCtrl) {
+        let svc = crate::iam::sessions::SessionService::new(self.db.clone());
+        match *req.method() {
+            salvo::http::Method::GET => match svc.list_trusted_clusters().await {
+                Ok(clusters) => {
+                    res.status_code(StatusCode::OK);
+                    res.render(Json(serde_json::json!({ "clusters": clusters })));
+                }
+                Err(e) => {
+                    res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+                    res.render(Json(serde_json::json!({ "error": e.to_string() })));
+                }
+            },
+            salvo::http::Method::POST => {
+                #[derive(serde::Deserialize)]
+                struct TrustReq {
+                    cluster_id: String,
+                    issuer: String,
+                    root_pubkey: String,
+                    #[serde(default = "default_true")]
+                    allow_portable_import: bool,
+                    #[serde(default = "default_true")]
+                    require_local_mfa: bool,
+                }
+                fn default_true() -> bool { true }
+                let Ok(body) = req.parse_json::<TrustReq>().await else {
+                    res.status_code(StatusCode::BAD_REQUEST);
+                    return;
+                };
+                let actor = crate::ux::iam::depot_auth_context(depot)
+                    .and_then(|a| a.actor)
+                    .unwrap_or_else(|| "owner".into());
+                match svc
+                    .register_trusted_cluster(
+                        &actor,
+                        &body.cluster_id,
+                        &body.issuer,
+                        &body.root_pubkey,
+                        body.allow_portable_import,
+                        body.require_local_mfa,
+                    )
+                    .await
+                {
+                    Ok(pol) => {
+                        res.status_code(StatusCode::CREATED);
+                        res.render(Json(pol));
+                    }
+                    Err(e) => {
+                        res.status_code(StatusCode::BAD_REQUEST);
+                        res.render(Json(serde_json::json!({ "error": e.to_string() })));
+                    }
+                }
+            }
+            _ => { res.status_code(StatusCode::METHOD_NOT_ALLOWED); }
+        }
     }
 }
 

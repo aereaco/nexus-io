@@ -30,8 +30,35 @@ pub async fn resolve_unified_http_auth(
         .and_then(|h| h.strip_prefix("Bearer ").or_else(|| h.strip_prefix("bearer ")))
         .map(str::trim);
 
-    // 1. Fast ZCZS path for Nexus-IDP OAuth 2.1 `nxat_*` tokens
+    // 1. Fast ZCZS path for Nexus-IDP OAuth 2.1 `nxat_*` and unified `nxss_*` session tokens
     if let Some(bearer) = bearer_opt {
+        if bearer.starts_with("nxss_") {
+            let ses_svc = crate::iam::sessions::SessionService::new(db.clone());
+            if let Ok(Some(ses)) = ses_svc.validate_session(bearer).await {
+                let org_id = match &ses.scope {
+                    crate::iam::sessions::SessionScope::IdentityWide => "default".to_string(),
+                    crate::iam::sessions::SessionScope::Organization { org_id } => org_id.clone(),
+                };
+                let idp = crate::iam::idp::NexusIdp::new(db.clone());
+                let perms = idp
+                    .effective_permissions_for_org(&ses.identity_id, false, &org_id)
+                    .await
+                    .unwrap_or_default();
+                return Ok(Some(AuthContext {
+                    level: AuthLevel::Database(ns.to_string(), database.to_string()),
+                    roles: vec![Role::Viewer],
+                    actor: Some(ses.identity_id),
+                    access_name: Some(ses.session_id),
+                    token_claims: Some(serde_json::json!({
+                        "org_id": org_id,
+                        "acr": ses.acr,
+                        "amr": ses.amr,
+                        "permissions": perms,
+                    })),
+                }));
+            }
+            return Err("Invalid, expired, or revoked Nexus-IO session token".into());
+        }
         if bearer.starts_with("nxat_") {
             let idp = crate::iam::idp::NexusIdp::new(db.clone());
             if let Ok(Some(rec)) = idp.introspect_token(bearer).await {
