@@ -386,12 +386,11 @@ impl Handler for AuthMeHandler {
         );
 
         let (ns, database) = extract_ns_db(req);
-        let resolved: Option<AuthContext> = if let Some(header) = req.headers().get("authorization").and_then(|v| v.to_str().ok()) {
-            if let Some(bearer) = header.strip_prefix("Bearer ").or_else(|| header.strip_prefix("bearer ")) {
-                self.db.inner.authenticate_token(&ns, &database, bearer.trim()).ok()
-            } else {
-                None
-            }
+        let resolved: Option<AuthContext> = if req.headers().contains_key("authorization") {
+            crate::ux::iam::resolve_unified_http_auth(req, &self.db, &ns, &database, false)
+                .await
+                .ok()
+                .flatten()
         } else if let Some(cookie_token) = extract_session_cookie(req) {
             match self.db.inner.authenticate_token(&ns, &database, &cookie_token) {
                 Ok(ctx) => Some(ctx),
@@ -408,11 +407,15 @@ impl Handler for AuthMeHandler {
             res.render(Json(json!({
                 "authenticated": false,
                 "actor": JsonValue::Null,
+                "identity_id": JsonValue::Null,
                 "level": "anonymous",
                 "ns": ns,
                 "db": database,
+                "org_id": JsonValue::Null,
                 "roles": [],
-                "capabilities": []
+                "capabilities": [],
+                "permissions": [],
+                "authorized_orgs": []
             })));
             return;
         };
@@ -425,15 +428,42 @@ impl Handler for AuthMeHandler {
             AuthLevel::Record { .. } => "record",
             AuthLevel::Anonymous => "anonymous",
         };
+        let actor_id = ctx.actor.clone().unwrap_or_default();
+        let is_platform_admin = ctx.roles.contains(&nexus_db::auth::Role::Owner);
+        let active_org_id = req
+            .query::<String>("org_id")
+            .or_else(|| {
+                ctx.token_claims
+                    .as_ref()
+                    .and_then(|c| c.get("org_id"))
+                    .and_then(|v| v.as_str())
+                    .map(ToString::to_string)
+            })
+            .unwrap_or_else(|| "default".to_string());
+
+        let idp = crate::iam::idp::NexusIdp::new(self.db.clone());
+        let authorized_orgs = idp
+            .list_authorized_orgs(&actor_id, is_platform_admin)
+            .await
+            .unwrap_or_default();
+        let permissions = idp
+            .effective_permissions_for_org(&actor_id, is_platform_admin, &active_org_id)
+            .await
+            .unwrap_or_default();
         let caps = CapabilitySet::from_auth_context(Some(&ctx));
+
         res.render(Json(json!({
             "authenticated": true,
             "actor": ctx.actor,
+            "identity_id": ctx.actor,
             "level": level,
             "ns": ns,
             "db": database,
+            "org_id": active_org_id,
             "roles": ctx.roles,
-            "capabilities": caps.caps
+            "capabilities": caps.caps,
+            "permissions": permissions,
+            "authorized_orgs": authorized_orgs
         })));
     }
 }

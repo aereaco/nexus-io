@@ -1910,6 +1910,69 @@ impl NexusIdp {
         })
     }
 
+    /// Collect all effective permission tokens (IAM + runtime capabilities) granted to `subject_id`
+    /// in `target_org_id` via explicit memberships, built-in/custom `RoleBundle`s, and direct grants.
+    pub async fn effective_permissions_for_org(
+        &self,
+        subject_id: &str,
+        is_platform_admin: bool,
+        target_org_id: &str,
+    ) -> Result<Vec<String>> {
+        self.ensure_tables().await?;
+        let mut perms: HashSet<String> = HashSet::new();
+        if is_platform_admin {
+            perms.insert("*".into());
+            for p in builtin_role_permissions("ORG_ADMIN") {
+                perms.insert(p.to_string());
+            }
+            perms.insert("iam.orgs.create".into());
+            perms.insert("iam.orgs.manage".into());
+            let mut out: Vec<String> = perms.into_iter().collect();
+            out.sort();
+            return Ok(out);
+        }
+        let Some(target_org) = self.get_org(target_org_id).await? else {
+            return Ok(Vec::new());
+        };
+        if target_org.status != OrgStatus::Active {
+            return Ok(Vec::new());
+        }
+        let custom_roles: Vec<RoleBundle> = {
+            let mut r = self.db.client.query("SELECT * FROM sys_iam_role").await?;
+            r.take::<Vec<serde_json::Value>>(0)
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|v| serde_json::from_value::<RoleBundle>(v).ok())
+                .collect()
+        };
+        let memberships = self.list_memberships_for_subject(subject_id).await?;
+        for mem in memberships {
+            if !self.membership_covers_org(&mem, &target_org).await {
+                continue;
+            }
+            for dp in &mem.direct_permissions {
+                perms.insert(dp.clone());
+            }
+            for role_name in &mem.role_assignments {
+                for bp in builtin_role_permissions(role_name) {
+                    perms.insert(bp.to_string());
+                }
+                for cr in &custom_roles {
+                    if cr.name.eq_ignore_ascii_case(role_name)
+                        && (cr.org_id.is_none() || cr.org_id.as_deref() == Some(&mem.org_id))
+                    {
+                        for p in &cr.permissions {
+                            perms.insert(p.clone());
+                        }
+                    }
+                }
+            }
+        }
+        let mut out: Vec<String> = perms.into_iter().collect();
+        out.sort();
+        Ok(out)
+    }
+
     // -------------------------------------------------------------------------
     // OIDC / OAuth 2.1 Clients (Argon2id Secrets, Mandatory PKCE S256, EdDSA JWT)
     // -------------------------------------------------------------------------

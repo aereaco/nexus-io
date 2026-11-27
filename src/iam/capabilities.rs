@@ -171,13 +171,15 @@ impl CapabilitySet {
     }
 
     /// Derive the maximum capability set permitted by an external IAM `AuthContext`.
+    /// Fuses legacy `Role` grants (`OWNER`/`EDITOR`/`VIEWER`) with granular permission/capability
+    /// tokens resolved from `OrgMembership` + custom `RoleBundle`s in `ctx.token_claims["permissions"]`.
     /// SECURITY INVARIANT: An absent `AuthContext` (`None`) is strictly default-deny
     /// (`CapabilitySet::empty()`), never granting implicit DB, blob, hardware, or UI access.
     pub fn from_auth_context(auth: Option<&AuthContext>) -> Self {
         let Some(ctx) = auth else {
             return Self::empty();
         };
-        if ctx.roles.contains(&Role::Owner) {
+        let mut base = if ctx.roles.contains(&Role::Owner) {
             Self::admin_all()
         } else if ctx.roles.contains(&Role::Editor) {
             Self::from_iter([
@@ -191,13 +193,31 @@ impl CapabilitySet {
                 Capability::OsUi,
             ])
         } else {
-            // Viewer / Record-level identity: strictly read-only
+            // Viewer / Record-level identity: strictly read-only base
             Self::from_iter([
                 Capability::DbRead,
                 Capability::BlobRead,
                 Capability::HwInfo,
             ])
+        };
+
+        // Union any explicit runtime capability tokens granted via Nexus-IDP RoleBundles / OrgMemberships
+        if let Some(perms) = ctx
+            .token_claims
+            .as_ref()
+            .and_then(|c| c.get("permissions"))
+            .and_then(|v| v.as_array())
+        {
+            for p in perms.iter().filter_map(|v| v.as_str()) {
+                if p == "*" {
+                    return Self::admin_all();
+                }
+                if let Some(cap) = Capability::from_str_token(p) {
+                    base.caps.insert(cap);
+                }
+            }
         }
+        base
     }
 
     /// Trusted internal kernel execution helper (used only when no external HTTP caller is present,

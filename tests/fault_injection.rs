@@ -1482,7 +1482,18 @@ async fn nexus_idp_gateway_oidc_pkce_outpost_and_mfa_e2e() {
     let access_token = tok_json["access_token"].as_str().unwrap().to_string();
     let refresh_token = tok_json["refresh_token"].as_str().unwrap().to_string();
 
-    // 4. OIDC UserInfo + Authentik-style Forward-Auth Outpost
+    // 4. OIDC UserInfo + Unified /_nexus/auth/me + Authentik-style Forward-Auth Outpost
+    let mut me_res = TestClient::get("http://127.0.0.1/_nexus/auth/me")
+        .add_header("Authorization", format!("Bearer {}", access_token), true)
+        .send(&service)
+        .await;
+    assert_eq!(me_res.status_code, Some(salvo::http::StatusCode::OK));
+    let me_json: serde_json::Value = me_res.take_json().await.unwrap();
+    assert_eq!(me_json["authenticated"], true);
+    assert_eq!(me_json["org_id"], contoso_id);
+    assert!(me_json["authorized_orgs"].is_array());
+    assert!(me_json["permissions"].is_array());
+
     let mut ui_res = TestClient::get("http://127.0.0.1/oidc/v1/userinfo")
         .add_header("Authorization", format!("Bearer {}", access_token), true)
         .send(&service)
