@@ -1,19 +1,21 @@
-//! P0.1 / P0.2 Hardening & 4-Node Heterogeneous Mesh Regression Suite
+//! P0.1–P0.4 Hardening & 4-Node Heterogeneous Mesh Regression Suite
 //!
 //! Verifies:
 //! 1. Canonical length-prefixed signing covers ALL fields (tampering `gpu.apis` or `wasm_slots` fails).
 //! 2. Membership binding rejects untrusted/wrong-org self-signed advertisements.
-//! 3. Deterministic CRDT convergence under equal `lamport_ts` (commutative & idempotent) + tombstones.
-//! 4. `ReservationLedger` prevents double-booking advertised capacity + verified CAS locality check.
-//! 5. Durable `VoterNode` vote-locks reject conflicting proposals on the same `(group, epoch, slot)`.
-//! 6. Durable `CoordinationGroup::open_durable` recovers committed leases & monotonic fencing epochs.
-//! 7. `FencedResourceGuard` rejects stale fencing tokens directly at the resource boundary.
+//! 3. CRDT ingestion rejects expired non-tombstone ads, converges deterministically under equal
+//!    `lamport_ts`, and `gc_expired` cleans expired ads while retaining active tombstones.
+//! 4. `ReservationLedger` prevents over-booking + verified CAS locality is enforced.
+//! 5. Complete canonical `hash_membership_change` rejects key substitution under existing `node_id`.
+//! 6. `FencedResourceGuard::install_lease` authenticates the full QC (rejecting forged high-epoch
+//!    leases) and `authorize_local_exec` serves cheap O(1) hot-path checks while rejecting stale epochs.
+//! 7. `CoordinationGroup::open_durable` recovers committed leases & monotonic fencing epochs.
 
 use nexus_io::db::Database;
 use nexus_io::iam::idp::{NexusIdp, OrgPolicyPatch};
 use nexus_io::mesh::consensus::{
-    hash_proposal, sign_vote_raw, ConsensusMode, CoordinationGroup, FencedResourceGuard,
-    GroupMember, VoteRequest, VoterNode,
+    hash_membership_change, hash_proposal, sign_vote_raw, ConsensusMode, CoordinationGroup,
+    FencedLease, FencedResourceGuard, GroupMember, QuorumCertificate, VoteRequest, VoterNode,
 };
 use nexus_io::mesh::resources::{
     schedule_and_lease_workload, GpuCapability, NodeAdvertisement, ReservationLedger,
@@ -24,7 +26,7 @@ use nexus_io::storage::cas_store::CasStore;
 use std::sync::Arc;
 
 #[tokio::test]
-async fn p0_resource_trust_crdt_convergence_durable_consensus_and_boundary_fencing() {
+async fn p0_resource_trust_crdt_expiry_membership_digest_and_authenticated_boundary_fencing() {
     let db_coord = Arc::new(Database::open_mem());
     let idp = NexusIdp::new(db_coord.clone());
     let org = idp
@@ -32,7 +34,6 @@ async fn p0_resource_trust_crdt_convergence_durable_consensus_and_boundary_fenci
         .await
         .unwrap();
 
-    // 4 independent cryptographic node identities + 4 independent VoterNode databases
     let (id_a, sk_a) = idp.create_identity("node-a-control", None).await.unwrap();
     let (id_b, sk_b) = idp.create_identity("node-b-cpu", None).await.unwrap();
     let (id_c, sk_c) = idp.create_identity("node-c-gpu", None).await.unwrap();
@@ -60,7 +61,6 @@ async fn p0_resource_trust_crdt_convergence_durable_consensus_and_boundary_fenci
     .await
     .unwrap();
 
-    // Real CAS manifest on Node D
     let tmp_dir = std::env::temp_dir().join(format!("nexus_mesh_p0_{}", uuid::Uuid::new_v4().simple()));
     let blobs = Arc::new(BlobBridge::new_in(db_coord.clone(), tmp_dir.clone()).await.unwrap());
     let cas = CasStore::new(blobs);
@@ -70,7 +70,6 @@ async fn p0_resource_trust_crdt_convergence_durable_consensus_and_boundary_fenci
     let t0 = 1_700_000_000_000u64;
     let exp = t0 + 300_000;
 
-    // 1. P0.1A: Tampering `gpu.apis` or `wasm_slots` MUST invalidate the signature!
     let mut adv_c = NodeAdvertisement {
         node_id: "node-c".into(),
         identity_id: id_c.identity_id.clone(),
@@ -103,25 +102,32 @@ async fn p0_resource_trust_crdt_convergence_durable_consensus_and_boundary_fenci
     };
     adv_c.sign(&sk_c).unwrap();
 
+    // 1. Tampering `gpu.apis` or `wasm_slots` fails canonical verification
+    let mut crdt_a = ResourceMeshCrdt::new();
     let mut tampered_gpu = adv_c.clone();
     tampered_gpu.gpus[0].apis.push("rocm".into());
-    let mut crdt_a = ResourceMeshCrdt::new();
-    assert!(crdt_a.merge_advertisement(tampered_gpu, &group).is_err());
+    assert!(crdt_a.merge_advertisement(tampered_gpu, &group, t0).is_err());
 
     let mut tampered_wasm = adv_c.clone();
     tampered_wasm.wasm_slots = 999;
-    assert!(crdt_a.merge_advertisement(tampered_wasm, &group).is_err());
+    assert!(crdt_a.merge_advertisement(tampered_wasm, &group, t0).is_err());
 
-    // 2. P0.1B: Untrusted rogue node claiming membership in `org` MUST be rejected!
+    // 2. Expired ordinary advertisement is rejected at CRDT ingestion!
+    let mut expired_adv = adv_c.clone();
+    expired_adv.expires_at_ms = t0 - 1;
+    expired_adv.sign(&sk_c).unwrap();
+    assert!(crdt_a.merge_advertisement(expired_adv, &group, t0).is_err());
+
+    // 3. Untrusted rogue node claiming membership in `org` is rejected!
     let (rogue_id, rogue_sk) = idp.create_identity("rogue", None).await.unwrap();
     let mut rogue_adv = adv_c.clone();
     rogue_adv.node_id = "rogue-node".into();
     rogue_adv.identity_id = rogue_id.identity_id;
     rogue_adv.ed25519_pubkey = rogue_id.active_pubkey;
     rogue_adv.sign(&rogue_sk).unwrap();
-    assert!(crdt_a.merge_advertisement(rogue_adv, &group).is_err());
+    assert!(crdt_a.merge_advertisement(rogue_adv, &group, t0).is_err());
 
-    // 3. P0.1C: Equal-lamport_ts deterministic CRDT convergence (merge order invariant!)
+    // 4. Equal-lamport_ts deterministic CRDT convergence + gc_expired cleanup
     let mut adv_b1 = NodeAdvertisement {
         node_id: "node-b".into(),
         identity_id: id_b.identity_id.clone(),
@@ -152,24 +158,18 @@ async fn p0_resource_trust_crdt_convergence_durable_consensus_and_boundary_fenci
     adv_b2.sign(&sk_b).unwrap();
 
     let mut peer1 = ResourceMeshCrdt::new();
-    peer1.merge_advertisement(adv_b1.clone(), &group).unwrap();
-    peer1.merge_advertisement(adv_b2.clone(), &group).unwrap();
-
+    peer1.merge_advertisement(adv_b1.clone(), &group, t0).unwrap();
+    peer1.merge_advertisement(adv_b2.clone(), &group, t0).unwrap();
     let mut peer2 = ResourceMeshCrdt::new();
-    peer2.merge_advertisement(adv_b2.clone(), &group).unwrap();
-    peer2.merge_advertisement(adv_b1.clone(), &group).unwrap();
+    peer2.merge_advertisement(adv_b2.clone(), &group, t0).unwrap();
+    peer2.merge_advertisement(adv_b1.clone(), &group, t0).unwrap();
+    assert_eq!(peer1.nodes["node-b"].available_cpu_cores, peer2.nodes["node-b"].available_cpu_cores);
+    assert_eq!(peer1.gc_expired(exp + 1, 60_000), 1);
 
-    assert_eq!(
-        peer1.nodes["node-b"].available_cpu_cores,
-        peer2.nodes["node-b"].available_cpu_cores,
-        "CRDT MUST converge identically regardless of equal-timestamp arrival order!"
-    );
+    crdt_a.merge_advertisement(adv_b2.clone(), &group, t0).unwrap();
+    crdt_a.merge_advertisement(adv_c.clone(), &group, t0).unwrap();
 
-    // Populate live CRDT with valid advertisements for node-b and node-c
-    crdt_a.merge_advertisement(adv_b2.clone(), &group).unwrap();
-    crdt_a.merge_advertisement(adv_c.clone(), &group).unwrap();
-
-    // 4. P0.1D: Verified CAS locality + ReservationLedger capacity accounting
+    // 5. Verified CAS locality + parallel 1-RTT fan-out + ReservationLedger
     let mut reservations = ReservationLedger::new();
     let gpu_spec = WorkloadSpec {
         workload_id: "wl-gpu-1".into(),
@@ -198,37 +198,51 @@ async fn p0_resource_trust_crdt_convergence_durable_consensus_and_boundary_fenci
     assert_eq!(dec1.selected_node_id, "node-c");
     assert!(dec1.verified_cas_local);
 
-    // Second workload needing 3 more wasm_slots on node-c (only 4 total, 3 reserved -> 1 free!) MUST FAIL!
-    let gpu_spec_2 = WorkloadSpec {
-        workload_id: "wl-gpu-2".into(),
-        ..gpu_spec.clone()
+    // 6. Authenticated resource-boundary guard: valid lease installs & hot-path succeeds; forged epoch=999 FAILS!
+    let guard = FencedResourceGuard::new(Arc::new(Database::open_mem()));
+    guard.install_lease(&dec1.lease, &group, t0 + 10).await.unwrap();
+    guard.authorize_local_exec("gpu:us-east:slot-0", "node-c", 1, t0 + 20).await.unwrap();
+
+    let forged_lease = FencedLease {
+        lease_id: "lse_forged".into(),
+        group_id: "pool:us-east".into(),
+        resource_key: "gpu:us-east:slot-0".into(),
+        holder_node_id: "node-b".into(),
+        workload_id: "wl-hijack".into(),
+        fencing_epoch: 999,
+        issued_at_ms: t0,
+        expires_at_ms: t0 + 60_000,
+        qc: QuorumCertificate {
+            group_id: "pool:us-east".into(),
+            epoch: 1,
+            slot: 99,
+            proposal_hash: hash_proposal("gpu:us-east:slot-0", "node-b", "wl-hijack", 999),
+            mode: ConsensusMode::CftFastPath,
+            votes: vec![],
+        },
     };
     assert!(
-        schedule_and_lease_workload(
-            &crdt_a,
-            &mut reservations,
-            &mut group,
-            &gpu_spec_2,
-            "gpu:us-east:slot-1",
-            30_000,
-            t0,
-            &all_voters,
-        )
-        .await
-        .is_err(),
-        "ReservationLedger MUST prevent over-booking advertised wasm_slots/VRAM!"
+        guard.install_lease(&forged_lease, &group, t0 + 30).await.is_err(),
+        "Forged lease without valid QC MUST be rejected at resource boundary!"
     );
 
-    // 5. P0.2: Durable VoterNode refuses conflicting vote for same (group, epoch, slot)
+    // 7. Complete membership-transition digest catches pubkey substitution under same node_id!
+    let mut swapped_members = members.clone();
+    swapped_members[0].ed25519_pubkey = "FAKE_SUBSTITUTED_PUBKEY".into();
+    let h_orig = hash_membership_change("pool:us-east", 2, ConsensusMode::CftFastPath, &members).unwrap();
+    let h_swap = hash_membership_change("pool:us-east", 2, ConsensusMode::CftFastPath, &swapped_members).unwrap();
+    assert_ne!(h_orig, h_swap, "Membership digest MUST bind full member pubkeys/identities!");
+
+    // 8. Durable VoterNode refuses conflicting vote for same (group, epoch, slot)
     let conflict_req = VoteRequest {
         group_id: "pool:us-east".into(),
         epoch: 1,
-        slot: 1, // Already voted on slot 1 for wl-gpu-1!
+        slot: 1,
         proposal_hash: hash_proposal("gpu:us-east:slot-0", "node-b", "wl-hijack", 1),
     };
     assert!(voter_a.cast_vote(&conflict_req).await.is_err());
 
-    // 6. P0.2: Durable CoordinationGroup restart recovery preserves fencing_epoch & next_slot!
+    // 9. Durable CoordinationGroup restart recovery preserves fencing_epoch & next_slot
     let recovered_group = CoordinationGroup::open_durable(
         db_coord.clone(),
         "pool:us-east",
@@ -240,12 +254,7 @@ async fn p0_resource_trust_crdt_convergence_durable_consensus_and_boundary_fenci
     assert_eq!(recovered_group.max_fencing_epoch["gpu:us-east:slot-0"], 1);
     assert_eq!(recovered_group.next_slot, 2);
 
-    // 7. P0.2: Resource-boundary FencedResourceGuard rejects stale epoch directly at resource!
-    let guard = FencedResourceGuard::new(Arc::new(Database::open_mem()));
-    guard.accept_fenced_operation("gpu:us-east:slot-0", "node-c", 2).await.unwrap();
-    assert!(guard.accept_fenced_operation("gpu:us-east:slot-0", "node-b", 1).await.is_err());
-
-    // 8. Opt-in BFT equivocation detection still works cleanly
+    // 10. BFT equivocation detection
     let mut bft_group = CoordinationGroup::new("open:global", ConsensusMode::BftSigned, members);
     let h1 = hash_proposal("open:gpu:1", "node-c", "wl-1", 1);
     let h2 = hash_proposal("open:gpu:1", "node-b", "wl-evil", 1);

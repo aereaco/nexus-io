@@ -156,12 +156,22 @@ impl ResourceMeshCrdt {
     }
 
     /// Authenticate `adv` against `group` membership (`node_id`, `identity_id`, `org_id`,
-    /// `ed25519_pubkey`, `group_id`) and merge deterministically using `(lamport_ts, canonical_digest)`.
+    /// `ed25519_pubkey`, `group_id`), reject expired non-tombstone records at ingestion, and merge
+    /// deterministically using `(lamport_ts, tombstone, canonical_digest)`.
     pub fn merge_advertisement(
         &mut self,
         adv: NodeAdvertisement,
         group: &CoordinationGroup,
+        now_ms: u64,
     ) -> Result<bool> {
+        if !adv.tombstone && now_ms >= adv.expires_at_ms {
+            anyhow::bail!(
+                "Rejected expired NodeAdvertisement from '{}' (expires_at_ms={} <= now={})",
+                adv.node_id,
+                adv.expires_at_ms,
+                now_ms
+            );
+        }
         if adv.group_id != group.group_id {
             anyhow::bail!(
                 "Advertisement group_id '{}' does not match authorized group '{}'",
@@ -193,7 +203,6 @@ impl ResourceMeshCrdt {
         }
 
         if let Some(existing) = self.nodes.get(&adv.node_id) {
-            // Deterministic LWW ordering: (lamport_ts, tombstone_precedence, canonical_digest)
             let new_key = (adv.lamport_ts, adv.tombstone, adv.canonical_digest());
             let old_key = (existing.lamport_ts, existing.tombstone, existing.canonical_digest());
             if new_key <= old_key {
@@ -209,21 +218,32 @@ impl ResourceMeshCrdt {
         &mut self,
         other: &ResourceMeshCrdt,
         group: &CoordinationGroup,
+        now_ms: u64,
     ) -> Result<usize> {
         let mut updated = 0usize;
         for adv in other.nodes.values() {
-            if self.merge_advertisement(adv.clone(), group)? {
+            if !adv.tombstone && now_ms >= adv.expires_at_ms {
+                continue;
+            }
+            if self.merge_advertisement(adv.clone(), group, now_ms)? {
                 updated += 1;
             }
         }
         Ok(updated)
     }
 
-    /// Prune expired tombstones older than `retention_ms`.
-    pub fn gc_tombstones(&mut self, now_ms: u64, retention_ms: u64) {
+    /// Garbage-collect both expired ordinary advertisements AND tombstones older than `tombstone_retention_ms`.
+    /// Active tombstones within `tombstone_retention_ms` are retained to prevent stale resurrection.
+    pub fn gc_expired(&mut self, now_ms: u64, tombstone_retention_ms: u64) -> usize {
+        let before = self.nodes.len();
         self.nodes.retain(|_, adv| {
-            !adv.tombstone || now_ms.saturating_sub(adv.expires_at_ms) <= retention_ms
+            if adv.tombstone {
+                now_ms.saturating_sub(adv.expires_at_ms) <= tombstone_retention_ms
+            } else {
+                now_ms < adv.expires_at_ms
+            }
         });
+        before.saturating_sub(self.nodes.len())
     }
 }
 
@@ -431,12 +451,19 @@ pub async fn schedule_and_lease_workload(
         proposal_hash,
     };
 
-    let mut votes: Vec<SignedVote> = Vec::new();
+    // Parallel 1-RTT fan-out to all online authorized voters!
+    let mut join_set = tokio::task::JoinSet::new();
     for voter in online_voters {
         if group.members.contains_key(&voter.node_id) {
-            if let Ok(v) = voter.cast_vote(&vote_req).await {
-                votes.push(v);
-            }
+            let v = voter.clone();
+            let req = vote_req.clone();
+            join_set.spawn(async move { v.cast_vote(&req).await });
+        }
+    }
+    let mut votes: Vec<SignedVote> = Vec::new();
+    while let Some(res) = join_set.join_next().await {
+        if let Ok(Ok(v)) = res {
+            votes.push(v);
         }
     }
 

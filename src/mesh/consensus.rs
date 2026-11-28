@@ -1,21 +1,34 @@
-//! Nexus Scoped Hybrid Consensus Foundation (Durable Vote-Locks, Recovery & Resource Fencing)
+//! Nexus Scoped Hybrid Consensus Foundation (Durable Vote-Locks, Recovery & Authenticated Resource Fencing)
 //!
 //! Maturity & Scope (Explicit):
-//! - **`CftFastPath` (`2f + 1` quorum):** Durable per-voter vote-locks in `nexus-db` prevent honest
-//!   voters from signing conflicting proposals for the same `(group_id, epoch, slot)` across
-//!   concurrent requests and process restarts. Committed leases, membership epochs, and monotonic
-//!   fencing tokens are persisted durably and enforced at the resource boundary (`FencedResourceGuard`).
-//! - **`BftSigned` (`3f + 1` quorum):** Adds signed `3f + 1` quorum thresholds and cryptographic
-//!   `EquivocationProof` detection. Full multi-round Byzantine view-change (HotStuff/Tendermint)
-//!   remains a separate future milestone.
+//! - **`CftFastPath` (`2f + 1` quorum — `experimental`):** Durable per-voter vote-locks in `nexus-db`
+//!   prevent honest voters from signing conflicting proposals for the same `(group_id, epoch, slot)`
+//!   across concurrent requests and process restarts. Includes `query_slot_lock` for coordinator
+//!   crash recovery, complete canonical membership-transition digests, and `FencedResourceGuard`
+//!   with two-phase authenticated lease installation + O(1) local hot-path execution checks.
+//! - **`BftSigned` (`3f + 1` quorum — `prototype`):** Adds signed `3f + 1` quorum thresholds and
+//!   cryptographic `EquivocationProof` detection. Full multi-round Byzantine view-change
+//!   (HotStuff/Tendermint) remains a separate future milestone.
 
 use anyhow::{anyhow, Result};
+use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::db::Database;
+
+const FENCE_STRIPE_COUNT: usize = 64;
+
+fn fence_stripe_idx(key: &str) -> usize {
+    let h = blake3::hash(key.as_bytes());
+    let b = h.as_bytes();
+    (u32::from_be_bytes([b[0], b[1], b[2], b[3]]) as usize) % FENCE_STRIPE_COUNT
+}
+
+static FENCE_STRIPES: Lazy<Vec<tokio::sync::Mutex<()>>> =
+    Lazy::new(|| (0..FENCE_STRIPE_COUNT).map(|_| tokio::sync::Mutex::new(())).collect());
 
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -43,9 +56,16 @@ impl ConsensusMode {
             Self::BftSigned => ((2 * total_members) / 3) + 1,
         }
     }
+
+    pub fn canonical_tag(self) -> &'static str {
+        match self {
+            Self::CftFastPath => "cft_fast_path",
+            Self::BftSigned => "bft_signed",
+        }
+    }
 }
 
-/// Authorized coordination group member binding node, identity, public key, and organization.
+/// Authorized coordination group member binding node, identity, organization, and public key.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GroupMember {
     pub node_id: String,
@@ -126,6 +146,21 @@ struct DurableMembershipRecord {
     members: Vec<GroupMember>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AcceptedFenceRecord {
+    resource_key: String,
+    holder_node_id: String,
+    highest_epoch: u64,
+    expires_at_ms: u64,
+    lease_id: String,
+    updated_at_ms: u64,
+}
+
+fn push_len_prefixed(hasher: &mut blake3::Hasher, bytes: &[u8]) {
+    hasher.update(&(bytes.len() as u32).to_be_bytes());
+    hasher.update(bytes);
+}
+
 /// Canonical length-prefixed vote payload to eliminate framing ambiguity.
 pub fn canonical_vote_payload(
     group_id: &str,
@@ -170,18 +205,43 @@ pub fn hash_proposal(resource_key: &str, holder_node_id: &str, workload_id: &str
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"NEXUS-LEASE-PROPOSAL-v1");
     for field in [resource_key.as_bytes(), holder_node_id.as_bytes(), workload_id.as_bytes()] {
-        hasher.update(&(field.len() as u32).to_be_bytes());
-        hasher.update(field);
+        push_len_prefixed(&mut hasher, field);
     }
     hasher.update(&fencing_epoch.to_be_bytes());
     hasher.finalize().to_hex().to_string()
 }
 
+/// Complete canonical digest of a membership transition covering `group_id`, `next_epoch`, `mode`,
+/// and every member's `(node_id, identity_id, org_id, ed25519_pubkey)` sorted by `node_id`.
+/// Rejects duplicate `node_id`s to prevent membership spoofing.
+pub fn hash_membership_change(
+    group_id: &str,
+    next_epoch: u64,
+    mode: ConsensusMode,
+    new_members: &[GroupMember],
+) -> Result<String> {
+    let mut sorted = new_members.to_vec();
+    sorted.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+    let mut seen = HashSet::new();
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"NEXUS-MEMBERSHIP-CHANGE-v2");
+    push_len_prefixed(&mut hasher, group_id.as_bytes());
+    hasher.update(&next_epoch.to_be_bytes());
+    push_len_prefixed(&mut hasher, mode.canonical_tag().as_bytes());
+    hasher.update(&(sorted.len() as u32).to_be_bytes());
+    for m in &sorted {
+        if !seen.insert(m.node_id.as_str()) {
+            anyhow::bail!("Duplicate node_id '{}' in membership transition", m.node_id);
+        }
+        push_len_prefixed(&mut hasher, m.node_id.as_bytes());
+        push_len_prefixed(&mut hasher, m.identity_id.as_bytes());
+        push_len_prefixed(&mut hasher, m.org_id.as_bytes());
+        push_len_prefixed(&mut hasher, m.ed25519_pubkey.as_bytes());
+    }
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
 /// Independent durable voter node backed by its own `nexus-db` instance.
-///
-/// Safety invariant: `cast_vote` atomically persists a `sys_mesh_voter_lock` record via `CREATE`
-/// (insert-if-absent) **before** returning a `SignedVote`. A conflicting `proposal_hash` for the
-/// same `(group_id, epoch, slot)` is ALWAYS rejected — across concurrent requests and restarts!
 #[derive(Clone)]
 pub struct VoterNode {
     pub node_id: String,
@@ -207,18 +267,44 @@ impl VoterNode {
         Ok(())
     }
 
-    /// Atomically acquire durable vote-lock BEFORE returning signature.
-    /// - Same `(group_id, epoch, slot, proposal_hash)` -> idempotently returns the locked vote.
-    /// - Different `proposal_hash` for same `(group_id, epoch, slot)` -> FAILS CLOSED!
+    fn slot_lock_key(&self, group_id: &str, epoch: u64, slot: u64) -> String {
+        format!(
+            "{}_{}_{}_{}",
+            &blake3::hash(group_id.as_bytes()).to_hex().as_str()[..12],
+            epoch,
+            slot,
+            self.node_id
+        )
+    }
+
+    /// Query this voter's durable lock for `(group_id, epoch, slot)` to support coordinator crash recovery!
+    pub async fn query_slot_lock(&self, group_id: &str, epoch: u64, slot: u64) -> Result<Option<SignedVote>> {
+        self.ensure_tables().await?;
+        let lock_key = self.slot_lock_key(group_id, epoch, slot);
+        let mut resp = self
+            .db
+            .client
+            .query("SELECT * FROM type::record('sys_mesh_voter_lock', $id)")
+            .bind(("id", lock_key))
+            .await?;
+        let rows: Vec<serde_json::Value> = resp.take(0).unwrap_or_default();
+        Ok(rows
+            .first()
+            .and_then(|v| serde_json::from_value::<DurableVoterLock>(v.clone()).ok())
+            .map(|existing| SignedVote {
+                group_id: existing.group_id,
+                epoch: existing.epoch,
+                slot: existing.slot,
+                proposal_hash: existing.proposal_hash,
+                voter_node_id: existing.voter_node_id,
+                signature: existing.signature,
+            }))
+    }
+
+    /// Atomically acquire durable vote-lock (`CREATE` insert-if-absent) BEFORE returning signature.
     pub async fn cast_vote(&self, req: &VoteRequest) -> Result<SignedVote> {
         self.ensure_tables().await?;
-        let lock_key = format!(
-            "{}_{}_{}_{}",
-            blake3::hash(req.group_id.as_bytes()).to_hex().as_str()[..12].to_string(),
-            req.epoch,
-            req.slot,
-            self.node_id
-        );
+        let lock_key = self.slot_lock_key(&req.group_id, req.epoch, req.slot);
         let vote = sign_vote_raw(
             &req.group_id,
             req.epoch,
@@ -239,7 +325,6 @@ impl VoterNode {
         };
         let val = serde_json::to_value(&lock_rec)?;
 
-        // Atomic database CREATE (fails if record already exists — cross-process atomic!)
         let create_res = self
             .db
             .client
@@ -256,28 +341,13 @@ impl VoterNode {
             return Ok(vote);
         }
 
-        // Lock already exists in DB — inspect existing durable lock
-        let mut resp = self
-            .db
-            .client
-            .query("SELECT * FROM type::record('sys_mesh_voter_lock', $id)")
-            .bind(("id", lock_key))
-            .await?;
-        let rows: Vec<serde_json::Value> = resp.take(0).unwrap_or_default();
-        let existing: DurableVoterLock = rows
-            .first()
-            .and_then(|v| serde_json::from_value(v.clone()).ok())
+        let existing = self
+            .query_slot_lock(&req.group_id, req.epoch, req.slot)
+            .await?
             .ok_or_else(|| anyhow!("Failed to acquire or read durable voter lock"))?;
 
         if existing.proposal_hash == req.proposal_hash {
-            return Ok(SignedVote {
-                group_id: existing.group_id,
-                epoch: existing.epoch,
-                slot: existing.slot,
-                proposal_hash: existing.proposal_hash,
-                voter_node_id: existing.voter_node_id,
-                signature: existing.signature,
-            });
+            return Ok(existing);
         }
 
         anyhow::bail!(
@@ -292,16 +362,26 @@ impl VoterNode {
     }
 }
 
-/// Resource-boundary fencing guard enforced directly at the protected resource (compute/storage node),
-/// independent of coordinator reachability. Persists monotonic `highest_epoch` in `nexus-db`.
+/// Authenticated resource-boundary fencing guard enforced directly at the protected resource.
+///
+/// Two-phase design:
+/// 1. **`install_lease(lease, group, now)`**: Cryptographically verifies the full `QuorumCertificate`,
+///    proposal hash binding, and expiry, then atomically advances the durable monotonic fence in
+///    `nexus-db` (never regressing under concurrent out-of-order arrivals).
+/// 2. **`authorize_local_exec(resource_key, holder_node_id, fencing_epoch, now)`**: O(1) cheap local
+///    hot-path check against accepted ownership state (zero Ed25519 verification or DB I/O per op).
 #[derive(Clone)]
 pub struct FencedResourceGuard {
     db: Arc<Database>,
+    local_accepted: Arc<RwLock<HashMap<String, AcceptedFenceRecord>>>,
 }
 
 impl FencedResourceGuard {
     pub fn new(db: Arc<Database>) -> Self {
-        Self { db }
+        Self {
+            db,
+            local_accepted: Arc::new(RwLock::new(HashMap::new())),
+        }
     }
 
     pub async fn ensure_tables(&self) -> Result<()> {
@@ -313,64 +393,152 @@ impl FencedResourceGuard {
         Ok(())
     }
 
-    /// Enforce monotonic fencing epoch at the actual protected resource boundary.
-    /// Rejects any stale/partitioned caller presenting `fencing_epoch < highest_seen_epoch`
-    /// or presenting a different holder for the same epoch!
-    pub async fn accept_fenced_operation(
+    /// Authenticate a `FencedLease` (QC + proposal binding + expiry) and atomically install its
+    /// monotonic `fencing_epoch` at the resource boundary. Rejects forged leases and never regresses!
+    pub async fn install_lease(
+        &self,
+        lease: &FencedLease,
+        group: &CoordinationGroup,
+        now: u64,
+    ) -> Result<u64> {
+        if lease.fencing_epoch == 0 {
+            anyhow::bail!("Fencing epoch must be >= 1");
+        }
+        if now >= lease.expires_at_ms {
+            anyhow::bail!("Cannot install expired lease '{}' at resource boundary", lease.lease_id);
+        }
+        // 1. Cryptographically authenticate the lease directly at the resource boundary!
+        group.verify_qc(&lease.qc)?;
+        let expected_hash = hash_proposal(
+            &lease.resource_key,
+            &lease.holder_node_id,
+            &lease.workload_id,
+            lease.fencing_epoch,
+        );
+        if lease.qc.proposal_hash != expected_hash {
+            anyhow::bail!("Lease QC proposal_hash does not match presented lease fields");
+        }
+
+        // 2. Database-enforced atomic monotonic update (serializes concurrent out-of-order arrivals)
+        let _guard = FENCE_STRIPES[fence_stripe_idx(&lease.resource_key)].lock().await;
+        self.ensure_tables().await?;
+        let key = blake3::hash(lease.resource_key.as_bytes()).to_hex().to_string();
+
+        let rec = AcceptedFenceRecord {
+            resource_key: lease.resource_key.clone(),
+            holder_node_id: lease.holder_node_id.clone(),
+            highest_epoch: lease.fencing_epoch,
+            expires_at_ms: lease.expires_at_ms,
+            lease_id: lease.lease_id.clone(),
+            updated_at_ms: now,
+        };
+        let rec_val = serde_json::to_value(&rec)?;
+
+        // Atomic DB CAS: CREATE insert-if-absent for first lease, else conditional UPDATE WHERE highest_epoch < $ep
+        let create_res = self
+            .db
+            .client
+            .query("CREATE type::record('sys_mesh_resource_fence', $id) CONTENT $r;")
+            .bind(("id", key.clone()))
+            .bind(("r", rec_val))
+            .await;
+        let created = match create_res {
+            Ok(resp) => resp.check().is_ok(),
+            Err(_) => false,
+        };
+        if !created {
+            let mut upd = self
+                .db
+                .client
+                .query(
+                    "UPDATE type::record('sys_mesh_resource_fence', $id) \
+                     SET holder_node_id = $holder, highest_epoch = $ep, expires_at_ms = $exp, lease_id = $lid, updated_at_ms = $now \
+                     WHERE highest_epoch < $ep OR (highest_epoch == $ep AND holder_node_id == $holder);",
+                )
+                .bind(("id", key))
+                .bind(("holder", lease.holder_node_id.clone()))
+                .bind(("ep", lease.fencing_epoch))
+                .bind(("exp", lease.expires_at_ms))
+                .bind(("lid", lease.lease_id.clone()))
+                .bind(("now", now))
+                .await?;
+            let updated_rows: Vec<serde_json::Value> = upd.take(0).unwrap_or_default();
+            if updated_rows.is_empty() {
+                anyhow::bail!(
+                    "Resource boundary rejected stale/conflicting lease '{}' (epoch={}) for '{}'",
+                    lease.lease_id,
+                    lease.fencing_epoch,
+                    lease.resource_key
+                );
+            }
+        }
+
+        // 3. Publish to cheap local hot-path cache ONLY after durable DB commit succeeds
+        if let Ok(mut map) = self.local_accepted.write() {
+            map.insert(lease.resource_key.clone(), rec);
+        }
+        Ok(lease.fencing_epoch)
+    }
+
+    /// Cheap O(1) local hot-path execution check (zero signature verification or DB reads on cache hit).
+    pub async fn authorize_local_exec(
         &self,
         resource_key: &str,
         holder_node_id: &str,
         fencing_epoch: u64,
+        now: u64,
     ) -> Result<u64> {
-        if fencing_epoch == 0 {
-            anyhow::bail!("Fencing epoch must be >= 1");
+        if let Ok(map) = self.local_accepted.read() {
+            if let Some(rec) = map.get(resource_key) {
+                if fencing_epoch < rec.highest_epoch {
+                    anyhow::bail!(
+                        "Stale fencing_epoch {} rejected on hot path (highest accepted: {})",
+                        fencing_epoch,
+                        rec.highest_epoch
+                    );
+                }
+                if fencing_epoch != rec.highest_epoch || rec.holder_node_id != holder_node_id {
+                    anyhow::bail!(
+                        "Unauthorized holder '{}' / epoch {} (installed: '{}' @ {})",
+                        holder_node_id,
+                        fencing_epoch,
+                        rec.holder_node_id,
+                        rec.highest_epoch
+                    );
+                }
+                if now >= rec.expires_at_ms {
+                    anyhow::bail!("Installed lease '{}' has expired", rec.lease_id);
+                }
+                return Ok(rec.highest_epoch);
+            }
         }
+        // Cold miss (e.g., after process restart): hydrate from durable DB record
         self.ensure_tables().await?;
         let key = blake3::hash(resource_key.as_bytes()).to_hex().to_string();
         let mut resp = self
             .db
             .client
             .query("SELECT * FROM type::record('sys_mesh_resource_fence', $id)")
-            .bind(("id", key.clone()))
+            .bind(("id", key))
             .await?;
         let rows: Vec<serde_json::Value> = resp.take(0).unwrap_or_default();
-        if let Some(existing) = rows.first() {
-            let cur_epoch = existing["highest_epoch"].as_u64().unwrap_or(0);
-            let cur_holder = existing["holder_node_id"].as_str().unwrap_or("");
-            if fencing_epoch < cur_epoch {
-                anyhow::bail!(
-                    "Resource boundary rejected stale fencing_epoch {} for '{}' (highest seen: {})",
-                    fencing_epoch,
-                    resource_key,
-                    cur_epoch
-                );
-            }
-            if fencing_epoch == cur_epoch && cur_holder != holder_node_id {
-                anyhow::bail!(
-                    "Resource boundary rejected conflicting holder '{}' at epoch {} (owned by '{}')",
-                    holder_node_id,
-                    fencing_epoch,
-                    cur_holder
-                );
-            }
-            if fencing_epoch == cur_epoch {
-                return Ok(cur_epoch);
-            }
+        let rec: AcceptedFenceRecord = rows
+            .first()
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .ok_or_else(|| anyhow!("No authenticated lease installed for '{}'", resource_key))?;
+        if let Ok(mut map) = self.local_accepted.write() {
+            map.insert(resource_key.to_string(), rec.clone());
         }
-        let rec = serde_json::json!({
-            "resource_key": resource_key,
-            "holder_node_id": holder_node_id,
-            "highest_epoch": fencing_epoch,
-            "updated_at_ms": now_ms(),
-        });
-        self.db
-            .client
-            .query("UPSERT type::record('sys_mesh_resource_fence', $id) CONTENT $r;")
-            .bind(("id", key))
-            .bind(("r", rec))
-            .await?
-            .check()?;
-        Ok(fencing_epoch)
+        if fencing_epoch != rec.highest_epoch || rec.holder_node_id != holder_node_id || now >= rec.expires_at_ms {
+            anyhow::bail!(
+                "Resource boundary rejected execution by '{}' at epoch {} (installed: '{}' @ {})",
+                holder_node_id,
+                fencing_epoch,
+                rec.holder_node_id,
+                rec.highest_epoch
+            );
+        }
+        Ok(rec.highest_epoch)
     }
 }
 
@@ -409,9 +577,6 @@ impl CoordinationGroup {
         }
     }
 
-    /// Open or recover a durable `CoordinationGroup` backed by `nexus-db`.
-    /// On restart, recovers committed `membership_epoch`, `next_slot`, `active_leases`, and
-    /// monotonic `max_fencing_epoch` (discarding any uncommitted/incomplete proposals).
     pub async fn open_durable(
         db: Arc<Database>,
         group_id: impl Into<String>,
@@ -421,8 +586,7 @@ impl CoordinationGroup {
         let gid = group_id.into();
         let ddl = "\
             DEFINE TABLE IF NOT EXISTS sys_mesh_membership SCHEMALESS;\
-            DEFINE TABLE IF NOT EXISTS sys_mesh_decision_log SCHEMALESS;\
-            DEFINE TABLE IF NOT EXISTS sys_mesh_fencing_epoch SCHEMALESS;";
+            DEFINE TABLE IF NOT EXISTS sys_mesh_decision_log SCHEMALESS;";
         let _ = db.client.query(ddl).await;
 
         let mut group = Self::new(gid.clone(), mode, initial_members);
@@ -432,7 +596,7 @@ impl CoordinationGroup {
         let mut mresp = db
             .client
             .query("SELECT * FROM type::record('sys_mesh_membership', $id)")
-            .bind(("id", gkey.clone()))
+            .bind(("id", gkey))
             .await?;
         let mrows: Vec<serde_json::Value> = mresp.take(0).unwrap_or_default();
         if let Some(rec) = mrows
@@ -448,10 +612,9 @@ impl CoordinationGroup {
                 .map(|m| (m.node_id.clone(), m))
                 .collect();
         } else {
-            group.persist_membership().await?;
+            group.persist_membership_record(group.membership_epoch, group.next_slot, &group.members.values().cloned().collect::<Vec<_>>()).await?;
         }
 
-        // Recover committed leases & monotonic fencing epochs
         let mut lresp = db.client.query("SELECT * FROM sys_mesh_decision_log").await?;
         let lrows: Vec<serde_json::Value> = lresp.take(0).unwrap_or_default();
         for v in lrows {
@@ -471,15 +634,20 @@ impl CoordinationGroup {
         Ok(group)
     }
 
-    async fn persist_membership(&self) -> Result<()> {
+    async fn persist_membership_record(
+        &self,
+        membership_epoch: u64,
+        next_slot: u64,
+        members: &[GroupMember],
+    ) -> Result<()> {
         let Some(ref db) = self.db else { return Ok(()) };
         let gkey = blake3::hash(self.group_id.as_bytes()).to_hex().to_string();
         let rec = DurableMembershipRecord {
             group_id: self.group_id.clone(),
             mode: self.mode,
-            membership_epoch: self.membership_epoch,
-            next_slot: self.next_slot,
-            members: self.members.values().cloned().collect(),
+            membership_epoch,
+            next_slot,
+            members: members.to_vec(),
         };
         let val = serde_json::to_value(&rec)?;
         db.client
@@ -491,7 +659,7 @@ impl CoordinationGroup {
         Ok(())
     }
 
-    async fn persist_committed_lease(&self, lease: &FencedLease) -> Result<()> {
+    async fn persist_committed_lease(&self, lease: &FencedLease, new_next_slot: u64) -> Result<()> {
         let Some(ref db) = self.db else { return Ok(()) };
         let val = serde_json::to_value(lease)?;
         db.client
@@ -500,7 +668,9 @@ impl CoordinationGroup {
             .bind(("l", val))
             .await?
             .check()?;
-        self.persist_membership().await?;
+        let mems: Vec<GroupMember> = self.members.values().cloned().collect();
+        self.persist_membership_record(self.membership_epoch, new_next_slot, &mems)
+            .await?;
         Ok(())
     }
 
@@ -508,25 +678,43 @@ impl CoordinationGroup {
         self.mode.quorum_size(self.members.len())
     }
 
-    /// Safe quorum-gated membership reconfiguration: requires a valid quorum of CURRENT members
-    /// signing the new membership epoch transition before advancing `membership_epoch`!
+    /// Coordinator crash recovery: given votes queried from voters' durable locks for `slot`,
+    /// reconstruct a valid `QuorumCertificate` if a quorum had already locked on one proposal!
+    pub fn recover_qc_from_voter_locks(&self, slot: u64, locked_votes: Vec<SignedVote>) -> Result<Option<QuorumCertificate>> {
+        let mut by_hash: HashMap<String, Vec<SignedVote>> = HashMap::new();
+        for v in locked_votes {
+            if v.group_id == self.group_id && v.epoch == self.membership_epoch && v.slot == slot {
+                by_hash.entry(v.proposal_hash.clone()).or_default().push(v);
+            }
+        }
+        for (proposal_hash, votes) in by_hash {
+            let qc = QuorumCertificate {
+                group_id: self.group_id.clone(),
+                epoch: self.membership_epoch,
+                slot,
+                proposal_hash,
+                mode: self.mode,
+                votes,
+            };
+            if self.verify_qc(&qc).is_ok() {
+                return Ok(Some(qc));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Safe quorum-gated membership reconfiguration:
+    /// 1. Hashes the COMPLETE canonical new membership record (node_id, identity_id, org_id, pubkey).
+    /// 2. Rejects duplicate `node_id`s.
+    /// 3. Verifies current-epoch quorum certificate.
+    /// 4. Persists durable membership record BEFORE mutating in-memory state!
     pub async fn reconfigure_membership_with_quorum(
         &mut self,
         new_members: Vec<GroupMember>,
         votes: Vec<SignedVote>,
     ) -> Result<u64> {
         let next_epoch = self.membership_epoch + 1;
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(b"NEXUS-MEMBERSHIP-CHANGE-v1|");
-        hasher.update(self.group_id.as_bytes());
-        hasher.update(&next_epoch.to_be_bytes());
-        let mut sorted_ids: Vec<&str> = new_members.iter().map(|m| m.node_id.as_str()).collect();
-        sorted_ids.sort_unstable();
-        for nid in sorted_ids {
-            hasher.update(nid.as_bytes());
-            hasher.update(b"|");
-        }
-        let expected_hash = hasher.finalize().to_hex().to_string();
+        let expected_hash = hash_membership_change(&self.group_id, next_epoch, self.mode, &new_members)?;
         let slot = self.next_slot;
 
         let mut valid_votes = Vec::new();
@@ -551,17 +739,20 @@ impl CoordinationGroup {
         };
         self.verify_qc(&qc)?;
 
+        // Persist-before-mutate!
+        let new_next_slot = self.next_slot + 1;
+        self.persist_membership_record(next_epoch, new_next_slot, &new_members)
+            .await?;
+
         self.membership_epoch = next_epoch;
-        self.next_slot += 1;
+        self.next_slot = new_next_slot;
         self.members = new_members
             .into_iter()
             .map(|m| (m.node_id.clone(), m))
             .collect();
-        self.persist_membership().await?;
         Ok(self.membership_epoch)
     }
 
-    /// Verify a `SignedVote` against the group's membership and detect equivocation.
     pub fn record_and_verify_vote(&mut self, vote: &SignedVote) -> Result<Option<EquivocationProof>> {
         if vote.group_id != self.group_id || vote.epoch != self.membership_epoch {
             anyhow::bail!(
@@ -607,8 +798,6 @@ impl CoordinationGroup {
         Ok(None)
     }
 
-    /// Verify a `QuorumCertificate` against current `group_id`, `membership_epoch`, `mode`,
-    /// member public keys, and quorum size.
     pub fn verify_qc(&self, qc: &QuorumCertificate) -> Result<()> {
         if qc.group_id != self.group_id || qc.mode != self.mode || qc.epoch != self.membership_epoch {
             anyhow::bail!(
@@ -648,8 +837,6 @@ impl CoordinationGroup {
         Ok(())
     }
 
-    /// Commit an exclusive, quorum-fenced resource lease (persisting durably before returning if
-    /// opened via `open_durable`).
     #[allow(clippy::too_many_arguments)]
     pub async fn commit_exclusive_lease(
         &mut self,
@@ -729,50 +916,13 @@ impl CoordinationGroup {
             expires_at_ms: now.saturating_add(ttl_ms),
             qc,
         };
-        // Persist-before-publish: durable write succeeds before updating in-memory active_leases
-        self.next_slot += 1;
-        if let Err(e) = self.persist_committed_lease(&lease).await {
-            self.next_slot -= 1;
-            return Err(e);
-        }
+        let new_next_slot = self.next_slot + 1;
+        // Persist-before-publish
+        self.persist_committed_lease(&lease, new_next_slot).await?;
+        self.next_slot = new_next_slot;
         self.max_fencing_epoch.insert(resource_key.to_string(), next_fencing);
         self.active_leases.insert(resource_key.to_string(), lease.clone());
         Ok(lease)
-    }
-
-    pub fn verify_fencing_token(
-        &self,
-        resource_key: &str,
-        holder_node_id: &str,
-        fencing_epoch: u64,
-        now: u64,
-    ) -> Result<()> {
-        let highest = self.max_fencing_epoch.get(resource_key).copied().unwrap_or(0);
-        if fencing_epoch < highest || fencing_epoch == 0 {
-            anyhow::bail!(
-                "Stale fencing token rejected for '{}': presented epoch {}, current highest is {}",
-                resource_key,
-                fencing_epoch,
-                highest
-            );
-        }
-        let Some(active) = self.active_leases.get(resource_key) else {
-            anyhow::bail!("No active lease for resource '{}'", resource_key);
-        };
-        if active.holder_node_id != holder_node_id || active.fencing_epoch != fencing_epoch {
-            anyhow::bail!(
-                "Lease holder/epoch mismatch for '{}': active is ({}, {}), presented ({}, {})",
-                resource_key,
-                active.holder_node_id,
-                active.fencing_epoch,
-                holder_node_id,
-                fencing_epoch
-            );
-        }
-        if now >= active.expires_at_ms {
-            anyhow::bail!("Lease '{}' for '{}' has expired", active.lease_id, resource_key);
-        }
-        Ok(())
     }
 
     pub fn expire_lease_for_fault(&mut self, resource_key: &str, now: u64) {

@@ -199,25 +199,40 @@ impl SessionService {
     }
 
     /// Durable monotonic revocation watermark for immediate cross-instance revocation coherence.
-    /// Executes atomically inside a `nexus-db` transaction guarded by a striped lock.
+    /// Uses DB-atomic `CREATE` (first bump) or DB-atomic `UPDATE ... SET epoch += 1` (subsequent bumps)
+    /// — zero read-before-write race across threads or separate processes!
     pub async fn bump_revocation_epoch(&self, identity_id: &str) -> Result<u64> {
         let _guard = REVOCATION_STRIPES[rev_stripe_idx(identity_id)].lock().await;
         self.ensure_tables().await?;
-        let cur = self.get_revocation_epoch(identity_id).await.unwrap_or(0);
-        let next = cur + 1;
-        let rec = serde_json::json!({
+        let now = now_ms();
+        let init_rec = serde_json::json!({
             "identity_id": identity_id,
-            "epoch": next,
-            "updated_at_ms": now_ms(),
+            "epoch": 1u64,
+            "updated_at_ms": now,
         });
-        self.db
+        let create_res = self
+            .db
             .client
-            .query("BEGIN TRANSACTION; UPSERT type::record('sys_iam_revocation_epoch', $id) CONTENT $r; COMMIT TRANSACTION;")
+            .query("CREATE type::record('sys_iam_revocation_epoch', $id) CONTENT $r;")
             .bind(("id", identity_id.to_string()))
-            .bind(("r", rec))
-            .await?
-            .check()?;
-        Ok(next)
+            .bind(("r", init_rec))
+            .await;
+        let created = match create_res {
+            Ok(resp) => resp.check().is_ok(),
+            Err(_) => false,
+        };
+        if created {
+            return Ok(1);
+        }
+        let resp = self
+            .db
+            .client
+            .query("UPDATE type::record('sys_iam_revocation_epoch', $id) SET epoch += 1, updated_at_ms = $now;")
+            .bind(("id", identity_id.to_string()))
+            .bind(("now", now))
+            .await?;
+        resp.check()?;
+        self.get_revocation_epoch(identity_id).await
     }
 
     pub async fn get_revocation_epoch(&self, identity_id: &str) -> Result<u64> {
@@ -258,7 +273,7 @@ impl SessionService {
             .await?
             .check()?;
 
-        let cur_epoch = self.get_revocation_epoch(&rec.identity_id).await.unwrap_or(0);
+        let cur_epoch = self.get_revocation_epoch(&rec.identity_id).await?;
         let dbk = self.db_key();
         let entry = Arc::new(LiveSessionEntry {
             record: rec.clone(),
@@ -352,11 +367,8 @@ impl SessionService {
             if entry.revoked.load(Ordering::Acquire) || now > entry.record.expires_at_ms {
                 stale_evict = true;
             } else if now.saturating_sub(entry.cached_at_ms) <= SESSION_CACHE_TTL_MS {
-                // Verify immediate revocation epoch against durable authority
-                let live_epoch = self
-                    .get_revocation_epoch(&entry.record.identity_id)
-                    .await
-                    .unwrap_or(entry.revocation_epoch);
+                // Fail-closed: if durable revocation epoch authority is unavailable, DO NOT accept cached session!
+                let live_epoch = self.get_revocation_epoch(&entry.record.identity_id).await?;
                 if live_epoch == entry.revocation_epoch {
                     return Ok(Some(entry.record.clone()));
                 }
@@ -404,7 +416,7 @@ impl SessionService {
             }
             return Ok(None);
         }
-        let cur_epoch = self.get_revocation_epoch(&rec.identity_id).await.unwrap_or(0);
+        let cur_epoch = self.get_revocation_epoch(&rec.identity_id).await?;
         let entry = Arc::new(LiveSessionEntry {
             record: rec.clone(),
             revoked: AtomicBool::new(false),
@@ -450,7 +462,7 @@ impl SessionService {
             }
             rec.revoked = true;
             self.persist_session(&rec).await?;
-            let _ = self.bump_revocation_epoch(&rec.identity_id).await;
+            self.bump_revocation_epoch(&rec.identity_id).await?;
             let _ = self
                 .idp
                 .append_audit("instance", actor, "session.revoke", session_id, "ok", &rec.identity_id)
@@ -478,7 +490,7 @@ impl SessionService {
             }
         }
         if count > 0 {
-            let _ = self.bump_revocation_epoch(identity_id).await;
+            self.bump_revocation_epoch(identity_id).await?;
         }
         let _ = self
             .idp
