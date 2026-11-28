@@ -217,12 +217,22 @@ impl SessionService {
             .bind(("id", identity_id.to_string()))
             .bind(("r", init_rec))
             .await;
-        let created = match create_res {
-            Ok(resp) => resp.check().is_ok(),
-            Err(_) => false,
-        };
-        if created {
-            return Ok(1);
+        match create_res {
+            Ok(resp) => match resp.check() {
+                Ok(_) => return Ok(1),
+                Err(e) => {
+                    let msg = e.to_string().to_ascii_lowercase();
+                    if !(msg.contains("already exists") || msg.contains("duplicate") || msg.contains("unique")) {
+                        return Err(anyhow!("Failed to initialize revocation epoch: {}", e));
+                    }
+                }
+            },
+            Err(e) => {
+                let msg = e.to_string().to_ascii_lowercase();
+                if !(msg.contains("already exists") || msg.contains("duplicate") || msg.contains("unique")) {
+                    return Err(anyhow!("Database error initializing revocation epoch: {}", e));
+                }
+            }
         }
         let resp = self
             .db

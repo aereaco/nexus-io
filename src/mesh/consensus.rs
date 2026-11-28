@@ -153,6 +153,7 @@ struct AcceptedFenceRecord {
     highest_epoch: u64,
     expires_at_ms: u64,
     lease_id: String,
+    lease_digest: String,
     updated_at_ms: u64,
 }
 
@@ -201,14 +202,50 @@ pub fn sign_vote_raw(
     })
 }
 
-pub fn hash_proposal(resource_key: &str, holder_node_id: &str, workload_id: &str, fencing_epoch: u64) -> String {
+/// Single canonical length-prefixed lease digest covering EVERY authority & validity field:
+/// `group_id`, `lease_id`, `resource_key`, `holder_node_id`, `workload_id`, `fencing_epoch`,
+/// `issued_at_ms`, and `expires_at_ms`. Altering even 1ms of `expires_at_ms` invalidates the QC!
+#[allow(clippy::too_many_arguments)]
+pub fn hash_lease_proposal(
+    group_id: &str,
+    lease_id: &str,
+    resource_key: &str,
+    holder_node_id: &str,
+    workload_id: &str,
+    fencing_epoch: u64,
+    issued_at_ms: u64,
+    expires_at_ms: u64,
+) -> String {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"NEXUS-LEASE-PROPOSAL-v1");
-    for field in [resource_key.as_bytes(), holder_node_id.as_bytes(), workload_id.as_bytes()] {
+    hasher.update(b"NEXUS-LEASE-PROPOSAL-v2");
+    for field in [
+        group_id.as_bytes(),
+        lease_id.as_bytes(),
+        resource_key.as_bytes(),
+        holder_node_id.as_bytes(),
+        workload_id.as_bytes(),
+    ] {
         push_len_prefixed(&mut hasher, field);
     }
     hasher.update(&fencing_epoch.to_be_bytes());
+    hasher.update(&issued_at_ms.to_be_bytes());
+    hasher.update(&expires_at_ms.to_be_bytes());
     hasher.finalize().to_hex().to_string()
+}
+
+impl FencedLease {
+    pub fn canonical_digest(&self) -> String {
+        hash_lease_proposal(
+            &self.group_id,
+            &self.lease_id,
+            &self.resource_key,
+            &self.holder_node_id,
+            &self.workload_id,
+            self.fencing_epoch,
+            self.issued_at_ms,
+            self.expires_at_ms,
+        )
+    }
 }
 
 /// Complete canonical digest of a membership transition covering `group_id`, `next_epoch`, `mode`,
@@ -393,33 +430,53 @@ impl FencedResourceGuard {
         Ok(())
     }
 
-    /// Authenticate a `FencedLease` (QC + proposal binding + expiry) and atomically install its
-    /// monotonic `fencing_epoch` at the resource boundary. Rejects forged leases and never regresses!
+    /// Authenticate a `FencedLease` (complete canonical lease digest + QC + group binding +
+    /// validity interval + max TTL) and atomically install its monotonic `fencing_epoch` at the
+    /// resource boundary.
+    ///
+    /// Strictly idempotent CAS rules:
+    /// - Higher epoch: accept after full QC verification.
+    /// - Same epoch + exact same `(lease_id, lease_digest)`: idempotent success.
+    /// - Same epoch + different lease/workload/expiry: REJECT.
+    /// - Lower epoch: REJECT.
     pub async fn install_lease(
         &self,
         lease: &FencedLease,
         group: &CoordinationGroup,
         now: u64,
     ) -> Result<u64> {
+        if lease.group_id != group.group_id {
+            anyhow::bail!(
+                "Lease group_id '{}' does not match authorized group '{}'",
+                lease.group_id,
+                group.group_id
+            );
+        }
         if lease.fencing_epoch == 0 {
             anyhow::bail!("Fencing epoch must be >= 1");
+        }
+        if lease.expires_at_ms <= lease.issued_at_ms {
+            anyhow::bail!("Lease '{}' has invalid validity interval (expires_at_ms <= issued_at_ms)", lease.lease_id);
+        }
+        if lease.expires_at_ms - lease.issued_at_ms > group.max_lease_ttl_ms {
+            anyhow::bail!(
+                "Lease '{}' duration ({}ms) exceeds group max_lease_ttl_ms ({}ms)",
+                lease.lease_id,
+                lease.expires_at_ms - lease.issued_at_ms,
+                group.max_lease_ttl_ms
+            );
         }
         if now >= lease.expires_at_ms {
             anyhow::bail!("Cannot install expired lease '{}' at resource boundary", lease.lease_id);
         }
-        // 1. Cryptographically authenticate the lease directly at the resource boundary!
+        // 1. Cryptographically authenticate the complete lease directly at the resource boundary!
         group.verify_qc(&lease.qc)?;
-        let expected_hash = hash_proposal(
-            &lease.resource_key,
-            &lease.holder_node_id,
-            &lease.workload_id,
-            lease.fencing_epoch,
-        );
-        if lease.qc.proposal_hash != expected_hash {
-            anyhow::bail!("Lease QC proposal_hash does not match presented lease fields");
+        let expected_digest = lease.canonical_digest();
+        if lease.qc.proposal_hash != expected_digest {
+            anyhow::bail!("Lease QC proposal_hash does not match complete canonical lease digest (tampering detected)");
         }
 
-        // 2. Database-enforced atomic monotonic update (serializes concurrent out-of-order arrivals)
+        // 2. Database-enforced strictly idempotent monotonic CAS
         let _guard = FENCE_STRIPES[fence_stripe_idx(&lease.resource_key)].lock().await;
         self.ensure_tables().await?;
         let key = blake3::hash(lease.resource_key.as_bytes()).to_hex().to_string();
@@ -430,11 +487,11 @@ impl FencedResourceGuard {
             highest_epoch: lease.fencing_epoch,
             expires_at_ms: lease.expires_at_ms,
             lease_id: lease.lease_id.clone(),
+            lease_digest: expected_digest.clone(),
             updated_at_ms: now,
         };
         let rec_val = serde_json::to_value(&rec)?;
 
-        // Atomic DB CAS: CREATE insert-if-absent for first lease, else conditional UPDATE WHERE highest_epoch < $ep
         let create_res = self
             .db
             .client
@@ -452,20 +509,21 @@ impl FencedResourceGuard {
                 .client
                 .query(
                     "UPDATE type::record('sys_mesh_resource_fence', $id) \
-                     SET holder_node_id = $holder, highest_epoch = $ep, expires_at_ms = $exp, lease_id = $lid, updated_at_ms = $now \
-                     WHERE highest_epoch < $ep OR (highest_epoch == $ep AND holder_node_id == $holder);",
+                     SET holder_node_id = $holder, highest_epoch = $ep, expires_at_ms = $exp, lease_id = $lid, lease_digest = $dig, updated_at_ms = $now \
+                     WHERE highest_epoch < $ep OR (highest_epoch == $ep AND lease_id == $lid AND lease_digest == $dig);",
                 )
                 .bind(("id", key))
                 .bind(("holder", lease.holder_node_id.clone()))
                 .bind(("ep", lease.fencing_epoch))
                 .bind(("exp", lease.expires_at_ms))
                 .bind(("lid", lease.lease_id.clone()))
+                .bind(("dig", expected_digest))
                 .bind(("now", now))
                 .await?;
             let updated_rows: Vec<serde_json::Value> = upd.take(0).unwrap_or_default();
             if updated_rows.is_empty() {
                 anyhow::bail!(
-                    "Resource boundary rejected stale/conflicting lease '{}' (epoch={}) for '{}'",
+                    "Resource boundary rejected stale or conflicting lease '{}' (epoch={}) for '{}'",
                     lease.lease_id,
                     lease.fencing_epoch,
                     lease.resource_key
@@ -473,7 +531,7 @@ impl FencedResourceGuard {
             }
         }
 
-        // 3. Publish to cheap local hot-path cache ONLY after durable DB commit succeeds
+        // 3. Publish to cheap local hot-path cache ONLY after durable DB operation succeeds
         if let Ok(mut map) = self.local_accepted.write() {
             map.insert(lease.resource_key.clone(), rec);
         }
@@ -549,6 +607,7 @@ pub struct CoordinationGroup {
     pub mode: ConsensusMode,
     pub membership_epoch: u64,
     pub next_slot: u64,
+    pub max_lease_ttl_ms: u64,
     pub members: HashMap<String, GroupMember>,
     pub active_leases: HashMap<String, FencedLease>,
     pub max_fencing_epoch: HashMap<String, u64>,
@@ -568,6 +627,7 @@ impl CoordinationGroup {
             mode,
             membership_epoch: 1,
             next_slot: 1,
+            max_lease_ttl_ms: 300_000,
             members: map,
             active_leases: HashMap::new(),
             max_fencing_epoch: HashMap::new(),
@@ -678,15 +738,25 @@ impl CoordinationGroup {
         self.mode.quorum_size(self.members.len())
     }
 
-    /// Coordinator crash recovery: given votes queried from voters' durable locks for `slot`,
-    /// reconstruct a valid `QuorumCertificate` if a quorum had already locked on one proposal!
-    pub fn recover_qc_from_voter_locks(&self, slot: u64, locked_votes: Vec<SignedVote>) -> Result<Option<QuorumCertificate>> {
+    /// Safe coordinator crash recovery for `slot`:
+    /// 1. Checks if a committed decision already exists in `active_leases` for `slot` (if so,
+    ///    verifies no conflicting quorum exists in `locked_votes` and returns the committed QC).
+    /// 2. Otherwise checks all durable voter locks for `(group_id, membership_epoch, slot)` and
+    ///    verifies at most ONE proposal achieved quorum (failing closed if conflicting quorums exist).
+    pub fn recover_safe_slot_decision(&self, slot: u64, locked_votes: Vec<SignedVote>) -> Result<Option<QuorumCertificate>> {
+        let existing_committed = self
+            .active_leases
+            .values()
+            .find(|l| l.qc.slot == slot && l.qc.epoch == self.membership_epoch);
+
         let mut by_hash: HashMap<String, Vec<SignedVote>> = HashMap::new();
         for v in locked_votes {
             if v.group_id == self.group_id && v.epoch == self.membership_epoch && v.slot == slot {
                 by_hash.entry(v.proposal_hash.clone()).or_default().push(v);
             }
         }
+
+        let mut valid_qcs = Vec::new();
         for (proposal_hash, votes) in by_hash {
             let qc = QuorumCertificate {
                 group_id: self.group_id.clone(),
@@ -697,10 +767,21 @@ impl CoordinationGroup {
                 votes,
             };
             if self.verify_qc(&qc).is_ok() {
-                return Ok(Some(qc));
+                valid_qcs.push(qc);
             }
         }
-        Ok(None)
+        if valid_qcs.len() > 1 {
+            anyhow::bail!("CRITICAL: Conflicting quorum certificates detected during slot {} recovery!", slot);
+        }
+        if let Some(committed) = existing_committed {
+            if let Some(ref recovered) = valid_qcs.first() {
+                if recovered.proposal_hash != committed.qc.proposal_hash {
+                    anyhow::bail!("CRITICAL: Recovered voter quorum conflicts with already-persisted lease for slot {}!", slot);
+                }
+            }
+            return Ok(Some(committed.qc.clone()));
+        }
+        Ok(valid_qcs.into_iter().next())
     }
 
     /// Safe quorum-gated membership reconfiguration:
@@ -840,15 +921,27 @@ impl CoordinationGroup {
     #[allow(clippy::too_many_arguments)]
     pub async fn commit_exclusive_lease(
         &mut self,
+        lease_id: &str,
         resource_key: &str,
         holder_node_id: &str,
         workload_id: &str,
-        ttl_ms: u64,
+        issued_at_ms: u64,
+        expires_at_ms: u64,
         now: u64,
         votes: Vec<SignedVote>,
     ) -> Result<FencedLease> {
         if !self.members.contains_key(holder_node_id) {
             anyhow::bail!("Holder '{}' is not an authorized member of group '{}'", holder_node_id, self.group_id);
+        }
+        if expires_at_ms <= issued_at_ms {
+            anyhow::bail!("Invalid lease interval: expires_at_ms ({}) <= issued_at_ms ({})", expires_at_ms, issued_at_ms);
+        }
+        if expires_at_ms - issued_at_ms > self.max_lease_ttl_ms {
+            anyhow::bail!(
+                "Requested lease duration ({}ms) exceeds group max_lease_ttl_ms ({}ms)",
+                expires_at_ms - issued_at_ms,
+                self.max_lease_ttl_ms
+            );
         }
         if let Some(existing) = self.active_leases.get(resource_key) {
             if existing.expires_at_ms > now && existing.holder_node_id != holder_node_id {
@@ -864,7 +957,16 @@ impl CoordinationGroup {
 
         let next_fencing = self.max_fencing_epoch.get(resource_key).copied().unwrap_or(0) + 1;
         let slot = self.next_slot;
-        let expected_hash = hash_proposal(resource_key, holder_node_id, workload_id, next_fencing);
+        let expected_hash = hash_lease_proposal(
+            &self.group_id,
+            lease_id,
+            resource_key,
+            holder_node_id,
+            workload_id,
+            next_fencing,
+            issued_at_ms,
+            expires_at_ms,
+        );
 
         let mut valid_votes = Vec::new();
         let mut unique_voters = HashSet::new();
@@ -906,14 +1008,14 @@ impl CoordinationGroup {
         self.verify_qc(&qc)?;
 
         let lease = FencedLease {
-            lease_id: format!("lse_{}", &uuid::Uuid::new_v4().simple().to_string()[..12]),
+            lease_id: lease_id.to_string(),
             group_id: self.group_id.clone(),
             resource_key: resource_key.to_string(),
             holder_node_id: holder_node_id.to_string(),
             workload_id: workload_id.to_string(),
             fencing_epoch: next_fencing,
-            issued_at_ms: now,
-            expires_at_ms: now.saturating_add(ttl_ms),
+            issued_at_ms,
+            expires_at_ms,
             qc,
         };
         let new_next_slot = self.next_slot + 1;

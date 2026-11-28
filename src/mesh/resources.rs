@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use crate::mesh::consensus::{
-    hash_proposal, CoordinationGroup, FencedLease, SignedVote, VoteRequest, VoterNode,
+    hash_lease_proposal, CoordinationGroup, FencedLease, SignedVote, VoteRequest, VoterNode,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -442,8 +442,19 @@ pub async fn schedule_and_lease_workload(
         .first()
         .ok_or_else(|| anyhow!("No eligible authorized mesh node satisfies workload '{}'", spec.workload_id))?;
 
+    let lease_id = format!("lse_{}", &uuid::Uuid::new_v4().simple().to_string()[..12]);
+    let expires_at_ms = now.saturating_add(ttl_ms);
     let next_fencing = group.max_fencing_epoch.get(resource_key).copied().unwrap_or(0) + 1;
-    let proposal_hash = hash_proposal(resource_key, &chosen.node_id, &spec.workload_id, next_fencing);
+    let proposal_hash = hash_lease_proposal(
+        &group.group_id,
+        &lease_id,
+        resource_key,
+        &chosen.node_id,
+        &spec.workload_id,
+        next_fencing,
+        now,
+        expires_at_ms,
+    );
     let vote_req = VoteRequest {
         group_id: group.group_id.clone(),
         epoch: group.membership_epoch,
@@ -469,10 +480,12 @@ pub async fn schedule_and_lease_workload(
 
     let lease = group
         .commit_exclusive_lease(
+            &lease_id,
             resource_key,
             &chosen.node_id,
             &spec.workload_id,
-            ttl_ms,
+            now,
+            expires_at_ms,
             now,
             votes,
         )

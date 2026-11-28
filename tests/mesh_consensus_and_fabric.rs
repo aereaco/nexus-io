@@ -1,20 +1,9 @@
-//! P0.1–P0.4 Hardening & 4-Node Heterogeneous Mesh Regression Suite
-//!
-//! Verifies:
-//! 1. Canonical length-prefixed signing covers ALL fields (tampering `gpu.apis` or `wasm_slots` fails).
-//! 2. Membership binding rejects untrusted/wrong-org self-signed advertisements.
-//! 3. CRDT ingestion rejects expired non-tombstone ads, converges deterministically under equal
-//!    `lamport_ts`, and `gc_expired` cleans expired ads while retaining active tombstones.
-//! 4. `ReservationLedger` prevents over-booking + verified CAS locality is enforced.
-//! 5. Complete canonical `hash_membership_change` rejects key substitution under existing `node_id`.
-//! 6. `FencedResourceGuard::install_lease` authenticates the full QC (rejecting forged high-epoch
-//!    leases) and `authorize_local_exec` serves cheap O(1) hot-path checks while rejecting stale epochs.
-//! 7. `CoordinationGroup::open_durable` recovers committed leases & monotonic fencing epochs.
+//! P0.1–P0.4 + Complete Lease-Binding & Strict Idempotent Fencing Regression Suite
 
 use nexus_io::db::Database;
 use nexus_io::iam::idp::{NexusIdp, OrgPolicyPatch};
 use nexus_io::mesh::consensus::{
-    hash_membership_change, hash_proposal, sign_vote_raw, ConsensusMode, CoordinationGroup,
+    hash_lease_proposal, hash_membership_change, sign_vote_raw, ConsensusMode, CoordinationGroup,
     FencedLease, FencedResourceGuard, GroupMember, QuorumCertificate, VoteRequest, VoterNode,
 };
 use nexus_io::mesh::resources::{
@@ -112,13 +101,13 @@ async fn p0_resource_trust_crdt_expiry_membership_digest_and_authenticated_bound
     tampered_wasm.wasm_slots = 999;
     assert!(crdt_a.merge_advertisement(tampered_wasm, &group, t0).is_err());
 
-    // 2. Expired ordinary advertisement is rejected at CRDT ingestion!
+    // 2. Expired ordinary advertisement is rejected at CRDT ingestion
     let mut expired_adv = adv_c.clone();
     expired_adv.expires_at_ms = t0 - 1;
     expired_adv.sign(&sk_c).unwrap();
     assert!(crdt_a.merge_advertisement(expired_adv, &group, t0).is_err());
 
-    // 3. Untrusted rogue node claiming membership in `org` is rejected!
+    // 3. Untrusted rogue node claiming membership in `org` is rejected
     let (rogue_id, rogue_sk) = idp.create_identity("rogue", None).await.unwrap();
     let mut rogue_adv = adv_c.clone();
     rogue_adv.node_id = "rogue-node".into();
@@ -198,10 +187,23 @@ async fn p0_resource_trust_crdt_expiry_membership_digest_and_authenticated_bound
     assert_eq!(dec1.selected_node_id, "node-c");
     assert!(dec1.verified_cas_local);
 
-    // 6. Authenticated resource-boundary guard: valid lease installs & hot-path succeeds; forged epoch=999 FAILS!
+    // 6. Authenticated resource-boundary guard:
+    //    - Valid lease installs & exact retry succeeds (idempotent!)
+    //    - +1 ms `expires_at_ms` tampering on valid QC MUST BE REJECTED!
+    //    - Forged high-epoch lease MUST BE REJECTED!
     let guard = FencedResourceGuard::new(Arc::new(Database::open_mem()));
     guard.install_lease(&dec1.lease, &group, t0 + 10).await.unwrap();
+    // Exact same lease retry is strictly idempotent
+    guard.install_lease(&dec1.lease, &group, t0 + 11).await.unwrap();
     guard.authorize_local_exec("gpu:us-east:slot-0", "node-c", 1, t0 + 20).await.unwrap();
+
+    // +1 ms expiry tampering MUST fail canonical digest check!
+    let mut tampered_expiry = dec1.lease.clone();
+    tampered_expiry.expires_at_ms += 1;
+    assert!(
+        guard.install_lease(&tampered_expiry, &group, t0 + 25).await.is_err(),
+        "+1 ms expires_at_ms tampering MUST invalidate QC at resource boundary!"
+    );
 
     let forged_lease = FencedLease {
         lease_id: "lse_forged".into(),
@@ -216,29 +218,44 @@ async fn p0_resource_trust_crdt_expiry_membership_digest_and_authenticated_bound
             group_id: "pool:us-east".into(),
             epoch: 1,
             slot: 99,
-            proposal_hash: hash_proposal("gpu:us-east:slot-0", "node-b", "wl-hijack", 999),
+            proposal_hash: hash_lease_proposal(
+                "pool:us-east",
+                "lse_forged",
+                "gpu:us-east:slot-0",
+                "node-b",
+                "wl-hijack",
+                999,
+                t0,
+                t0 + 60_000,
+            ),
             mode: ConsensusMode::CftFastPath,
             votes: vec![],
         },
     };
-    assert!(
-        guard.install_lease(&forged_lease, &group, t0 + 30).await.is_err(),
-        "Forged lease without valid QC MUST be rejected at resource boundary!"
-    );
+    assert!(guard.install_lease(&forged_lease, &group, t0 + 30).await.is_err());
 
-    // 7. Complete membership-transition digest catches pubkey substitution under same node_id!
+    // 7. Complete membership-transition digest catches pubkey substitution under same node_id
     let mut swapped_members = members.clone();
     swapped_members[0].ed25519_pubkey = "FAKE_SUBSTITUTED_PUBKEY".into();
     let h_orig = hash_membership_change("pool:us-east", 2, ConsensusMode::CftFastPath, &members).unwrap();
     let h_swap = hash_membership_change("pool:us-east", 2, ConsensusMode::CftFastPath, &swapped_members).unwrap();
-    assert_ne!(h_orig, h_swap, "Membership digest MUST bind full member pubkeys/identities!");
+    assert_ne!(h_orig, h_swap);
 
     // 8. Durable VoterNode refuses conflicting vote for same (group, epoch, slot)
     let conflict_req = VoteRequest {
         group_id: "pool:us-east".into(),
         epoch: 1,
         slot: 1,
-        proposal_hash: hash_proposal("gpu:us-east:slot-0", "node-b", "wl-hijack", 1),
+        proposal_hash: hash_lease_proposal(
+            "pool:us-east",
+            "lse_conflict",
+            "gpu:us-east:slot-0",
+            "node-b",
+            "wl-hijack",
+            1,
+            t0,
+            t0 + 30_000,
+        ),
     };
     assert!(voter_a.cast_vote(&conflict_req).await.is_err());
 
@@ -256,8 +273,8 @@ async fn p0_resource_trust_crdt_expiry_membership_digest_and_authenticated_bound
 
     // 10. BFT equivocation detection
     let mut bft_group = CoordinationGroup::new("open:global", ConsensusMode::BftSigned, members);
-    let h1 = hash_proposal("open:gpu:1", "node-c", "wl-1", 1);
-    let h2 = hash_proposal("open:gpu:1", "node-b", "wl-evil", 1);
+    let h1 = hash_lease_proposal("open:global", "l1", "open:gpu:1", "node-c", "wl-1", 1, t0, t0 + 10_000);
+    let h2 = hash_lease_proposal("open:global", "l2", "open:gpu:1", "node-b", "wl-evil", 1, t0, t0 + 10_000);
     let v1 = sign_vote_raw("open:global", 1, 1, &h1, "node-b", &sk_b).unwrap();
     let v2 = sign_vote_raw("open:global", 1, 1, &h2, "node-b", &sk_b).unwrap();
     assert!(bft_group.record_and_verify_vote(&v1).unwrap().is_none());
