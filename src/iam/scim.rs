@@ -333,6 +333,13 @@ impl ScimService {
                 _ => {}
             }
         }
+        // Atomic deprovisioning: revoke org memberships & org sessions BEFORE committing
+        // `active = false`, propagating any error so deprovisioning NEVER reports false success!
+        if deactivated {
+            self.idp.revoke_membership(actor, &user.org_id, &user.id).await?;
+            self.sessions.revoke_org_sessions(actor, &user.id, &user.org_id).await?;
+        }
+
         user.updated_at_ms = now_ms();
         let val = serde_json::to_value(&user)?;
         self.db
@@ -342,11 +349,6 @@ impl ScimService {
             .bind(("u", val))
             .await?
             .check()?;
-
-        if deactivated {
-            let _ = self.idp.revoke_membership(actor, &user.org_id, &user.id).await;
-            let _ = self.sessions.revoke_org_sessions(actor, &user.id, &user.org_id).await;
-        }
         let _ = self
             .idp
             .append_audit(
@@ -361,14 +363,14 @@ impl ScimService {
         Ok(user)
     }
 
-    /// Deprovision a SCIM user: removes SCIM directory record, revokes org memberships & org
-    /// sessions, and preserves the personal `NEXUS-ID-v1` identity (Identity-First invariant!).
+    /// Deprovision a SCIM user: revokes org memberships & org sessions FIRST (failing closed on
+    /// error), removes the SCIM directory record, and preserves the personal `NEXUS-ID-v1` identity.
     pub async fn delete_user(&self, actor: &str, id: &str) -> Result<bool> {
         let Some(user) = self.get_user(id).await? else {
             return Ok(false);
         };
-        let _ = self.idp.revoke_membership(actor, &user.org_id, &user.id).await;
-        let _ = self.sessions.revoke_org_sessions(actor, &user.id, &user.org_id).await;
+        self.idp.revoke_membership(actor, &user.org_id, &user.id).await?;
+        self.sessions.revoke_org_sessions(actor, &user.id, &user.org_id).await?;
         self.db
             .client
             .query("DELETE type::record('sys_iam_scim_user', $id);")

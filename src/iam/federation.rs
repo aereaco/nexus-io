@@ -21,6 +21,16 @@ use crate::db::Database;
 use crate::iam::idp::{validate_eddsa_jwt, JwtValidationPolicy, NexusIdp};
 
 const MAX_REPLAY_ENTRIES: usize = 32_768;
+const REPLAY_STRIPE_COUNT: usize = 64;
+
+fn replay_stripe_idx(key: &str) -> usize {
+    let h = blake3::hash(key.as_bytes());
+    let b = h.as_bytes();
+    (u32::from_be_bytes([b[0], b[1], b[2], b[3]]) as usize) % REPLAY_STRIPE_COUNT
+}
+
+static REPLAY_STRIPES: Lazy<Vec<tokio::sync::Mutex<()>>> =
+    Lazy::new(|| (0..REPLAY_STRIPE_COUNT).map(|_| tokio::sync::Mutex::new(())).collect());
 
 /// Process-local replay cache keyed by `(db_ptr_addr, kind:token_id) -> expires_at_ms`.
 static REPLAY_CACHE: Lazy<RwLock<HashMap<(usize, String), u64>>> =
@@ -289,7 +299,8 @@ impl FederationService {
     }
 
     /// Single-use replay protection for SAML `Assertion ID` and OIDC `jti` values.
-    /// Persists durably to `sys_iam_replay_jti` before publishing to the bounded `REPLAY_CACHE`.
+    /// Uses database-atomic `CREATE` (insert-if-absent) as the cross-process authority so two
+    /// concurrent requests can NEVER both consume the same replay ID!
     async fn consume_replay_id(&self, kind: &str, token_id: &str, expires_at_ms: u64) -> Result<()> {
         let key = format!("{}:{}", kind, token_id.trim());
         let dbk = self.db_key();
@@ -301,38 +312,59 @@ impl FederationService {
                 }
             }
         }
+        let _guard = REPLAY_STRIPES[replay_stripe_idx(&key)].lock().await;
         self.ensure_tables().await?;
-        let mut resp = self
-            .db
-            .client
-            .query("SELECT * FROM type::record('sys_iam_replay_jti', $id)")
-            .bind(("id", key.clone()))
-            .await?;
-        let rows: Vec<serde_json::Value> = resp.take(0).unwrap_or_default();
-        if let Some(existing) = rows.first() {
-            let exp = existing["expires_at_ms"].as_u64().unwrap_or(0);
-            if exp > now {
-                anyhow::bail!("Replay detected: {} '{}' has already been consumed", kind, token_id);
-            }
-        }
+        let exp_val = expires_at_ms.max(now + 60_000);
         let rec = serde_json::json!({
             "key": key,
             "kind": kind,
             "consumed_at_ms": now,
-            "expires_at_ms": expires_at_ms.max(now + 60_000),
+            "expires_at_ms": exp_val,
         });
-        self.db
+
+        // Atomic database insert-if-absent (`CREATE` fails if record already exists!)
+        let create_res = self
+            .db
             .client
-            .query("UPSERT type::record('sys_iam_replay_jti', $id) CONTENT $r;")
+            .query("CREATE type::record('sys_iam_replay_jti', $id) CONTENT $r;")
             .bind(("id", key.clone()))
-            .bind(("r", rec))
-            .await?
-            .check()?;
+            .bind(("r", rec.clone()))
+            .await;
+        let created_ok = match create_res {
+            Ok(resp) => resp.check().is_ok(),
+            Err(_) => false,
+        };
+
+        if !created_ok {
+            // Record already exists — check if it is still active or genuinely expired
+            let mut resp = self
+                .db
+                .client
+                .query("SELECT * FROM type::record('sys_iam_replay_jti', $id)")
+                .bind(("id", key.clone()))
+                .await?;
+            let rows: Vec<serde_json::Value> = resp.take(0).unwrap_or_default();
+            if let Some(existing) = rows.first() {
+                let exp = existing["expires_at_ms"].as_u64().unwrap_or(0);
+                if exp > now {
+                    anyhow::bail!("Replay detected: {} '{}' has already been consumed", kind, token_id);
+                }
+            }
+            // Expired entry: replace atomically inside transaction
+            self.db
+                .client
+                .query("BEGIN TRANSACTION; DELETE type::record('sys_iam_replay_jti', $id); CREATE type::record('sys_iam_replay_jti', $id) CONTENT $r; COMMIT TRANSACTION;")
+                .bind(("id", key.clone()))
+                .bind(("r", rec))
+                .await?
+                .check()?;
+        }
+
         if let Ok(mut cache) = REPLAY_CACHE.write() {
             if cache.len() >= MAX_REPLAY_ENTRIES {
                 cache.retain(|_, exp| *exp > now);
             }
-            cache.insert((dbk, key), expires_at_ms.max(now + 60_000));
+            cache.insert((dbk, key), exp_val);
         }
         Ok(())
     }

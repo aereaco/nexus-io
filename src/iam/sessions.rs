@@ -115,12 +115,23 @@ pub struct ClusterTrustDecision {
 }
 
 const MAX_SESSION_CACHE_ENTRIES: usize = 16_384;
-/// Bounded local cache freshness window so cross-process/cross-cluster revocations propagate promptly.
+/// Bounded local cache freshness window; revocation coherence is ALSO checked immediately via `sys_iam_revocation_epoch`.
 const SESSION_CACHE_TTL_MS: u64 = 15_000;
+const REVOCATION_STRIPE_COUNT: usize = 64;
+
+fn rev_stripe_idx(identity_id: &str) -> usize {
+    let h = blake3::hash(identity_id.as_bytes());
+    let b = h.as_bytes();
+    (u32::from_be_bytes([b[0], b[1], b[2], b[3]]) as usize) % REVOCATION_STRIPE_COUNT
+}
+
+static REVOCATION_STRIPES: Lazy<Vec<tokio::sync::Mutex<()>>> =
+    Lazy::new(|| (0..REVOCATION_STRIPE_COUNT).map(|_| tokio::sync::Mutex::new(())).collect());
 
 struct LiveSessionEntry {
     record: SessionRecord,
     revoked: AtomicBool,
+    revocation_epoch: u64,
     cached_at_ms: u64,
 }
 
@@ -187,8 +198,10 @@ impl SessionService {
         Ok(())
     }
 
-    /// Durable monotonic revocation watermark for cross-instance revocation coherence.
+    /// Durable monotonic revocation watermark for immediate cross-instance revocation coherence.
+    /// Executes atomically inside a `nexus-db` transaction guarded by a striped lock.
     pub async fn bump_revocation_epoch(&self, identity_id: &str) -> Result<u64> {
+        let _guard = REVOCATION_STRIPES[rev_stripe_idx(identity_id)].lock().await;
         self.ensure_tables().await?;
         let cur = self.get_revocation_epoch(identity_id).await.unwrap_or(0);
         let next = cur + 1;
@@ -199,7 +212,7 @@ impl SessionService {
         });
         self.db
             .client
-            .query("UPSERT type::record('sys_iam_revocation_epoch', $id) CONTENT $r;")
+            .query("BEGIN TRANSACTION; UPSERT type::record('sys_iam_revocation_epoch', $id) CONTENT $r; COMMIT TRANSACTION;")
             .bind(("id", identity_id.to_string()))
             .bind(("r", rec))
             .await?
@@ -245,10 +258,12 @@ impl SessionService {
             .await?
             .check()?;
 
+        let cur_epoch = self.get_revocation_epoch(&rec.identity_id).await.unwrap_or(0);
         let dbk = self.db_key();
         let entry = Arc::new(LiveSessionEntry {
             record: rec.clone(),
             revoked: AtomicBool::new(rec.revoked),
+            revocation_epoch: cur_epoch,
             cached_at_ms: now_ms(),
         });
         insert_session_cache_bounded(dbk, rec.token_hash.clone(), entry);
@@ -320,19 +335,32 @@ impl SessionService {
         Ok((rec, raw_token))
     }
 
-    /// ZCZS hot-path session validation with bounded freshness TTL and O(1) indexed DB fallback.
+    /// ZCZS session validation with immediate cross-instance revocation coherence:
+    /// checks the persisted `sys_iam_revocation_epoch` on cache hit so revocations from any
+    /// peer instance invalidate local cache entries immediately (zero stale-revocation window).
     pub async fn validate_session(&self, raw_token: &str) -> Result<Option<SessionRecord>> {
         let thash = hash_token(raw_token);
         let dbk = self.db_key();
         let now = now_ms();
         let mut stale_evict = false;
-        if let Ok(cache) = SESSION_CACHE.read() {
-            if let Some(entry) = cache.get(&(dbk, thash.clone())) {
-                if entry.revoked.load(Ordering::Acquire) || now > entry.record.expires_at_ms {
-                    stale_evict = true;
-                } else if now.saturating_sub(entry.cached_at_ms) <= SESSION_CACHE_TTL_MS {
+        let cached_hit: Option<Arc<LiveSessionEntry>> = if let Ok(cache) = SESSION_CACHE.read() {
+            cache.get(&(dbk, thash.clone())).cloned()
+        } else {
+            None
+        };
+        if let Some(entry) = cached_hit {
+            if entry.revoked.load(Ordering::Acquire) || now > entry.record.expires_at_ms {
+                stale_evict = true;
+            } else if now.saturating_sub(entry.cached_at_ms) <= SESSION_CACHE_TTL_MS {
+                // Verify immediate revocation epoch against durable authority
+                let live_epoch = self
+                    .get_revocation_epoch(&entry.record.identity_id)
+                    .await
+                    .unwrap_or(entry.revocation_epoch);
+                if live_epoch == entry.revocation_epoch {
                     return Ok(Some(entry.record.clone()));
                 }
+                // Epoch advanced (cross-instance revocation occurred) -> fall through to DB
             }
         }
         if stale_evict {
@@ -376,9 +404,11 @@ impl SessionService {
             }
             return Ok(None);
         }
+        let cur_epoch = self.get_revocation_epoch(&rec.identity_id).await.unwrap_or(0);
         let entry = Arc::new(LiveSessionEntry {
             record: rec.clone(),
             revoked: AtomicBool::new(false),
+            revocation_epoch: cur_epoch,
             cached_at_ms: now_ms(),
         });
         insert_session_cache_bounded(dbk, thash, entry);
@@ -713,12 +743,17 @@ impl SessionService {
             .await?
             .check()?;
 
-        // Revoke all active sessions bound to this device
+        // Revoke all active sessions bound to this device & bump revocation epoch
+        let mut revoked_any = false;
         for mut ses in self.list_sessions(&owner_id).await? {
             if ses.device_id.as_deref() == Some(device_id) {
                 ses.revoked = true;
                 self.persist_session(&ses).await?;
+                revoked_any = true;
             }
+        }
+        if revoked_any {
+            self.bump_revocation_epoch(&owner_id).await?;
         }
         let _ = self
             .idp
